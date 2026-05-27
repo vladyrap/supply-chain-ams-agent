@@ -1,0 +1,36 @@
+{
+  "name": "supply-chain-ams-backend",
+  "version": "0.1.0",
+  "description": "Backend Fastify para el Agente AMS Supply Chain",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google/genai": "^0.7.0",
+    "fastify": "^4.28.1",
+    "@fastify/cors": "^9.0.1",
+    "pino": "^9.5.0",
+    "pino-pretty": "^11.3.0",
+    "pg": "^8.13.1",
+    "dotenv": "^16.4.5",
+    "prom-client": "^15.1.3",
+    "bullmq": "^5.21.2",
+    "ioredis": "^5.4.1",
+    "bcryptjs": "^2.4.3",
+    "@fastify/cookie": "^9.4.0",
+    "nodemailer": "^6.9.16"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/pg": "^8.11.10",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/nodemailer": "^6.4.17",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

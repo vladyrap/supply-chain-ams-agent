@@ -1,0 +1,40 @@
+import "dotenv/config";
+import { buildServer } from "./server";
+import { logger } from "./utils/logger";
+import { bootstrapAdminIfNeeded } from "./services/auth.service";
+
+const PORT = Number(process.env.BACKEND_PORT ?? 8000);
+const HOST = "0.0.0.0";
+
+async function main() {
+  const app = buildServer();
+
+  // Crear admin de bootstrap si está configurado en env vars y no hay usuarios.
+  await bootstrapAdminIfNeeded().catch((err) => {
+    logger.warn({ err }, "bootstrap admin falló");
+  });
+
+  try {
+    await app.listen({ port: PORT, host: HOST });
+    logger.info({ port: PORT }, "ams-backend listening");
+  } catch (err) {
+    logger.error({ err }, "Fallo al iniciar el servidor");
+    process.exit(1);
+  }
+
+  const shutdown = async (signal: string) => {
+    logger.info({ signal }, "Shutting down...");
+    try {
+      await app.close();
+      process.exit(0);
+    } catch (err) {
+      logger.error({ err }, "Error en shutdown");
+      process.exit(1);
+    }
+  };
+
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+}
+
+main();
