@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { Worker, type Job } from "bullmq";
+import { Worker, type Job, type ConnectionOptions } from "bullmq";
 import IORedis from "ioredis";
 import cron from "node-cron";
 import { logger } from "./logger";
@@ -18,6 +18,10 @@ const connection = new IORedis(REDIS_URL, {
 connection.on("error", (err) => logger.error({ err }, "redis error"));
 connection.on("connect", () => logger.info({ REDIS_URL }, "redis connected"));
 
+// BullMQ ancla su propia copia de ioredis; el typecheck cruzado falla aunque a runtime
+// el cliente es idéntico. Cast a ConnectionOptions solo para satisfacer al Worker.
+const bullConnection = connection as unknown as ConnectionOptions;
+
 const ingestWorker = new Worker<IngestJobData>(
   "knowledge-ingest",
   async (job: Job<IngestJobData>) => {
@@ -25,7 +29,7 @@ const ingestWorker = new Worker<IngestJobData>(
     await processIngest(job.data);
     return { ok: true };
   },
-  { connection, concurrency: 1, autorun: true }
+  { connection: bullConnection, concurrency: 1, autorun: true }
 );
 
 const meetingWorker = new Worker<MeetingJobData>(
@@ -35,7 +39,7 @@ const meetingWorker = new Worker<MeetingJobData>(
     await processMeeting(job.data);
     return { ok: true };
   },
-  { connection, concurrency: 1, autorun: true }
+  { connection: bullConnection, concurrency: 1, autorun: true }
 );
 
 for (const [name, w] of [["ingest", ingestWorker], ["meeting", meetingWorker]] as const) {
