@@ -306,3 +306,130 @@ async function escalateConversation(
 export function welcomeText(): string {
   return GREETING;
 }
+
+// ============================================================
+// Escalación MANUAL: la dispara un humano desde la UI (consultor/aprobador/admin)
+// sin esperar a que el resolver decida. Reutiliza la misma logica que la
+// escalacion automatica pero etiqueta el actor como "human" en la auditoria
+// y permite pasar una razon libre.
+// ============================================================
+export async function manualEscalate(
+  conversationId: string,
+  opts: { reason?: string; actor?: string } = {}
+): Promise<SupportTicket> {
+  const conv = await getConversationById(conversationId);
+  if (!conv) throw new Error("conv no encontrada");
+  if (conv.status === "escalated" && conv.escalated_to_ticket) {
+    throw new Error("La conversacion ya fue escalada");
+  }
+  if (conv.status === "resolved" || conv.status === "closed") {
+    throw new Error(`No se puede escalar una conversacion ${conv.status}`);
+  }
+
+  // Reconstruir transcript desde la BD
+  const messages = await listMessages(conversationId);
+  const transcript = messages.map((m) => ({
+    role: m.role === "user" ? "user" : (m.role === "system" ? "system" : "ai"),
+    text: m.text ?? "",
+  }));
+
+  // Si no hay triage previo (caso raro), usamos defaults razonables a partir de
+  // los campos persistidos en la conversacion.
+  const firstUserMsg = transcript.find((t) => t.role === "user")?.text ?? "";
+  const triage = {
+    intent: conv.intent || "incidente",
+    sap_module: conv.sap_module || "NO_INFORMADO",
+    urgency: conv.urgency || "media",
+    category: conv.category || "otros",
+    title: conv.summary?.slice(0, 80) || `Escalacion manual de conversacion ${conv.id.slice(0, 8)}`,
+    summary: conv.summary || firstUserMsg.slice(0, 240) || "Sin resumen",
+    confidence: "alta" as const,
+    needs_escalation: true,
+    escalation_reason: opts.reason || "Escalado manualmente por agente humano",
+  };
+
+  const transcriptText = transcript.map((m) => `${m.role === "user" ? "Usuario" : "AMS-Bot"}: ${m.text}`).join("\n");
+  const evidences = [
+    {
+      type: "conversation",
+      label: `Conversacion completa (${transcript.length} mensajes)`,
+      value: transcriptText.slice(0, 4000),
+    },
+    {
+      type: "manual_reason",
+      label: "Razon de escalacion manual",
+      value: opts.reason || "(no especificada)",
+    },
+    {
+      type: "actor",
+      label: "Escalado por",
+      value: opts.actor || "humano (UI)",
+    },
+  ];
+  if (conv.user_name) evidences.push({ type: "user", label: "Usuario", value: conv.user_name });
+  if (conv.user_email) evidences.push({ type: "user", label: "Email", value: conv.user_email });
+  if (conv.client) evidences.push({ type: "client", label: "Cliente", value: conv.client });
+  evidences.push({ type: "channel", label: "Canal", value: conv.channel });
+
+  const ticket = await createTicket({
+    conversationId,
+    title: triage.title,
+    summary: triage.summary,
+    systemAffected: triage.sap_module,
+    category: triage.category,
+    priority: triage.urgency,
+    slaMinutes: slaMinutesForUrgency(triage.urgency),
+    assignedRole: suggestedAssigneeRole(triage.sap_module),
+    evidences,
+  });
+
+  await updateConversation(conversationId, {
+    status: "escalated",
+    escalated_to_ticket: ticket.id,
+  });
+
+  await appendMessage(
+    conversationId,
+    "system",
+    `📤 Caso escalado manualmente a Nivel 2 con el ticket ${ticket.code}.${opts.reason ? ` Razon: ${opts.reason}` : ""} Un especialista te contactara dentro de la SLA (${ticket.sla_minutes} min).`,
+    { escalatedTicketId: ticket.id, ticketCode: ticket.code, manual: true, reason: opts.reason ?? null }
+  );
+
+  await recordSupportAudit({
+    conversationId,
+    ticketId: ticket.id,
+    action: "TICKET_CREATED",
+    actor: "human",
+    details: {
+      code: ticket.code,
+      priority: ticket.priority,
+      sla_minutes: ticket.sla_minutes,
+      assigned_role: ticket.assigned_role,
+      reason: opts.reason ?? null,
+      manual: true,
+      escalated_by: opts.actor ?? null,
+    },
+  });
+
+  emitEventFireAndForget("ticket.escalated", {
+    code: ticket.code,
+    title: ticket.title,
+    summary: ticket.summary,
+    priority: ticket.priority,
+    sla_minutes: ticket.sla_minutes,
+    sla_due_at: ticket.sla_due_at,
+    system_affected: ticket.system_affected,
+    category: ticket.category,
+    assigned_role: ticket.assigned_role,
+    conversation_id: conversationId,
+    channel: conv.channel,
+    user: conv.user_name,
+    client: conv.client,
+    reason: opts.reason ?? null,
+    manual: true,
+    escalated_by: opts.actor ?? null,
+  });
+
+  logger.info({ conversationId, ticketCode: ticket.code, actor: opts.actor }, "support: manual escalation");
+  return ticket;
+}

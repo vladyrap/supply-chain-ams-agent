@@ -5,7 +5,7 @@ import {
   updateConversation, recordSupportAudit, appendMessage,
 } from "../services/support/conversation.service";
 import {
-  handleFirstMessage, handleUserMessage, welcomeText,
+  handleFirstMessage, handleUserMessage, welcomeText, manualEscalate,
 } from "../services/support/orchestrator.service";
 import {
   listTickets, getTicketById, getTicketByCode, assignTicket,
@@ -122,6 +122,28 @@ export async function getConversationDetail(
   } catch (err) {
     logger.error({ err }, "support.conv detail fail");
     return reply.code(500).send({ success: false, error: "Error" });
+  }
+}
+
+export async function postManualEscalate(
+  req: FastifyRequest<{ Params: { id: string }; Body: { reason?: string } }>,
+  reply: FastifyReply
+) {
+  const { id } = req.params;
+  const reason = (req.body?.reason ?? "").trim();
+  try {
+    const userId = await getUserId(req);
+    let actorLabel: string | undefined;
+    if (userId) {
+      const u = await getUserBySession((req as FastifyRequest & { cookies?: Record<string, string> }).cookies?.[COOKIE] ?? "");
+      actorLabel = u ? `${u.name} (${u.email}, ${u.role})` : userId;
+    }
+    const ticket = await manualEscalate(id, { reason: reason || undefined, actor: actorLabel });
+    return reply.send({ success: true, ticket });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Error escalando manualmente";
+    logger.warn({ err, id, reason }, "support.manualEscalate fail");
+    return reply.code(400).send({ success: false, error: message });
   }
 }
 

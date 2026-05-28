@@ -5,6 +5,7 @@ import {
   getConversations,
   getConversationDetail,
   postCloseConversation,
+  postManualEscalate,
   getTicketsRoute,
   getTicketDetail,
   postAssignTicket,
@@ -30,6 +31,7 @@ export async function supportRoutes(app: FastifyInstance) {
   app.get("/api/support/conversations/:id", getConversationDetail);
   app.post("/api/support/conversations/:id/messages", postSendMessage);
   app.post("/api/support/conversations/:id/close", postCloseConversation);
+  app.post("/api/support/conversations/:id/escalate", postManualEscalate);
 
   // Tickets
   app.get("/api/support/tickets", getTicketsRoute);
