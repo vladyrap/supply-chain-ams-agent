@@ -1,6 +1,53 @@
 # supply-chain-ams-agent
 
-> **Agente AMS Supply Chain** — consultor senior SAP impulsado por LLM (Gemini 2.5 Flash en Fase 1, intercambiable a Claude) para clasificar, diagnosticar y guiar la resolución de incidentes de cadena de suministro (MM, SD, PP, WM/EWM, QM, PM, Ariba, IBP, integraciones).
+[![CI](https://github.com/vladyrap/supply-chain-ams-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/vladyrap/supply-chain-ams-agent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Status](https://img.shields.io/badge/Status-Active-success)]()
+[![Node](https://img.shields.io/badge/Node-20-339933?logo=node.js&logoColor=white)](https://nodejs.org)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+[![Fastify](https://img.shields.io/badge/Fastify-4-000000?logo=fastify)](https://fastify.dev)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16_+_pgvector-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org)
+[![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io)
+[![Gemini](https://img.shields.io/badge/LLM-Gemini_2.5_Flash-4285F4?logo=google)](https://ai.google.dev)
+[![Twilio](https://img.shields.io/badge/Voice-Twilio-F22F46?logo=twilio&logoColor=white)](https://www.twilio.com/voice)
+[![Whisper](https://img.shields.io/badge/STT-Whisper-412991?logo=openai&logoColor=white)](https://github.com/openai/whisper)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com)
+[![Made with Claude Code](https://img.shields.io/badge/Made_with-Claude_Code-D97757?logo=anthropic&logoColor=white)](https://claude.com/claude-code)
+
+> **Agente AMS Supply Chain** — consultor senior SAP impulsado por LLM (Gemini 2.5 Flash, intercambiable a Claude) para clasificar, diagnosticar y guiar la resolución de incidentes de cadena de suministro (MM, SD, PP, WM/EWM, QM, PM, Ariba, IBP, integraciones).
+>
+> Incluye **chat web**, **mesa de soporte con IA Nivel 1/2**, **RAG documental con pgvector**, **integraciones webhook/Slack/email**, **SAP read-only**, **reuniones con Whisper**, y **atención telefónica vía Twilio Voice**.
+
+## 🧭 Repos relacionados
+
+Este es el **backend del agente**. Funciona con dos repos hermanos:
+
+| Repo | Rol |
+|---|---|
+| [`supply-chain-ams-agent`](https://github.com/vladyrap/supply-chain-ams-agent) **← estás aquí** | API + LLM + workers + DB + observabilidad |
+| [`supply-chain-ams-platform`](https://github.com/vladyrap/supply-chain-ams-platform) | UI Next.js — 20+ módulos, war-room 3D, asistente Jaimito, voz |
+| [`supply-chain-ams-stack`](https://github.com/vladyrap/supply-chain-ams-stack) | Orquestador `docker compose up` para los 13 contenedores juntos |
+
+## 🚀 Quickstart
+
+```bash
+git clone https://github.com/vladyrap/supply-chain-ams-agent
+cd supply-chain-ams-agent
+cp .env.example .env
+# Editar .env con tu GEMINI_API_KEY (https://aistudio.google.com/app/apikey)
+docker compose up -d
+curl http://localhost:6601/health
+```
+
+Para levantar también la UI:
+
+```bash
+git clone https://github.com/vladyrap/supply-chain-ams-stack ../supply-chain-ams-stack
+git clone https://github.com/vladyrap/supply-chain-ams-platform ../supply-chain-ams-platform
+cd ../supply-chain-ams-stack
+docker compose up -d
+# UI en http://localhost:6700
+```
 
 ---
 
