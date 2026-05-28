@@ -2,6 +2,7 @@ import "dotenv/config";
 import { buildServer } from "./server";
 import { logger } from "./utils/logger";
 import { bootstrapAdminIfNeeded } from "./services/auth.service";
+import { ensureVoiceSchema } from "./services/call-log.service";
 
 const PORT = Number(process.env.BACKEND_PORT ?? 8000);
 const HOST = "0.0.0.0";
@@ -12,6 +13,11 @@ async function main() {
   // Crear admin de bootstrap si está configurado en env vars y no hay usuarios.
   await bootstrapAdminIfNeeded().catch((err) => {
     logger.warn({ err }, "bootstrap admin falló");
+  });
+
+  // Asegurar schema del canal telefónico (idempotente, best-effort).
+  await ensureVoiceSchema().catch((err) => {
+    logger.warn({ err }, "ensureVoiceSchema falló (continuamos)");
   });
 
   try {

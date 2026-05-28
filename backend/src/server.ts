@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import cookie from "@fastify/cookie";
+import formbody from "@fastify/formbody";
 import { logger } from "./utils/logger";
 import { healthRoutes } from "./routes/health.routes";
 import { amsRoutes } from "./routes/ams.routes";
@@ -17,6 +18,7 @@ import { searchRoutes } from "./routes/search.routes";
 import { evalRoutes } from "./routes/eval.routes";
 import { graphRoutes } from "./routes/graph.routes";
 import { demoRoutes } from "./routes/demo.routes";
+import { voiceRoutes } from "./routes/voice.routes";
 import { registry, httpRequestsTotal, httpRequestDuration } from "./utils/metrics";
 
 export function buildServer() {
@@ -41,6 +43,10 @@ export function buildServer() {
   app.register(cookie, {
     secret: process.env.COOKIE_SECRET || "ams-dev-cookie-secret-change-in-prod-please",
   });
+
+  // Twilio webhooks usan application/x-www-form-urlencoded.
+  // Sin este parser, req.body llega vacío en /api/voice/*.
+  app.register(formbody);
 
   // Métricas Prometheus
   app.addHook("onResponse", async (req, reply) => {
@@ -74,6 +80,7 @@ export function buildServer() {
   app.register(evalRoutes);
   app.register(graphRoutes);
   app.register(demoRoutes);
+  app.register(voiceRoutes);
 
   app.setErrorHandler((err, _req, reply) => {
     logger.error({ err }, "Unhandled error");

@@ -242,6 +242,114 @@ Resumen:
 
 ---
 
+---
+
+## Atención telefónica con IA (Canal Voice)
+
+### Qué hace
+
+Permite que un cliente **llame por teléfono** a un número configurado y sea atendido por la IA del agente AMS. La llamada se procesa con reconocimiento de voz (STT) y la respuesta del agente se sintetiza a voz (TTS) — todo orquestado por Twilio Voice.
+
+Flujo end-to-end:
+
+1. Cliente marca el número Twilio configurado
+2. Twilio hace `POST /api/voice/incoming` con el `CallSid`
+3. Backend responde TwiML con saludo + `<Gather input="speech">`
+4. Cliente habla; Twilio transcribe y hace `POST /api/voice/process-speech` con `SpeechResult`
+5. Backend envía el texto al agente (modelo `gemini-2.5-flash-lite` + `prompts/voice-system-prompt.md`)
+6. Gemini responde en estilo conversacional breve (sin markdown, frases cortas)
+7. Backend devuelve TwiML con `<Say>` (TTS) y nuevo `<Gather>` para continuar
+8. Twilio hace `POST /api/voice/status` cuando la llamada termina; el backend cierra el `call_log`
+
+### Proveedor
+
+**Twilio Voice** en esta primera versión. El módulo está estructurado con una interfaz `VoiceProvider` para que más adelante se pueda agregar **Vonage**, **Telnyx**, **SIP propio**, **Asterisk** o cualquier PBX sin tocar los controllers.
+
+### Variables de entorno
+
+```
+TWILIO_ACCOUNT_SID=ACxxxxxxxx...
+TWILIO_AUTH_TOKEN=xxxxxxxx...
+TWILIO_PHONE_NUMBER=+1xxxxxxxxxx
+VOICE_DEFAULT_LANGUAGE=es-CL
+VOICE_DEFAULT_VOICE=alice
+VOICE_AGENT_MODE=SUPPORT
+GEMINI_VOICE_MODEL=gemini-2.5-flash-lite
+VOICE_MAX_OUTPUT_TOKENS=220
+```
+
+Todas son opcionales en MVP. Sin `TWILIO_AUTH_TOKEN` el módulo arranca pero NO valida la firma de los webhooks (modo dev).
+
+### Endpoints nuevos
+
+| Método | Ruta | Para qué |
+|--------|------|----------|
+| `POST` | `/api/voice/incoming` | Webhook que Twilio llama al recibir una llamada. Responde TwiML con saludo + Gather |
+| `POST` | `/api/voice/process-speech` | Webhook tras el Gather. Envía `SpeechResult` al agente y responde TwiML con la respuesta + nuevo Gather |
+| `POST` | `/api/voice/status` | Status callback de Twilio (ringing, completed, busy, failed…). Persiste duración y cierra el call_log |
+| `GET`  | `/api/voice/calls` | Listado de llamadas (números enmascarados) |
+| `GET`  | `/api/voice/calls/:callSid` | Detalle de una llamada con sus turnos (USER/AI/SYSTEM) |
+
+### Configurar el webhook en Twilio
+
+1. Twilio Console → **Phone Numbers → Manage → Active Numbers**
+2. Hacer click en el número adquirido
+3. Sección **Voice Configuration**:
+   - **A call comes in** → `Webhook` → `POST` → `https://<tu-dominio>/api/voice/incoming`
+   - **Call status changes** → `https://<tu-dominio>/api/voice/status`
+
+### Probar localmente con ngrok
+
+Twilio necesita una URL **pública** (HTTPS). Para desarrollo:
+
+```bash
+# 1) Levantar el stack
+docker compose -f supply-chain-ams-stack/docker-compose.yml up -d
+
+# 2) Exponer el backend (puerto host 6601)
+ngrok http 6601
+
+# 3) Copiar la URL https que da ngrok, por ejemplo:
+#    https://abc1234.ngrok-free.app
+#
+# 4) En Twilio configurar como webhook:
+#    Voice:  https://abc1234.ngrok-free.app/api/voice/incoming  (POST)
+#    Status: https://abc1234.ngrok-free.app/api/voice/status    (POST)
+#
+# 5) Llamar al número desde tu celular
+```
+
+### Tablas que se crean
+
+```sql
+call_logs  (id, call_sid UNIQUE, from_number, to_number, call_status,
+            started_at, ended_at, duration_seconds,
+            transcript, ai_responses, metadata jsonb, created_at)
+call_turns (id, call_sid, speaker IN ('USER','AI','SYSTEM'),
+            message, created_at)
+```
+
+Se crean automáticamente al arranque del backend vía `ensureVoiceSchema()` (idempotente). También están en `database/init.sql` para deploys nuevos.
+
+### Limitaciones del MVP
+
+- ❌ No hay llamadas salientes (sólo entrantes)
+- ❌ No conecta SAP (igual que el resto del agente)
+- ❌ No requiere login (los webhooks de Twilio son sin auth de cookie)
+- ❌ No usa RAG todavía (la voz no consulta documentación, solo el LLM puro con voice-prompt)
+- ⚠️ Validación de firma `X-Twilio-Signature` implementada pero **no enforced** por default. Habilitar antes de producción
+- ⚠️ El idioma y la voz se setean por env. Para cambiar mid-call se requiere refactor
+
+### Consideraciones de privacidad
+
+- **No se guarda audio.** Sólo el texto transcrito por Twilio (consentimiento del usuario aplica al llamar)
+- Los números de teléfono se **enmascaran en logs** (`+56912345678` → `+56****5678`) vía `maskPhone()`
+- Las credenciales Twilio nunca se exponen en logs ni en respuestas
+- Cada llamada genera una fila en `call_logs` y N filas en `call_turns`, accesibles solo por API interna
+- TODO: agregar TTL de retención + endpoint de borrado por solicitud (GDPR/LGPD)
+
+---
+
 ## Estructura del proyecto
 
 ```

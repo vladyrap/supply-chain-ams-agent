@@ -181,3 +181,38 @@ CREATE INDEX IF NOT EXISTS idx_meetings_client   ON meetings (client);
 -- desde 2026-05-26. Si vuelves a crear la DB desde cero,
 -- consulta la documentación o usa el SQL del repositorio.
 -- =====================================================
+
+-- -----------------------------------------------------
+-- Canal Telefónico IA (Fase Voice, 2026-05-28)
+-- Tablas: call_logs, call_turns
+-- También se crean en runtime vía ensureVoiceSchema() para
+-- DBs ya en producción que no corren init.sql.
+-- No se almacena audio, solo texto.
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS call_logs (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    call_sid          TEXT NOT NULL UNIQUE,
+    from_number       TEXT,
+    to_number         TEXT,
+    call_status       TEXT,
+    started_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at          TIMESTAMPTZ,
+    duration_seconds  INTEGER,
+    transcript        TEXT,        -- transcripción concatenada del usuario
+    ai_responses      TEXT,        -- respuestas concatenadas de la IA
+    metadata          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_call_logs_started ON call_logs (started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_call_logs_status  ON call_logs (call_status);
+
+CREATE TABLE IF NOT EXISTS call_turns (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    call_sid    TEXT NOT NULL,
+    speaker     TEXT NOT NULL CHECK (speaker IN ('USER', 'AI', 'SYSTEM')),
+    message     TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_call_turns_call_sid ON call_turns (call_sid, created_at);

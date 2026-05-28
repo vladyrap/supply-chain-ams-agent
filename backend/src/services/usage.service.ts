@@ -19,7 +19,8 @@ const PRICING: Record<string, { in: number; out: number }> = {
 const DEFAULT_PRICING = { in: 0.10, out: 0.40 };
 
 export type UsageSource =
-  | "chat" | "research" | "triage" | "resolver" | "eval" | "ingest" | "embedding" | "other";
+  | "chat" | "research" | "triage" | "resolver" | "eval" | "ingest" | "embedding"
+  | "voice" | "other";
 
 export interface UsageRecord {
   source: UsageSource;
