@@ -91,11 +91,34 @@ export interface EvalRunReport {
   results: EvalSingleResult[];
 }
 
-async function callAgent(question: string, module: string | null): Promise<{ text: string; latencyMs: number }> {
-  // Reusamos chatWithAgent del claude.service para que use el mismo
-  // system prompt activo + few-shot. Así el eval mide al agente *real*.
-  const { chatWithAgent } = await import("./claude.service");
+async function callAgent(
+  question: string,
+  module: string | null,
+  systemPromptOverride?: string,
+): Promise<{ text: string; latencyMs: number }> {
   const start = Date.now();
+  // Si hay override, hacemos llamada directa a Gemini con ese system prompt.
+  // Sino, usamos chatWithAgent del claude.service (agente real con prompt activo + few-shot).
+  if (systemPromptOverride && systemPromptOverride.trim()) {
+    const ai = getClient();
+    try {
+      const resp = await ai.models.generateContent({
+        model: JUDGE_MODEL,
+        contents: question,
+        config: {
+          systemInstruction: systemPromptOverride,
+          maxOutputTokens: 1024,
+          temperature: 0.4,
+        },
+      });
+      const text = (resp.text ?? "").trim() || "(respuesta vacía)";
+      return { text, latencyMs: Date.now() - start };
+    } catch (err) {
+      logger.warn({ err }, "callAgent override fail");
+      return { text: `(error con prompt override: ${err instanceof Error ? err.message : "desconocido"})`, latencyMs: Date.now() - start };
+    }
+  }
+  const { chatWithAgent } = await import("./claude.service");
   const r = await chatWithAgent({
     userMessage: question,
     user: "qa-eval",
@@ -182,17 +205,23 @@ Reglas:
 export async function runQaEvaluation(opts: {
   limit?: number;
   triggeredBy?: string;
+  /** Si se pasa, se usa este system prompt en lugar del activo del agente */
+  systemPromptOverride?: string;
+  /** Label opcional para este run (útil en A/B) */
+  promptLabelOverride?: string;
 } = {}): Promise<EvalRunReport> {
   await ensureSchema();
   const limit = Math.max(1, Math.min(MAX_BATCH, opts.limit ?? DEFAULT_BATCH));
 
   // 1. Leer prompt activo (solo para registrarlo en el run)
-  let promptLabel: string | null = null;
-  try {
-    const { getActivePrompt } = await import("./agent-lab.service");
-    const v = await getActivePrompt();
-    if (v) promptLabel = v.label;
-  } catch { /* ignore */ }
+  let promptLabel: string | null = opts.promptLabelOverride ?? null;
+  if (!promptLabel) {
+    try {
+      const { getActivePrompt } = await import("./agent-lab.service");
+      const v = await getActivePrompt();
+      if (v) promptLabel = v.label;
+    } catch { /* ignore */ }
+  }
 
   // 2. Crear run
   const { rows: runRows } = await query<{ id: string }>(
@@ -233,7 +262,7 @@ export async function runQaEvaluation(opts: {
   const start = Date.now();
   for (const qa of qas) {
     try {
-      const { text: actual, latencyMs } = await callAgent(qa.question, qa.item_module);
+      const { text: actual, latencyMs } = await callAgent(qa.question, qa.item_module, opts.systemPromptOverride);
       const judged = await judgeWithGemini(qa.question, qa.expected_answer, actual);
       const result: EvalSingleResult = {
         qaId: qa.id,
@@ -356,4 +385,251 @@ export async function getEvalRunDetail(runId: string): Promise<EvalRunDetail | n
       latencyMs: r.latency_ms,
     })),
   };
+}
+
+// ============================================================================
+// A/B testing — corre 2 evals con prompts distintos y devuelve comparación
+// ============================================================================
+export interface AbTestInput {
+  /** Variante A: si se omite, usa el prompt activo del agente */
+  promptA?: { systemPrompt: string; label: string };
+  /** Variante B: prompt candidato a evaluar */
+  promptB: { systemPrompt: string; label: string };
+  limit?: number;
+  triggeredBy?: string;
+}
+
+export interface AbTestReport {
+  runA: EvalRunReport;
+  runB: EvalRunReport;
+  winner: "A" | "B" | "tie";
+  scoreDelta: number;          // runB.avgScore - runA.avgScore
+  passDelta: number;           // runB.passed - runA.passed
+  improvedQas: string[];       // qaIds donde B > A
+  degradedQas: string[];       // qaIds donde B < A
+  unchangedQas: string[];
+}
+
+export async function runAbTest(input: AbTestInput): Promise<AbTestReport> {
+  // Corremos A primero (sin override = activo), luego B con override
+  const runA = await runQaEvaluation({
+    limit: input.limit,
+    triggeredBy: (input.triggeredBy ?? "ab-test") + ":A",
+    systemPromptOverride: input.promptA?.systemPrompt,
+    promptLabelOverride: input.promptA?.label ?? "(activo)",
+  });
+  const runB = await runQaEvaluation({
+    limit: input.limit,
+    triggeredBy: (input.triggeredBy ?? "ab-test") + ":B",
+    systemPromptOverride: input.promptB.systemPrompt,
+    promptLabelOverride: input.promptB.label,
+  });
+
+  // Comparar Q&A por Q&A
+  const mapA = new Map(runA.results.map((r) => [r.qaId, r]));
+  const mapB = new Map(runB.results.map((r) => [r.qaId, r]));
+  const allIds = new Set([...mapA.keys(), ...mapB.keys()]);
+  const improvedQas: string[] = [];
+  const degradedQas: string[] = [];
+  const unchangedQas: string[] = [];
+  for (const id of allIds) {
+    const a = mapA.get(id), b = mapB.get(id);
+    const sa = a?.score ?? 0, sb = b?.score ?? 0;
+    if (sb > sa + 2) improvedQas.push(id);
+    else if (sb < sa - 2) degradedQas.push(id);
+    else unchangedQas.push(id);
+  }
+
+  const scoreDelta = runB.avgScore - runA.avgScore;
+  const passDelta = runB.passed - runA.passed;
+  const winner: "A" | "B" | "tie" =
+    Math.abs(scoreDelta) <= 1 ? "tie"
+    : scoreDelta > 0 ? "B"
+    : "A";
+
+  return { runA, runB, winner, scoreDelta, passDelta, improvedQas, degradedQas, unchangedQas };
+}
+
+// ============================================================================
+// AUTO-PROMOTE — si una variante gana por ≥ minDelta puntos, se adopta sola
+// ============================================================================
+export interface AutoPromoteInput {
+  candidate: { systemPrompt: string; label: string; temperature?: number; maxTokens?: number };
+  /** Mínimo score delta para auto-adoptar (default 5) */
+  minDelta?: number;
+  limit?: number;
+  triggeredBy?: string;
+  /** Si false, devuelve la recomendación pero NO adopta */
+  apply?: boolean;
+}
+
+export interface AutoPromoteResult {
+  decision: "adopted" | "skipped" | "no_change_needed";
+  reason: string;
+  abTest: AbTestReport;
+  /** Solo presente si decision === "adopted" */
+  newActiveVersionId?: string;
+}
+
+// ============================================================================
+// COMPARADOR de dos runs existentes
+// ============================================================================
+export interface RunDiffResult {
+  qaId: string;
+  question: string;
+  scoreA: number; scoreB: number; delta: number;
+  verdictA: "pass" | "partial" | "fail";
+  verdictB: "pass" | "partial" | "fail";
+  status: "improved" | "degraded" | "unchanged" | "only_a" | "only_b";
+}
+
+export interface RunDiffReport {
+  runA: EvalRunSummary;
+  runB: EvalRunSummary;
+  scoreDelta: number;
+  passDelta: number;
+  improved: RunDiffResult[];
+  degraded: RunDiffResult[];
+  unchanged: RunDiffResult[];
+  onlyA: RunDiffResult[];
+  onlyB: RunDiffResult[];
+}
+
+export async function diffEvalRuns(idA: string, idB: string): Promise<RunDiffReport | null> {
+  const [a, b] = await Promise.all([getEvalRunDetail(idA), getEvalRunDetail(idB)]);
+  if (!a || !b) return null;
+
+  const mapA = new Map(a.results.map((r) => [r.qaId, r]));
+  const mapB = new Map(b.results.map((r) => [r.qaId, r]));
+  const allIds = new Set([...mapA.keys(), ...mapB.keys()]);
+
+  const improved: RunDiffResult[] = [];
+  const degraded: RunDiffResult[] = [];
+  const unchanged: RunDiffResult[] = [];
+  const onlyA: RunDiffResult[] = [];
+  const onlyB: RunDiffResult[] = [];
+
+  for (const id of allIds) {
+    const ra = mapA.get(id);
+    const rb = mapB.get(id);
+    if (ra && !rb) {
+      onlyA.push({
+        qaId: id, question: ra.question,
+        scoreA: ra.score, scoreB: 0, delta: -ra.score,
+        verdictA: ra.verdict, verdictB: "fail",
+        status: "only_a",
+      });
+      continue;
+    }
+    if (!ra && rb) {
+      onlyB.push({
+        qaId: id, question: rb.question,
+        scoreA: 0, scoreB: rb.score, delta: rb.score,
+        verdictA: "fail", verdictB: rb.verdict,
+        status: "only_b",
+      });
+      continue;
+    }
+    if (ra && rb) {
+      const delta = rb.score - ra.score;
+      const r: RunDiffResult = {
+        qaId: id, question: ra.question,
+        scoreA: ra.score, scoreB: rb.score, delta,
+        verdictA: ra.verdict, verdictB: rb.verdict,
+        status: delta > 2 ? "improved" : delta < -2 ? "degraded" : "unchanged",
+      };
+      if (r.status === "improved") improved.push(r);
+      else if (r.status === "degraded") degraded.push(r);
+      else unchanged.push(r);
+    }
+  }
+
+  improved.sort((x, y) => y.delta - x.delta);
+  degraded.sort((x, y) => x.delta - y.delta);
+
+  // a.summary y b.summary están en la fila del run sin el campo "results"
+  const runA: EvalRunSummary = {
+    id: a.id, triggered_by: a.triggered_by, total_qas: a.total_qas,
+    passed: a.passed, failed: a.failed, avg_score: a.avg_score,
+    prompt_label: a.prompt_label, started_at: a.started_at, finished_at: a.finished_at,
+  };
+  const runB: EvalRunSummary = {
+    id: b.id, triggered_by: b.triggered_by, total_qas: b.total_qas,
+    passed: b.passed, failed: b.failed, avg_score: b.avg_score,
+    prompt_label: b.prompt_label, started_at: b.started_at, finished_at: b.finished_at,
+  };
+
+  return {
+    runA, runB,
+    scoreDelta: b.avg_score - a.avg_score,
+    passDelta: b.passed - a.passed,
+    improved, degraded, unchanged, onlyA, onlyB,
+  };
+}
+
+export async function autoPromoteIfBetter(input: AutoPromoteInput): Promise<AutoPromoteResult> {
+  const minDelta = Math.max(1, input.minDelta ?? 5);
+  const ab = await runAbTest({
+    promptB: { systemPrompt: input.candidate.systemPrompt, label: input.candidate.label },
+    limit: input.limit,
+    triggeredBy: input.triggeredBy ?? "auto-promote",
+  });
+
+  // Si runA tiene 0 Q&A, no podemos comparar
+  if (ab.runA.totalQas === 0) {
+    return {
+      decision: "skipped",
+      reason: "No hay Q&A aprobadas para evaluar. Generá Q&A primero y aprobalas.",
+      abTest: ab,
+    };
+  }
+
+  if (ab.scoreDelta < minDelta) {
+    return {
+      decision: "skipped",
+      reason: `Delta de score (${ab.scoreDelta}) por debajo del mínimo requerido (${minDelta}). Mantengo el prompt activo.`,
+      abTest: ab,
+    };
+  }
+  if (ab.winner !== "B") {
+    return {
+      decision: "no_change_needed",
+      reason: "El candidato no superó al prompt activo. Sin cambios.",
+      abTest: ab,
+    };
+  }
+
+  if (input.apply === false) {
+    return {
+      decision: "no_change_needed",
+      reason: `Candidato ganaría por +${ab.scoreDelta} (≥ ${minDelta}). Solo análisis, no se adoptó.`,
+      abTest: ab,
+    };
+  }
+
+  // Adoptar
+  try {
+    const { adoptPrompt } = await import("./agent-lab.service");
+    const adopted = await adoptPrompt({
+      label: input.candidate.label,
+      systemPrompt: input.candidate.systemPrompt,
+      temperature: input.candidate.temperature,
+      maxTokens: input.candidate.maxTokens,
+      createdBy: "auto-promote",
+      adoptionNotes: `Auto-adoptado tras ganar A/B por +${ab.scoreDelta} pts (run B ${ab.runB.runId.slice(0, 8)}). Mejoró ${ab.improvedQas.length} Q&A, degradó ${ab.degradedQas.length}.`,
+    });
+    return {
+      decision: "adopted",
+      reason: `Candidato adoptado automáticamente. Ganó por +${ab.scoreDelta} pts sobre el prompt activo.`,
+      abTest: ab,
+      newActiveVersionId: adopted.id,
+    };
+  } catch (err) {
+    logger.error({ err }, "auto-promote adopt fail");
+    return {
+      decision: "skipped",
+      reason: `Error adoptando: ${err instanceof Error ? err.message : "desconocido"}`,
+      abTest: ab,
+    };
+  }
 }

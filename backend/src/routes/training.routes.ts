@@ -44,4 +44,12 @@ export async function trainingRoutes(app: FastifyInstance) {
   app.post("/api/training/eval/run", ctrl.postRunQaEval);
   app.get("/api/training/eval/runs", ctrl.getEvalRunsList);
   app.get<{ Params: { id: string } }>("/api/training/eval/runs/:id", ctrl.getEvalRunDetailRoute);
+
+  // A/B testing + Auto-promote + Diff
+  app.post("/api/training/eval/ab", ctrl.postAbTest);
+  app.post("/api/training/eval/auto-promote", ctrl.postAutoPromote);
+  app.get<{ Querystring: { a?: string; b?: string } }>("/api/training/eval/diff", ctrl.getEvalDiff);
+
+  // Tickets resueltos -> Q&A propuestas
+  app.post("/api/training/qa/propose-from-tickets", ctrl.postProposeQasFromTickets);
 }

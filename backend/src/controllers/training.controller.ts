@@ -2,7 +2,11 @@ import type { FastifyRequest, FastifyReply } from "fastify";
 import { logger } from "../utils/logger";
 import * as training from "../services/training.service";
 import { runGapDetection } from "../services/gap-detector.service";
-import { runQaEvaluation, listEvalRuns, getEvalRunDetail } from "../services/qa-eval.service";
+import {
+  runQaEvaluation, listEvalRuns, getEvalRunDetail,
+  runAbTest, autoPromoteIfBetter, diffEvalRuns,
+} from "../services/qa-eval.service";
+import { proposeQAsFromTickets } from "../services/ticket-to-qa.service";
 import type {
   KnowledgeStatus, KnowledgeType, Priority, ValidationStage,
   TrainingVersionStatus, GapStatus,
@@ -418,5 +422,101 @@ export async function getEvalRunDetailRoute(
   } catch (err) {
     logger.error({ err, id }, "training.getEvalRunDetail fail");
     return reply.code(500).send({ success: false, error: "Error obteniendo detalle" });
+  }
+}
+
+// ============================================================
+// A/B TEST + AUTO-PROMOTE
+// ============================================================
+interface AbBody {
+  promptA?: { systemPrompt: string; label: string };
+  promptB?: { systemPrompt: string; label: string };
+  limit?: number;
+}
+export async function postAbTest(
+  req: FastifyRequest<{ Body: AbBody }>,
+  reply: FastifyReply
+) {
+  const b = req.body || {};
+  if (!b.promptB?.systemPrompt?.trim() || !b.promptB?.label?.trim()) {
+    return reply.code(400).send({ success: false, error: "promptB.systemPrompt y promptB.label son obligatorios" });
+  }
+  try {
+    const report = await runAbTest({
+      promptA: b.promptA,
+      promptB: b.promptB,
+      limit: b.limit,
+    });
+    return reply.send({ success: true, report });
+  } catch (err) {
+    logger.error({ err }, "training.abTest fail");
+    return reply.code(500).send({ success: false, error: "Error ejecutando A/B" });
+  }
+}
+
+interface AutoPromoteBody {
+  candidate?: { systemPrompt: string; label: string; temperature?: number; maxTokens?: number };
+  minDelta?: number;
+  limit?: number;
+  apply?: boolean;
+}
+export async function postAutoPromote(
+  req: FastifyRequest<{ Body: AutoPromoteBody }>,
+  reply: FastifyReply
+) {
+  const b = req.body || {};
+  if (!b.candidate?.systemPrompt?.trim() || !b.candidate?.label?.trim()) {
+    return reply.code(400).send({ success: false, error: "candidate.systemPrompt y candidate.label son obligatorios" });
+  }
+  try {
+    const result = await autoPromoteIfBetter({
+      candidate: b.candidate,
+      minDelta: b.minDelta,
+      limit: b.limit,
+      apply: b.apply ?? false,
+    });
+    return reply.send({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "training.autoPromote fail");
+    return reply.code(500).send({ success: false, error: "Error en auto-promote" });
+  }
+}
+
+// ============================================================
+// COMPARADOR de runs
+// ============================================================
+export async function getEvalDiff(
+  req: FastifyRequest<{ Querystring: { a?: string; b?: string } }>,
+  reply: FastifyReply
+) {
+  const { a, b } = req.query;
+  if (!a || !b) return reply.code(400).send({ success: false, error: "a y b son obligatorios" });
+  try {
+    const diff = await diffEvalRuns(a, b);
+    if (!diff) return reply.code(404).send({ success: false, error: "Run(s) no encontrado(s)" });
+    return reply.send({ success: true, diff });
+  } catch (err) {
+    logger.error({ err }, "training.diffEvalRuns fail");
+    return reply.code(500).send({ success: false, error: "Error comparando runs" });
+  }
+}
+
+// ============================================================
+// TICKETS -> Q&A
+// ============================================================
+export async function postProposeQasFromTickets(
+  req: FastifyRequest<{ Body: { limit?: number; daysBack?: number } }>,
+  reply: FastifyReply
+) {
+  try {
+    const report = await proposeQAsFromTickets({
+      limit: req.body?.limit,
+      daysBack: req.body?.daysBack,
+    });
+    return reply.send({ success: true, report });
+  } catch (err) {
+    logger.error({ err }, "training.proposeQasFromTickets fail");
+    const msg = err instanceof Error ? err.message : "Error proponiendo Q&A";
+    return reply.code(500).send({ success: false, error: msg });
   }
 }
