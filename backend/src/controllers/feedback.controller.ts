@@ -33,6 +33,7 @@ interface PostFeedbackBody {
   conversationId?: string;
   messageId?: string;
   ticketId?: string;
+  responseId?: string;          // <- vincula con agent_response_provenance
   query?: string;
   response?: string;
   metadata?: Record<string, unknown>;
@@ -63,10 +64,21 @@ export async function postFeedback(
       ticketId: b.ticketId || null,
       query: b.query?.slice(0, 4000) || null,
       response: b.response?.slice(0, 16000) || null,
-      metadata: b.metadata ?? {},
+      metadata: { ...(b.metadata ?? {}), responseId: b.responseId ?? null },
       createdBy: userId,
     });
-    return reply.send({ success: true, feedback: row });
+    // Loop de aprendizaje: si el feedback referencia un responseId,
+    // ajustamos scores de los items/Q&A usados en esa respuesta.
+    let learning: { itemsTouched: number; qasTouched: number } | null = null;
+    if (b.responseId) {
+      try {
+        const { adjustScoreFromFeedback } = await import("../services/provenance.service");
+        learning = await adjustScoreFromFeedback(b.responseId, b.kind as FeedbackKind);
+      } catch (err) {
+        logger.debug({ err }, "adjustScoreFromFeedback fail (continuo)");
+      }
+    }
+    return reply.send({ success: true, feedback: row, learning });
   } catch (err) {
     logger.error({ err }, "feedback.post fail");
     return reply.code(500).send({ success: false, error: "Error registrando feedback" });

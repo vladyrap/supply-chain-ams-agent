@@ -2,6 +2,7 @@ import type { FastifyRequest, FastifyReply } from "fastify";
 import { logger } from "../utils/logger";
 import * as training from "../services/training.service";
 import { runGapDetection } from "../services/gap-detector.service";
+import { runQaEvaluation, listEvalRuns, getEvalRunDetail } from "../services/qa-eval.service";
 import type {
   KnowledgeStatus, KnowledgeType, Priority, ValidationStage,
   TrainingVersionStatus, GapStatus,
@@ -374,5 +375,48 @@ export async function postRunGapDetection(
   } catch (err) {
     logger.error({ err }, "training.runGapDetection fail");
     return reply.code(500).send({ success: false, error: "Error ejecutando detección" });
+  }
+}
+
+// ============================================================
+// QA EVALUATION
+// ============================================================
+export async function postRunQaEval(
+  req: FastifyRequest<{ Body: { limit?: number; triggeredBy?: string } }>,
+  reply: FastifyReply
+) {
+  const limit = req.body?.limit;
+  try {
+    const report = await runQaEvaluation({ limit, triggeredBy: req.body?.triggeredBy });
+    return reply.send({ success: true, report });
+  } catch (err) {
+    logger.error({ err }, "training.runQaEval fail");
+    const msg = err instanceof Error ? err.message : "Error ejecutando evaluación";
+    return reply.code(500).send({ success: false, error: msg });
+  }
+}
+
+export async function getEvalRunsList(_req: FastifyRequest, reply: FastifyReply) {
+  try {
+    const runs = await listEvalRuns(30);
+    return reply.send({ success: true, count: runs.length, runs });
+  } catch (err) {
+    logger.error({ err }, "training.listEvalRuns fail");
+    return reply.code(500).send({ success: false, error: "Error listando runs" });
+  }
+}
+
+export async function getEvalRunDetailRoute(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply
+) {
+  const { id } = req.params;
+  try {
+    const detail = await getEvalRunDetail(id);
+    if (!detail) return reply.code(404).send({ success: false, error: "Run no encontrado" });
+    return reply.send({ success: true, run: detail });
+  } catch (err) {
+    logger.error({ err, id }, "training.getEvalRunDetail fail");
+    return reply.code(500).send({ success: false, error: "Error obteniendo detalle" });
   }
 }

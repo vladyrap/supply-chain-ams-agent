@@ -259,6 +259,13 @@ export async function updateItem(id: string, patch: UpdateItemInput): Promise<Kn
     `UPDATE kb_training_items SET ${sets.join(", ")} WHERE id = $${params.length} RETURNING *`,
     params
   );
+  // Si el item cambió a PUBLISHED o de PUBLISHED, invalidar few-shot cache
+  if (patch.status === "PUBLISHED" || patch.status === "ARCHIVED" || patch.status === "REJECTED") {
+    try {
+      const { invalidateFewShotCache } = await import("./few-shot.service");
+      invalidateFewShotCache();
+    } catch { /* ignore */ }
+  }
   return rows[0] ?? null;
 }
 
@@ -318,6 +325,13 @@ export async function updateQA(id: string, patch: { question?: string; expectedA
     `UPDATE kb_training_qa SET ${sets.join(", ")} WHERE id = $${params.length} RETURNING *`,
     params
   );
+  // Si se aprobó una Q&A, invalidar few-shot cache para que el agente la use de inmediato
+  if (patch.approved === true) {
+    try {
+      const { invalidateFewShotCache } = await import("./few-shot.service");
+      invalidateFewShotCache();
+    } catch { /* ignore */ }
+  }
   return rows[0] ?? null;
 }
 

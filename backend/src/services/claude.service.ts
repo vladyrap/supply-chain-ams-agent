@@ -104,6 +104,8 @@ export interface ClaudeChatResult {
   model: string;
   confidence: ConfidenceLevel;
   ragSources: RagSourceUsed[];
+  /** ID estable para que el feedback pueda referenciarlo y se ajusten scores */
+  responseId: string;
 }
 
 export interface ClaudeChatInput {
@@ -125,11 +127,26 @@ interface PreparedRequest {
   systemPrompt: string;
   contents: string | GeminiPart[];
   ragChunks: Awaited<ReturnType<typeof retrieveRelevantChunks>>;
+  /** IDs de Q&A y KB items inyectados como few-shot — usado por response provenance */
+  fewShotQaIds: string[];
+  fewShotItemIds: string[];
 }
 
 async function prepareRequest(input: ClaudeChatInput): Promise<PreparedRequest> {
   const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
-  const systemPrompt = await loadSystemPrompt();
+  const baseSystemPrompt = await loadSystemPrompt();
+
+  // Few-shot dinámico: Q&A aprobadas + KB items publicados que matchean
+  // léxicamente la query del usuario. Se concatena al system prompt si hay
+  // resultados, sino no afecta nada.
+  const { buildFewShotBlock } = await import("./few-shot.service");
+  const fewShot = await buildFewShotBlock(input.userMessage, input.module).catch((err) => {
+    logger.debug({ err }, "few-shot fail (continuo sin)");
+    return { block: "", qaIds: [] as string[], itemIds: [] as string[] };
+  });
+  const systemPrompt = fewShot.block
+    ? `${baseSystemPrompt}\n${fewShot.block}`
+    : baseSystemPrompt;
 
   const ragChunks = await retrieveRelevantChunks(input.userMessage, {
     module: input.module,
@@ -174,7 +191,7 @@ async function prepareRequest(input: ClaudeChatInput): Promise<PreparedRequest> 
     }
     contents = parts;
   }
-  return { model, systemPrompt, contents, ragChunks };
+  return { model, systemPrompt, contents, ragChunks, fewShotQaIds: fewShot.qaIds, fewShotItemIds: fewShot.itemIds };
 }
 
 function ragSourcesFromChunks(chunks: Awaited<ReturnType<typeof retrieveRelevantChunks>>): RagSourceUsed[] {
@@ -188,7 +205,7 @@ function ragSourcesFromChunks(chunks: Awaited<ReturnType<typeof retrieveRelevant
 
 export async function chatWithAgent(input: ClaudeChatInput): Promise<ClaudeChatResult> {
   const ai = getClient();
-  const { model, systemPrompt, contents, ragChunks } = await prepareRequest(input);
+  const { model, systemPrompt, contents, ragChunks, fewShotQaIds, fewShotItemIds } = await prepareRequest(input);
 
   logger.info(
     { model, module: input.module, environment: input.environment, attachmentCount: input.attachments?.length ?? 0 },
@@ -224,11 +241,30 @@ export async function chatWithAgent(input: ClaudeChatInput): Promise<ClaudeChatR
       metadata: { module: input.module, client: input.client },
     });
 
+    // Provenance: vincular respuesta con sus fuentes (Q&A few-shot, items
+    // y RAG docs) para que el feedback pueda ajustar scores después.
+    const responseId = `resp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    const ragDocIds = Array.from(new Set(ragChunks.map((c) => c.documentId)));
+    try {
+      const { recordProvenance } = await import("./provenance.service");
+      await recordProvenance({
+        responseId,
+        qaIds: fewShotQaIds,
+        itemIds: fewShotItemIds,
+        ragDocIds,
+        userQuery: input.userMessage,
+        module: input.module,
+      });
+    } catch (err) {
+      logger.debug({ err }, "provenance.record fail (continuo)");
+    }
+
     return {
       text,
       model,
       confidence: detectConfidence(text),
       ragSources: ragSourcesFromChunks(ragChunks),
+      responseId,
     };
   } catch (err) {
     if (err instanceof ConfigError) throw err;
@@ -251,6 +287,7 @@ export interface StreamDone {
   model: string;
   confidence: ConfidenceLevel;
   ragSources: RagSourceUsed[];
+  responseId: string;
 }
 
 export type StreamEvent = StreamChunk | StreamDone;
@@ -262,7 +299,7 @@ export type StreamEvent = StreamChunk | StreamDone;
  */
 export async function* chatWithAgentStream(input: ClaudeChatInput): AsyncGenerator<StreamEvent, void, unknown> {
   const ai = getClient();
-  const { model, systemPrompt, contents, ragChunks } = await prepareRequest(input);
+  const { model, systemPrompt, contents, ragChunks, fewShotQaIds, fewShotItemIds } = await prepareRequest(input);
 
   logger.info(
     { model, module: input.module, environment: input.environment, attachmentCount: input.attachments?.length ?? 0 },
@@ -323,11 +360,29 @@ export async function* chatWithAgentStream(input: ClaudeChatInput): AsyncGenerat
     metadata: { module: input.module, client: input.client, streaming: true },
   });
 
+  // Provenance + responseId también en streaming
+  const responseId = `resp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  const ragDocIds = Array.from(new Set(ragChunks.map((c) => c.documentId)));
+  try {
+    const { recordProvenance } = await import("./provenance.service");
+    await recordProvenance({
+      responseId,
+      qaIds: fewShotQaIds,
+      itemIds: fewShotItemIds,
+      ragDocIds,
+      userQuery: input.userMessage,
+      module: input.module,
+    });
+  } catch (err) {
+    logger.debug({ err }, "provenance.record stream fail (continuo)");
+  }
+
   yield {
     type: "done",
     fullText,
     model,
     confidence: detectConfidence(fullText),
     ragSources: ragSourcesFromChunks(ragChunks),
+    responseId,
   };
 }

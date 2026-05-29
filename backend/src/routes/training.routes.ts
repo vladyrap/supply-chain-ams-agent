@@ -39,4 +39,9 @@ export async function trainingRoutes(app: FastifyInstance) {
 
   // Auto-detección de brechas
   app.post("/api/training/gaps/detect", ctrl.postRunGapDetection);
+
+  // Evaluación automática de Q&A
+  app.post("/api/training/eval/run", ctrl.postRunQaEval);
+  app.get("/api/training/eval/runs", ctrl.getEvalRunsList);
+  app.get<{ Params: { id: string } }>("/api/training/eval/runs/:id", ctrl.getEvalRunDetailRoute);
 }
