@@ -7,6 +7,9 @@ import {
   runAbTest, autoPromoteIfBetter, diffEvalRuns,
 } from "../services/qa-eval.service";
 import { proposeQAsFromTickets } from "../services/ticket-to-qa.service";
+import { autoGenerateQasForItems } from "../services/qa-auto-generator.service";
+import { runSelfTrainingCycle } from "../services/self-training.service";
+import { loadExpandedCorpus, CORPUS_SIZE } from "../services/training-demo-corpus";
 import type {
   KnowledgeStatus, KnowledgeType, Priority, ValidationStage,
   TrainingVersionStatus, GapStatus,
@@ -518,5 +521,57 @@ export async function postProposeQasFromTickets(
     logger.error({ err }, "training.proposeQasFromTickets fail");
     const msg = err instanceof Error ? err.message : "Error proponiendo Q&A";
     return reply.code(500).send({ success: false, error: msg });
+  }
+}
+
+// ============================================================
+// AUTO-Q&A GENERATOR
+// ============================================================
+export async function postAutoGenerateQas(
+  req: FastifyRequest<{ Body: { limit?: number } }>,
+  reply: FastifyReply
+) {
+  try {
+    const report = await autoGenerateQasForItems({ limit: req.body?.limit });
+    return reply.send({ success: true, report });
+  } catch (err) {
+    logger.error({ err }, "training.autoGenerateQas fail");
+    return reply.code(500).send({ success: false, error: "Error generando Q&A" });
+  }
+}
+
+// ============================================================
+// SELF-TRAINING ORCHESTRATOR
+// ============================================================
+interface SelfTrainingBody {
+  evalLimit?: number;
+  ticketsLimit?: number;
+  autoApproveLimit?: number;
+  autoApproveMinScore?: number;
+  runEval?: boolean;
+}
+export async function postSelfTrainingRun(
+  req: FastifyRequest<{ Body: SelfTrainingBody }>,
+  reply: FastifyReply
+) {
+  try {
+    const report = await runSelfTrainingCycle(req.body || {});
+    return reply.send({ success: true, report });
+  } catch (err) {
+    logger.error({ err }, "training.selfTraining fail");
+    return reply.code(500).send({ success: false, error: "Error en self-training" });
+  }
+}
+
+// ============================================================
+// EXPANDED CORPUS LOADER
+// ============================================================
+export async function postLoadExpandedCorpus(_req: FastifyRequest, reply: FastifyReply) {
+  try {
+    const result = await loadExpandedCorpus();
+    return reply.send({ success: true, ...result, corpusSize: CORPUS_SIZE });
+  } catch (err) {
+    logger.error({ err }, "training.loadExpandedCorpus fail");
+    return reply.code(500).send({ success: false, error: "Error cargando corpus" });
   }
 }

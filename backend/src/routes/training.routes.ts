@@ -52,4 +52,13 @@ export async function trainingRoutes(app: FastifyInstance) {
 
   // Tickets resueltos -> Q&A propuestas
   app.post("/api/training/qa/propose-from-tickets", ctrl.postProposeQasFromTickets);
+
+  // Auto-generador de Q&A para items publicados sin Q&A
+  app.post("/api/training/qa/auto-generate", ctrl.postAutoGenerateQas);
+
+  // Self-training cycle (orchestrator)
+  app.post("/api/training/self/run", ctrl.postSelfTrainingRun);
+
+  // Cargar corpus expandido (26 items + Q&A aprobadas)
+  app.post("/api/training/seed/expand", ctrl.postLoadExpandedCorpus);
 }
