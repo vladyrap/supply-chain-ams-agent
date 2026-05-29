@@ -19,6 +19,7 @@ import { evalRoutes } from "./routes/eval.routes";
 import { graphRoutes } from "./routes/graph.routes";
 import { demoRoutes } from "./routes/demo.routes";
 import { voiceRoutes } from "./routes/voice.routes";
+import { agentLabRoutes } from "./routes/agent-lab.routes";
 import { registry, httpRequestsTotal, httpRequestDuration } from "./utils/metrics";
 
 export function buildServer() {
@@ -81,6 +82,7 @@ export function buildServer() {
   app.register(graphRoutes);
   app.register(demoRoutes);
   app.register(voiceRoutes);
+  app.register(agentLabRoutes);
 
   app.setErrorHandler((err, _req, reply) => {
     logger.error({ err }, "Unhandled error");
