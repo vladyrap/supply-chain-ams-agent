@@ -28,7 +28,50 @@ function getClient(): GoogleGenAI {
   return cachedClient;
 }
 
+// Cache del prompt activo de DB (TTL 60s para no pegarle a Postgres en cada
+// request, pero reaccionar rápido a un "Adoptar" del Playground).
+let cachedActivePrompt: { text: string; label: string; expiresAt: number } | null = null;
+const ACTIVE_PROMPT_TTL_MS = 60_000;
+
+async function getActiveOverride(): Promise<{ text: string; label: string } | null> {
+  if (cachedActivePrompt && cachedActivePrompt.expiresAt > Date.now()) {
+    return { text: cachedActivePrompt.text, label: cachedActivePrompt.label };
+  }
+  try {
+    // Import dinámico para evitar ciclo (agent-lab también importa cosas del agente).
+    const { getActivePrompt } = await import("./agent-lab.service");
+    const row = await getActivePrompt();
+    if (row && row.system_prompt) {
+      cachedActivePrompt = {
+        text: row.system_prompt,
+        label: row.label,
+        expiresAt: Date.now() + ACTIVE_PROMPT_TTL_MS,
+      };
+      return { text: row.system_prompt, label: row.label };
+    }
+    cachedActivePrompt = { text: "", label: "", expiresAt: Date.now() + ACTIVE_PROMPT_TTL_MS };
+    return null;
+  } catch (err) {
+    // Si la tabla no existe todavía (primer arranque sin Playground usado),
+    // simplemente no hay override.
+    logger.debug({ err }, "agent_prompt_versions no disponible — fallback a archivo");
+    return null;
+  }
+}
+
+/** Permite invalidar el cache desde otros lugares (p.ej. tras adoptar). */
+export function invalidateActivePromptCache(): void {
+  cachedActivePrompt = null;
+}
+
 async function loadSystemPrompt(): Promise<string> {
+  // 1) Si hay un prompt adoptado activo en DB, ese gana.
+  const override = await getActiveOverride();
+  if (override) {
+    logger.info({ active: override.label }, "agente usa prompt adoptado del Playground");
+    return override.text;
+  }
+  // 2) Fallback al prompt del archivo (cache eterno tras el primer load).
   if (cachedSystemPrompt) return cachedSystemPrompt;
   try {
     cachedSystemPrompt = await readFile(PROMPT_PATH, "utf-8");

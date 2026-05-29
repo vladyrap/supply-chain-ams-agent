@@ -289,6 +289,11 @@ export async function adoptPrompt(input: AdoptPromptInput): Promise<PromptVersio
       input.adoptionNotes ?? null,
     ]
   );
+  // Invalidar cache del agente para que la próxima consulta use el nuevo prompt
+  try {
+    const { invalidateActivePromptCache } = await import("./claude.service");
+    invalidateActivePromptCache();
+  } catch { /* ignore */ }
   return rows[0]!;
 }
 
@@ -315,6 +320,10 @@ export async function activatePromptVersion(id: string): Promise<PromptVersionRo
   const { rows } = await query<PromptVersionRow>(
     `UPDATE agent_prompt_versions SET active = true WHERE id = $1 RETURNING *`, [id]
   );
+  try {
+    const { invalidateActivePromptCache } = await import("./claude.service");
+    invalidateActivePromptCache();
+  } catch { /* ignore */ }
   return rows[0] ?? null;
 }
 

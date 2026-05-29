@@ -36,4 +36,7 @@ export async function trainingRoutes(app: FastifyInstance) {
   // Settings (singleton)
   app.get("/api/training/settings", ctrl.getSettings);
   app.patch("/api/training/settings", ctrl.updateSettings);
+
+  // Auto-detección de brechas
+  app.post("/api/training/gaps/detect", ctrl.postRunGapDetection);
 }

@@ -131,7 +131,7 @@ export async function ingestFromUrl(input: IngestUrlInput): Promise<KnowledgeDoc
     resp = await fetch(url.toString(), {
       signal: ctrl.signal,
       redirect: "follow",
-      headers: { "User-Agent": "ams-agent-ingest/1.0", Accept: "text/html, text/markdown, text/plain;q=0.9, */*;q=0.5" },
+      headers: { "User-Agent": "ams-agent-ingest/1.0", Accept: "text/html, application/pdf, text/markdown, text/plain;q=0.9, */*;q=0.5" },
     });
   } catch (err) {
     throw new Error(`No se pudo descargar la URL: ${err instanceof Error ? err.message : "error desconocido"}`);
@@ -143,14 +143,38 @@ export async function ingestFromUrl(input: IngestUrlInput): Promise<KnowledgeDoc
     throw new Error(`HTTP ${resp.status} al descargar la URL`);
   }
   const contentType = (resp.headers.get("content-type") || "").toLowerCase();
-  // Aceptamos text/* y application/json y markdown. PDF necesitaría parsing aparte (fase futura).
-  if (!contentType.startsWith("text/") && !contentType.includes("json") && !contentType.includes("markdown")) {
-    throw new Error(`Content-Type no soportado en esta fase: ${contentType || "desconocido"}`);
-  }
-
   const buf = await resp.arrayBuffer();
   if (buf.byteLength === 0) throw new Error("Respuesta vacía");
   if (buf.byteLength > MAX_URL_BYTES) throw new Error("Archivo demasiado grande (>8MB)");
+
+  // ---------- Caso PDF: encolamos el binario crudo, el worker hace el extract ----------
+  const looksLikePdf =
+    contentType.includes("pdf") ||
+    url.pathname.toLowerCase().endsWith(".pdf") ||
+    // PDF magic bytes %PDF
+    (buf.byteLength >= 4 && Buffer.from(buf.slice(0, 4)).toString("ascii") === "%PDF");
+  if (looksLikePdf) {
+    let title = input.title?.trim();
+    if (!title) {
+      const last = url.pathname.split("/").filter(Boolean).pop() || url.hostname;
+      title = decodeURIComponent(last).replace(/\.pdf$/i, "").slice(0, 160) || url.hostname;
+    }
+    const dataBase64 = Buffer.from(buf).toString("base64");
+    return createDocumentAndQueue({
+      title,
+      fileName: title.replace(/[^a-zA-Z0-9_\-]+/g, "_").slice(0, 60) + ".pdf",
+      mimeType: "application/pdf",
+      sizeBytes: buf.byteLength,
+      dataBase64,
+      module: input.module,
+      client: input.client,
+    });
+  }
+
+  // ---------- Caso texto / HTML / MD ----------
+  if (!contentType.startsWith("text/") && !contentType.includes("json") && !contentType.includes("markdown") && contentType !== "") {
+    throw new Error(`Content-Type no soportado: ${contentType}`);
+  }
 
   const raw = Buffer.from(buf).toString("utf-8");
   const isHtml = contentType.includes("html") || /<html|<body|<div/i.test(raw.slice(0, 2000));

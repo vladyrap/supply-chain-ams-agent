@@ -3,6 +3,7 @@ import { buildServer } from "./server";
 import { logger } from "./utils/logger";
 import { bootstrapAdminIfNeeded } from "./services/auth.service";
 import { ensureVoiceSchema } from "./services/call-log.service";
+import { seedTrainingIfEmpty } from "./services/training.seed";
 
 const PORT = Number(process.env.BACKEND_PORT ?? 8000);
 const HOST = "0.0.0.0";
@@ -18,6 +19,11 @@ async function main() {
   // Asegurar schema del canal telefónico (idempotente, best-effort).
   await ensureVoiceSchema().catch((err) => {
     logger.warn({ err }, "ensureVoiceSchema falló (continuamos)");
+  });
+
+  // Seed del Centro de Entrenamiento si tablas vacías (idempotente)
+  await seedTrainingIfEmpty().catch((err) => {
+    logger.warn({ err }, "seedTrainingIfEmpty falló (continuamos)");
   });
 
   try {

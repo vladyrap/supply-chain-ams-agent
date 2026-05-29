@@ -1,6 +1,7 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { logger } from "../utils/logger";
 import * as training from "../services/training.service";
+import { runGapDetection } from "../services/gap-detector.service";
 import type {
   KnowledgeStatus, KnowledgeType, Priority, ValidationStage,
   TrainingVersionStatus, GapStatus,
@@ -356,5 +357,22 @@ export async function updateSettings(
   } catch (err) {
     logger.error({ err }, "training.updateSettings fail");
     return reply.code(500).send({ success: false, error: "Error actualizando settings" });
+  }
+}
+
+// ============================================================
+// AUTO GAP DETECTION
+// ============================================================
+export async function postRunGapDetection(
+  req: FastifyRequest<{ Body: { daysBack?: number } }>,
+  reply: FastifyReply
+) {
+  const days = Math.max(1, Math.min(90, req.body?.daysBack ?? 14));
+  try {
+    const report = await runGapDetection(days);
+    return reply.send({ success: true, report });
+  } catch (err) {
+    logger.error({ err }, "training.runGapDetection fail");
+    return reply.code(500).send({ success: false, error: "Error ejecutando detección" });
   }
 }
