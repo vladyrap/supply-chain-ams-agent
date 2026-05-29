@@ -40,6 +40,61 @@ export interface CreateDocumentInput {
   client?: string;
 }
 
+// =====================================================
+// Quick-add: ingest text directly (no file)
+// =====================================================
+export interface IngestTextInput {
+  title: string;
+  content: string;
+  module?: string;
+  client?: string;
+}
+
+export async function ingestTextDirect(input: IngestTextInput): Promise<KnowledgeDocument> {
+  // Sintetizamos un "documento" tipo md con el texto pegado, igual va al worker
+  // como mime text/markdown para reusar el path de ingesta normal.
+  const fileName = `${input.title.replace(/[^a-zA-Z0-9_\-]+/g, "_").slice(0, 60) || "pasted"}.md`;
+  const dataBase64 = Buffer.from(input.content, "utf-8").toString("base64");
+  return createDocumentAndQueue({
+    title: input.title,
+    fileName,
+    mimeType: "text/markdown",
+    sizeBytes: Buffer.byteLength(input.content, "utf-8"),
+    dataBase64,
+    module: input.module,
+    client: input.client,
+  });
+}
+
+// =====================================================
+// Chunks por documento
+// =====================================================
+export interface DocumentChunk {
+  id: string;
+  document_id: string;
+  chunk_index: number;
+  content: string;
+  module: string | null;
+  client: string | null;
+  source_file: string;
+  source_type: string;
+  estimated_tokens: number;
+}
+
+export async function listChunksByDocument(documentId: string, limit = 200): Promise<DocumentChunk[]> {
+  const safe = Math.max(1, Math.min(500, limit));
+  const { rows } = await query<DocumentChunk>(
+    `SELECT id, document_id, chunk_index, content, module, client, source_file, source_type,
+            COALESCE(estimated_tokens, 0)::int AS estimated_tokens
+       FROM knowledge_items
+       WHERE document_id = $1 AND status = 'indexed'
+       ORDER BY chunk_index ASC
+       LIMIT $2`,
+    [documentId, safe]
+  );
+  return rows;
+}
+
 export async function createDocumentAndQueue(input: CreateDocumentInput): Promise<KnowledgeDocument> {
   // Source type tentativo desde el mime
   let sourceType = "unknown";

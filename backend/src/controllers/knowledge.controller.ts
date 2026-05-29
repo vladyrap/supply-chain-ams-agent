@@ -6,7 +6,10 @@ import {
   listDocuments,
   deleteDocument,
   getKnowledgeStats,
+  ingestTextDirect,
+  listChunksByDocument,
 } from "../services/knowledge.service";
+import { retrieveRelevantChunks } from "../services/rag.service";
 
 interface IngestBody {
   fileName?: string;
@@ -118,5 +121,99 @@ export async function getKnowledgeOverview(_req: FastifyRequest, reply: FastifyR
   } catch (err) {
     logger.error({ err }, "Fallo en knowledge stats");
     return reply.code(500).send({ success: false, error: "Error calculando overview" });
+  }
+}
+
+// =====================================================
+// POST /api/knowledge/ingest-text
+// Quick-add para pegar texto directo sin archivo
+// =====================================================
+interface IngestTextBody {
+  title?: string;
+  content?: string;
+  module?: string;
+  client?: string;
+}
+
+export async function postIngestText(
+  req: FastifyRequest<{ Body: IngestTextBody }>,
+  reply: FastifyReply
+) {
+  const b = req.body || {};
+  if (!b.content || typeof b.content !== "string" || b.content.trim().length < 20) {
+    return reply.code(400).send({ success: false, error: "content debe tener al menos 20 caracteres" });
+  }
+  if (b.content.length > 500_000) {
+    return reply.code(400).send({ success: false, error: "content supera 500.000 caracteres. Para textos grandes subí un archivo." });
+  }
+  const title = (b.title || `Texto pegado ${new Date().toISOString().slice(0, 16)}`).trim().slice(0, 200);
+  try {
+    const doc = await ingestTextDirect({
+      title,
+      content: b.content,
+      module: b.module || undefined,
+      client: b.client || undefined,
+    });
+    return reply.send({ success: true, document: doc });
+  } catch (err) {
+    logger.error({ err }, "fallo en /api/knowledge/ingest-text");
+    return reply.code(500).send({ success: false, error: "Error procesando el texto" });
+  }
+}
+
+// =====================================================
+// GET /api/knowledge/documents/:id/chunks
+// Lista los chunks indexados de un documento (para auditar calidad)
+// =====================================================
+export async function getDocumentChunks(
+  req: FastifyRequest<{ Params: { id: string }; Querystring: { limit?: string } }>,
+  reply: FastifyReply
+) {
+  const { id } = req.params;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    return reply.code(400).send({ success: false, error: "ID inválido" });
+  }
+  const limit = req.query?.limit ? Math.max(1, Math.min(500, parseInt(req.query.limit, 10) || 200)) : 200;
+  try {
+    const chunks = await listChunksByDocument(id, limit);
+    return reply.send({ success: true, count: chunks.length, chunks });
+  } catch (err) {
+    logger.error({ err, id }, "Fallo listando chunks");
+    return reply.code(500).send({ success: false, error: "Error listando chunks" });
+  }
+}
+
+// =====================================================
+// POST /api/knowledge/search
+// RAG playground: dado un query, devuelve top-K chunks con score
+// =====================================================
+interface SearchBody {
+  query?: string;
+  module?: string;
+  client?: string;
+}
+
+export async function postSearch(
+  req: FastifyRequest<{ Body: SearchBody }>,
+  reply: FastifyReply
+) {
+  const b = req.body || {};
+  if (!b.query || typeof b.query !== "string" || b.query.trim().length < 3) {
+    return reply.code(400).send({ success: false, error: "query debe tener al menos 3 caracteres" });
+  }
+  try {
+    const chunks = await retrieveRelevantChunks(b.query.trim(), {
+      module: b.module || undefined,
+      client: b.client || undefined,
+    });
+    return reply.send({
+      success: true,
+      query: b.query.trim(),
+      filters: { module: b.module || null, client: b.client || null },
+      chunks,
+    });
+  } catch (err) {
+    logger.error({ err }, "fallo en /api/knowledge/search");
+    return reply.code(500).send({ success: false, error: "Error buscando en knowledge" });
   }
 }
