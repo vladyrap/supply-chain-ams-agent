@@ -7,6 +7,10 @@ import {
 import { getUserBySession } from "../services/auth.service";
 import { query } from "../database/db";
 import type { SupportConversation, SupportMessage } from "../types/support.types";
+import {
+  listConvertibleTickets, draftKbFromTicket, runPlayground,
+} from "../services/agent-lab.service";
+import { createArticle } from "../services/support/kb.service";
 
 const COOKIE = "ams_session";
 
@@ -156,5 +160,110 @@ export async function getConversationTrace(
   } catch (err) {
     logger.error({ err, id }, "conversation.trace fail");
     return reply.code(500).send({ success: false, error: "Error obteniendo traza" });
+  }
+}
+
+// =====================================================
+// WIZARD: ticket → KB draft
+// =====================================================
+
+export async function getConvertibleTickets(_req: FastifyRequest, reply: FastifyReply) {
+  try {
+    const tickets = await listConvertibleTickets(80);
+    return reply.send({ success: true, count: tickets.length, tickets });
+  } catch (err) {
+    logger.error({ err }, "wizard.listTickets fail");
+    return reply.code(500).send({ success: false, error: "Error listando tickets" });
+  }
+}
+
+const UUID_RX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export async function postWizardDraft(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply
+) {
+  const { id } = req.params;
+  if (!UUID_RX.test(id)) {
+    return reply.code(400).send({ success: false, error: "ID inválido" });
+  }
+  try {
+    const result = await draftKbFromTicket(id);
+    return reply.send({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err, id }, "wizard.draft fail");
+    const msg = err instanceof Error ? err.message : "Error generando draft";
+    return reply.code(500).send({ success: false, error: msg });
+  }
+}
+
+interface WizardCommitBody {
+  ticketId?: string;
+  title?: string;
+  problem?: string;
+  solution?: string;
+  category?: string;
+  system?: string;
+  tags?: string[];
+}
+
+export async function postWizardCommit(
+  req: FastifyRequest<{ Body: WizardCommitBody }>,
+  reply: FastifyReply
+) {
+  const b = req.body || {};
+  if (!b.title?.trim() || !b.problem?.trim() || !b.solution?.trim()) {
+    return reply.code(400).send({ success: false, error: "title, problem y solution son obligatorios" });
+  }
+  try {
+    const userId = await getUserId(req);
+    const article = await createArticle({
+      title: b.title.trim().slice(0, 200),
+      problem: b.problem.trim(),
+      solution: b.solution.trim(),
+      category: b.category?.trim() || undefined,
+      system: b.system?.trim() || undefined,
+      tags: Array.isArray(b.tags) ? b.tags.filter((t) => typeof t === "string" && t.trim()).slice(0, 8) : [],
+      source: b.ticketId ? "from_ticket" : "manual",
+      source_ticket_id: b.ticketId && UUID_RX.test(b.ticketId) ? b.ticketId : undefined,
+      created_by: userId ?? undefined,
+    });
+    return reply.send({ success: true, article });
+  } catch (err) {
+    logger.error({ err }, "wizard.commit fail");
+    return reply.code(500).send({ success: false, error: "Error guardando artículo" });
+  }
+}
+
+// =====================================================
+// PLAYGROUND
+// =====================================================
+interface PlaygroundBody {
+  systemPrompt?: string;
+  query?: string;
+  temperature?: number;
+  maxOutputTokens?: number;
+}
+
+export async function postPlaygroundRun(
+  req: FastifyRequest<{ Body: PlaygroundBody }>,
+  reply: FastifyReply
+) {
+  const b = req.body || {};
+  if (!b.systemPrompt?.trim() || !b.query?.trim()) {
+    return reply.code(400).send({ success: false, error: "systemPrompt y query son obligatorios" });
+  }
+  try {
+    const result = await runPlayground({
+      systemPrompt: b.systemPrompt,
+      query: b.query,
+      temperature: typeof b.temperature === "number" ? b.temperature : undefined,
+      maxOutputTokens: typeof b.maxOutputTokens === "number" ? b.maxOutputTokens : undefined,
+    });
+    return reply.send({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "playground.run fail");
+    const msg = err instanceof Error ? err.message : "Error ejecutando playground";
+    return reply.code(500).send({ success: false, error: msg });
   }
 }
