@@ -223,6 +223,104 @@ export interface PlaygroundRunResult {
   tokens: { prompt: number; completion: number; total: number };
 }
 
+// ============================================================================
+// PROMPT VERSIONING — adoptar variante del Playground como activa
+// ============================================================================
+let promptSchemaEnsured = false;
+async function ensurePromptSchema(): Promise<void> {
+  if (promptSchemaEnsured) return;
+  try {
+    await query(`
+      CREATE TABLE IF NOT EXISTS agent_prompt_versions (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        label           TEXT NOT NULL,
+        system_prompt   TEXT NOT NULL,
+        temperature     REAL NOT NULL DEFAULT 0.4,
+        max_tokens      INTEGER NOT NULL DEFAULT 1024,
+        active          BOOLEAN NOT NULL DEFAULT false,
+        created_by      TEXT NOT NULL DEFAULT 'sistema',
+        adoption_notes  TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_agent_prompt_active  ON agent_prompt_versions(active) WHERE active = true;`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_agent_prompt_created ON agent_prompt_versions(created_at DESC);`);
+    promptSchemaEnsured = true;
+  } catch (err) {
+    logger.warn({ err }, "ensure agent_prompt_versions schema failed");
+  }
+}
+
+export interface PromptVersionRow {
+  id: string;
+  label: string;
+  system_prompt: string;
+  temperature: number;
+  max_tokens: number;
+  active: boolean;
+  created_by: string;
+  adoption_notes: string | null;
+  created_at: string;
+}
+
+export interface AdoptPromptInput {
+  label: string;
+  systemPrompt: string;
+  temperature?: number;
+  maxTokens?: number;
+  createdBy?: string;
+  adoptionNotes?: string;
+}
+
+export async function adoptPrompt(input: AdoptPromptInput): Promise<PromptVersionRow> {
+  await ensurePromptSchema();
+  // desactivar la versión activa actual
+  await query(`UPDATE agent_prompt_versions SET active = false WHERE active = true`);
+  const { rows } = await query<PromptVersionRow>(
+    `INSERT INTO agent_prompt_versions
+       (label, system_prompt, temperature, max_tokens, active, created_by, adoption_notes)
+     VALUES ($1, $2, $3, $4, true, $5, $6) RETURNING *`,
+    [
+      input.label.slice(0, 200),
+      input.systemPrompt.slice(0, 16000),
+      Math.max(0, Math.min(1.5, input.temperature ?? 0.4)),
+      Math.max(128, Math.min(4096, input.maxTokens ?? 1024)),
+      input.createdBy ?? "sistema",
+      input.adoptionNotes ?? null,
+    ]
+  );
+  return rows[0]!;
+}
+
+export async function getActivePrompt(): Promise<PromptVersionRow | null> {
+  await ensurePromptSchema();
+  const { rows } = await query<PromptVersionRow>(
+    `SELECT * FROM agent_prompt_versions WHERE active = true ORDER BY created_at DESC LIMIT 1`
+  );
+  return rows[0] ?? null;
+}
+
+export async function listPromptVersions(limit = 50): Promise<PromptVersionRow[]> {
+  await ensurePromptSchema();
+  const { rows } = await query<PromptVersionRow>(
+    `SELECT * FROM agent_prompt_versions ORDER BY created_at DESC LIMIT $1`,
+    [Math.max(1, Math.min(200, limit))]
+  );
+  return rows;
+}
+
+export async function activatePromptVersion(id: string): Promise<PromptVersionRow | null> {
+  await ensurePromptSchema();
+  await query(`UPDATE agent_prompt_versions SET active = false WHERE active = true`);
+  const { rows } = await query<PromptVersionRow>(
+    `UPDATE agent_prompt_versions SET active = true WHERE id = $1 RETURNING *`, [id]
+  );
+  return rows[0] ?? null;
+}
+
+// ============================================================================
+// PROMPT PLAYGROUND
+// ============================================================================
 export async function runPlayground(input: PlaygroundRunInput): Promise<PlaygroundRunResult> {
   if (!input.systemPrompt?.trim()) throw new ClaudeError("system prompt vacío");
   if (!input.query?.trim()) throw new ClaudeError("query vacía");

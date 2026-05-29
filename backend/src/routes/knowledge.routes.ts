@@ -5,6 +5,7 @@ import {
   delDocument,
   getKnowledgeOverview,
   postIngestText,
+  postIngestUrl,
   getDocumentChunks,
   postSearch,
 } from "../controllers/knowledge.controller";
@@ -12,6 +13,7 @@ import {
 export async function knowledgeRoutes(app: FastifyInstance) {
   app.post("/api/knowledge/ingest", postIngest);
   app.post("/api/knowledge/ingest-text", postIngestText);
+  app.post("/api/knowledge/ingest-url", postIngestUrl);
   app.post("/api/knowledge/search", postSearch);
   app.get("/api/knowledge/documents", getDocuments);
   app.get<{ Params: { id: string }; Querystring: { limit?: string } }>(

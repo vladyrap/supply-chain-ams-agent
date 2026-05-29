@@ -8,6 +8,10 @@ import {
   postWizardDraft,
   postWizardCommit,
   postPlaygroundRun,
+  postAdoptPrompt,
+  getActivePromptRoute,
+  listPromptVersionsRoute,
+  postActivatePromptVersion,
 } from "../controllers/feedback.controller";
 
 export async function agentLabRoutes(app: FastifyInstance) {
@@ -24,4 +28,10 @@ export async function agentLabRoutes(app: FastifyInstance) {
 
   // Prompt Playground
   app.post("/api/agent-lab/playground/run", postPlaygroundRun);
+
+  // Prompt versioning — adoptar variante del Playground como activa
+  app.post("/api/agent-lab/playground/adopt", postAdoptPrompt);
+  app.get("/api/agent-lab/playground/active", getActivePromptRoute);
+  app.get("/api/agent-lab/playground/versions", listPromptVersionsRoute);
+  app.post<{ Params: { id: string } }>("/api/agent-lab/playground/versions/:id/activate", postActivatePromptVersion);
 }

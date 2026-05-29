@@ -67,6 +67,118 @@ export async function ingestTextDirect(input: IngestTextInput): Promise<Knowledg
 }
 
 // =====================================================
+// URL ingest — descarga HTML/Markdown desde URL y lo encola
+// =====================================================
+export interface IngestUrlInput {
+  url: string;
+  title?: string;
+  module?: string;
+  client?: string;
+}
+
+const MAX_URL_BYTES = 8 * 1024 * 1024; // 8MB
+const FETCH_TIMEOUT_MS = 15_000;
+
+/** Extrae texto razonable de HTML quitando script/style/comments/tags. */
+function htmlToText(html: string): string {
+  return html
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<\/(p|div|h[1-6]|li|tr|br)>/gi, "\n")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+export async function ingestFromUrl(input: IngestUrlInput): Promise<KnowledgeDocument> {
+  let url: URL;
+  try {
+    url = new URL(input.url);
+  } catch {
+    throw new Error("URL inválida");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("Solo http/https soportado");
+  }
+  // Defensa básica contra SSRF a redes privadas comunes
+  const host = url.hostname.toLowerCase();
+  if (
+    host === "localhost" ||
+    host.startsWith("127.") ||
+    host.startsWith("10.") ||
+    host.startsWith("169.254.") ||
+    host.startsWith("192.168.") ||
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host) ||
+    host === "0.0.0.0"
+  ) {
+    throw new Error("Hosts privados no permitidos");
+  }
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+
+  let resp: Response;
+  try {
+    resp = await fetch(url.toString(), {
+      signal: ctrl.signal,
+      redirect: "follow",
+      headers: { "User-Agent": "ams-agent-ingest/1.0", Accept: "text/html, text/markdown, text/plain;q=0.9, */*;q=0.5" },
+    });
+  } catch (err) {
+    throw new Error(`No se pudo descargar la URL: ${err instanceof Error ? err.message : "error desconocido"}`);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!resp.ok) {
+    throw new Error(`HTTP ${resp.status} al descargar la URL`);
+  }
+  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+  // Aceptamos text/* y application/json y markdown. PDF necesitaría parsing aparte (fase futura).
+  if (!contentType.startsWith("text/") && !contentType.includes("json") && !contentType.includes("markdown")) {
+    throw new Error(`Content-Type no soportado en esta fase: ${contentType || "desconocido"}`);
+  }
+
+  const buf = await resp.arrayBuffer();
+  if (buf.byteLength === 0) throw new Error("Respuesta vacía");
+  if (buf.byteLength > MAX_URL_BYTES) throw new Error("Archivo demasiado grande (>8MB)");
+
+  const raw = Buffer.from(buf).toString("utf-8");
+  const isHtml = contentType.includes("html") || /<html|<body|<div/i.test(raw.slice(0, 2000));
+  const text = isHtml ? htmlToText(raw) : raw;
+
+  if (text.length < 20) {
+    throw new Error("No se pudo extraer texto significativo de la URL");
+  }
+
+  // Intentar extraer título de <title> si el usuario no dio uno
+  let title = input.title?.trim();
+  if (!title && isHtml) {
+    const m = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    if (m) title = m[1].replace(/\s+/g, " ").trim().slice(0, 160);
+  }
+  if (!title) title = url.hostname + url.pathname;
+
+  // Reusa el path de ingestText (encolado al worker)
+  const header = `# ${title}\n\n_Fuente: ${url.toString()}_\n\n`;
+  return ingestTextDirect({
+    title,
+    content: header + text.slice(0, 200_000),
+    module: input.module,
+    client: input.client,
+  });
+}
+
+// =====================================================
 // Chunks por documento
 // =====================================================
 export interface DocumentChunk {

@@ -6,7 +6,7 @@ import {
   listDocuments,
   deleteDocument,
   getKnowledgeStats,
-  ingestTextDirect,
+  ingestTextDirect, ingestFromUrl,
   listChunksByDocument,
 } from "../services/knowledge.service";
 import { retrieveRelevantChunks } from "../services/rag.service";
@@ -158,6 +158,40 @@ export async function postIngestText(
   } catch (err) {
     logger.error({ err }, "fallo en /api/knowledge/ingest-text");
     return reply.code(500).send({ success: false, error: "Error procesando el texto" });
+  }
+}
+
+// =====================================================
+// POST /api/knowledge/ingest-url
+// Descarga texto de una URL pública (HTML/MD/TXT) y lo encola
+// =====================================================
+interface IngestUrlBody {
+  url?: string;
+  title?: string;
+  module?: string;
+  client?: string;
+}
+
+export async function postIngestUrl(
+  req: FastifyRequest<{ Body: IngestUrlBody }>,
+  reply: FastifyReply
+) {
+  const b = req.body || {};
+  if (!b.url || typeof b.url !== "string") {
+    return reply.code(400).send({ success: false, error: "url es obligatorio" });
+  }
+  try {
+    const doc = await ingestFromUrl({
+      url: b.url.trim(),
+      title: b.title?.trim(),
+      module: b.module || undefined,
+      client: b.client || undefined,
+    });
+    return reply.send({ success: true, document: doc });
+  } catch (err) {
+    logger.error({ err }, "fallo en /api/knowledge/ingest-url");
+    const msg = err instanceof Error ? err.message : "Error procesando la URL";
+    return reply.code(400).send({ success: false, error: msg });
   }
 }
 

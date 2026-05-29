@@ -9,6 +9,7 @@ import { query } from "../database/db";
 import type { SupportConversation, SupportMessage } from "../types/support.types";
 import {
   listConvertibleTickets, draftKbFromTicket, runPlayground,
+  adoptPrompt, getActivePrompt, listPromptVersions, activatePromptVersion,
 } from "../services/agent-lab.service";
 import { createArticle } from "../services/support/kb.service";
 
@@ -265,5 +266,78 @@ export async function postPlaygroundRun(
     logger.error({ err }, "playground.run fail");
     const msg = err instanceof Error ? err.message : "Error ejecutando playground";
     return reply.code(500).send({ success: false, error: msg });
+  }
+}
+
+// =====================================================
+// PROMPT VERSIONING — adoptar variante del Playground como activa
+// =====================================================
+interface AdoptPromptBody {
+  label?: string;
+  systemPrompt?: string;
+  temperature?: number;
+  maxTokens?: number;
+  createdBy?: string;
+  adoptionNotes?: string;
+}
+
+export async function postAdoptPrompt(
+  req: FastifyRequest<{ Body: AdoptPromptBody }>,
+  reply: FastifyReply
+) {
+  const b = req.body || {};
+  if (!b.label?.trim() || !b.systemPrompt?.trim()) {
+    return reply.code(400).send({ success: false, error: "label y systemPrompt son obligatorios" });
+  }
+  try {
+    const userId = await getUserId(req);
+    const row = await adoptPrompt({
+      label: b.label,
+      systemPrompt: b.systemPrompt,
+      temperature: b.temperature,
+      maxTokens: b.maxTokens,
+      createdBy: b.createdBy ?? userId ?? "sistema",
+      adoptionNotes: b.adoptionNotes,
+    });
+    return reply.send({ success: true, version: row });
+  } catch (err) {
+    logger.error({ err }, "prompt.adopt fail");
+    return reply.code(500).send({ success: false, error: "Error adoptando prompt" });
+  }
+}
+
+export async function getActivePromptRoute(_req: FastifyRequest, reply: FastifyReply) {
+  try {
+    const row = await getActivePrompt();
+    return reply.send({ success: true, version: row });
+  } catch (err) {
+    logger.error({ err }, "prompt.active fail");
+    return reply.code(500).send({ success: false, error: "Error obteniendo prompt activo" });
+  }
+}
+
+export async function listPromptVersionsRoute(_req: FastifyRequest, reply: FastifyReply) {
+  try {
+    const rows = await listPromptVersions(50);
+    return reply.send({ success: true, count: rows.length, versions: rows });
+  } catch (err) {
+    logger.error({ err }, "prompt.list fail");
+    return reply.code(500).send({ success: false, error: "Error listando prompts" });
+  }
+}
+
+export async function postActivatePromptVersion(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply
+) {
+  const { id } = req.params;
+  if (!UUID_RX.test(id)) return reply.code(400).send({ success: false, error: "ID inválido" });
+  try {
+    const row = await activatePromptVersion(id);
+    if (!row) return reply.code(404).send({ success: false, error: "Versión no encontrada" });
+    return reply.send({ success: true, version: row });
+  } catch (err) {
+    logger.error({ err, id }, "prompt.activate fail");
+    return reply.code(500).send({ success: false, error: "Error activando versión" });
   }
 }
