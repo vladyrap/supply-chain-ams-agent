@@ -266,6 +266,18 @@ export async function updateItem(id: string, patch: UpdateItemInput): Promise<Kn
       invalidateFewShotCache();
     } catch { /* ignore */ }
   }
+  // Si publicamos, generar embedding del item para semantic few-shot
+  if (patch.status === "PUBLISHED" && rows[0]) {
+    const it = rows[0];
+    (async () => {
+      try {
+        const { upsertItemEmbedding } = await import("./training-embeddings.service");
+        await upsertItemEmbedding(it.id, `${it.title}\n\n${it.summary}\n\n${it.content.slice(0, 4000)}`);
+      } catch (err) {
+        logger.debug({ err }, "auto-embed item on publish fail");
+      }
+    })();
+  }
   return rows[0] ?? null;
 }
 
@@ -325,12 +337,24 @@ export async function updateQA(id: string, patch: { question?: string; expectedA
     `UPDATE kb_training_qa SET ${sets.join(", ")} WHERE id = $${params.length} RETURNING *`,
     params
   );
-  // Si se aprobó una Q&A, invalidar few-shot cache para que el agente la use de inmediato
+  // Si se aprobó una Q&A, invalidar few-shot cache + generar embedding semántico
   if (patch.approved === true) {
     try {
       const { invalidateFewShotCache } = await import("./few-shot.service");
       invalidateFewShotCache();
     } catch { /* ignore */ }
+    if (rows[0]) {
+      const qa = rows[0];
+      // fire-and-forget: no bloqueamos la respuesta al usuario
+      (async () => {
+        try {
+          const { upsertQaEmbedding } = await import("./training-embeddings.service");
+          await upsertQaEmbedding(qa.id, `${qa.question}\n\n${qa.expected_answer}`);
+        } catch (err) {
+          logger.debug({ err }, "auto-embed qa on approve fail");
+        }
+      })();
+    }
   }
   return rows[0] ?? null;
 }

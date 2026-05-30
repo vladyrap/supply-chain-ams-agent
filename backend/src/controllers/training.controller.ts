@@ -10,6 +10,13 @@ import { proposeQAsFromTickets } from "../services/ticket-to-qa.service";
 import { autoGenerateQasForItems } from "../services/qa-auto-generator.service";
 import { runSelfTrainingCycle } from "../services/self-training.service";
 import { loadExpandedCorpus, CORPUS_SIZE } from "../services/training-demo-corpus";
+import {
+  getSelfTrainingConfig, updateSelfTrainingConfig, listSelfTrainingHistory,
+  type UpdateConfigInput,
+} from "../services/self-training-cron.service";
+import { backfillTrainingEmbeddings } from "../services/training-embeddings.service";
+import { getEvalTimeline } from "../services/eval-timeline.service";
+import { runFeedbackPatternDetection } from "../services/feedback-patterns.service";
 import type {
   KnowledgeStatus, KnowledgeType, Priority, ValidationStage,
   TrainingVersionStatus, GapStatus,
@@ -573,5 +580,95 @@ export async function postLoadExpandedCorpus(_req: FastifyRequest, reply: Fastif
   } catch (err) {
     logger.error({ err }, "training.loadExpandedCorpus fail");
     return reply.code(500).send({ success: false, error: "Error cargando corpus" });
+  }
+}
+
+// ============================================================
+// SELF-TRAINING CRON CONFIG + HISTORIAL
+// ============================================================
+export async function getSelfTrainingConfigRoute(_req: FastifyRequest, reply: FastifyReply) {
+  try {
+    const cfg = await getSelfTrainingConfig();
+    return reply.send({ success: true, config: cfg });
+  } catch (err) {
+    logger.error({ err }, "selfTraining.getConfig fail");
+    return reply.code(500).send({ success: false, error: "Error obteniendo config" });
+  }
+}
+
+export async function patchSelfTrainingConfigRoute(
+  req: FastifyRequest<{ Body: UpdateConfigInput }>,
+  reply: FastifyReply
+) {
+  try {
+    const cfg = await updateSelfTrainingConfig(req.body || {});
+    return reply.send({ success: true, config: cfg });
+  } catch (err) {
+    logger.error({ err }, "selfTraining.patchConfig fail");
+    return reply.code(500).send({ success: false, error: "Error actualizando config" });
+  }
+}
+
+export async function getSelfTrainingHistoryRoute(_req: FastifyRequest, reply: FastifyReply) {
+  try {
+    const runs = await listSelfTrainingHistory(30);
+    return reply.send({ success: true, count: runs.length, runs });
+  } catch (err) {
+    logger.error({ err }, "selfTraining.history fail");
+    return reply.code(500).send({ success: false, error: "Error listando historial" });
+  }
+}
+
+// ============================================================
+// EMBEDDINGS BACKFILL
+// ============================================================
+export async function postBackfillEmbeddings(
+  req: FastifyRequest<{ Body: { limit?: number } }>,
+  reply: FastifyReply
+) {
+  try {
+    const report = await backfillTrainingEmbeddings({ limit: req.body?.limit });
+    return reply.send({ success: true, report });
+  } catch (err) {
+    logger.error({ err }, "embeddings.backfill fail");
+    return reply.code(500).send({ success: false, error: "Error en backfill embeddings" });
+  }
+}
+
+// ============================================================
+// TIMELINE + DRIFT
+// ============================================================
+export async function getEvalTimelineRoute(
+  req: FastifyRequest<{ Querystring: { days?: string; threshold?: string } }>,
+  reply: FastifyReply
+) {
+  const days = req.query?.days ? parseInt(req.query.days, 10) : 30;
+  const threshold = req.query?.threshold ? parseInt(req.query.threshold, 10) : 10;
+  try {
+    const data = await getEvalTimeline(days, threshold);
+    return reply.send({ success: true, ...data });
+  } catch (err) {
+    logger.error({ err }, "eval.timeline fail");
+    return reply.code(500).send({ success: false, error: "Error obteniendo timeline" });
+  }
+}
+
+// ============================================================
+// FEEDBACK PATTERNS
+// ============================================================
+export async function postFeedbackPatterns(
+  req: FastifyRequest<{ Body: { daysBack?: number; minClusterSize?: number } }>,
+  reply: FastifyReply
+) {
+  try {
+    const report = await runFeedbackPatternDetection({
+      daysBack: req.body?.daysBack,
+      minClusterSize: req.body?.minClusterSize,
+    });
+    return reply.send({ success: true, report });
+  } catch (err) {
+    logger.error({ err }, "feedback-patterns fail");
+    const msg = err instanceof Error ? err.message : "Error detectando patrones";
+    return reply.code(500).send({ success: false, error: msg });
   }
 }

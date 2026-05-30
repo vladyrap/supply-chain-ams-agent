@@ -4,6 +4,7 @@ import { logger } from "./utils/logger";
 import { bootstrapAdminIfNeeded } from "./services/auth.service";
 import { ensureVoiceSchema } from "./services/call-log.service";
 import { seedTrainingIfEmpty } from "./services/training.seed";
+import { bootstrapSelfTrainingCron } from "./services/self-training-cron.service";
 
 const PORT = Number(process.env.BACKEND_PORT ?? 8000);
 const HOST = "0.0.0.0";
@@ -24,6 +25,11 @@ async function main() {
   // Seed del Centro de Entrenamiento si tablas vacías (idempotente)
   await seedTrainingIfEmpty().catch((err) => {
     logger.warn({ err }, "seedTrainingIfEmpty falló (continuamos)");
+  });
+
+  // Bootstrap del worker + repeat job del self-training cron
+  await bootstrapSelfTrainingCron().catch((err) => {
+    logger.warn({ err }, "bootstrapSelfTrainingCron falló (continuamos)");
   });
 
   try {

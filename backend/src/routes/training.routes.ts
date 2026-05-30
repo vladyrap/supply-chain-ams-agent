@@ -61,4 +61,20 @@ export async function trainingRoutes(app: FastifyInstance) {
 
   // Cargar corpus expandido (26 items + Q&A aprobadas)
   app.post("/api/training/seed/expand", ctrl.postLoadExpandedCorpus);
+
+  // Self-training CRON config + historial
+  app.get("/api/training/self/config", ctrl.getSelfTrainingConfigRoute);
+  app.patch("/api/training/self/config", ctrl.patchSelfTrainingConfigRoute);
+  app.get("/api/training/self/history", ctrl.getSelfTrainingHistoryRoute);
+
+  // Embeddings backfill (semantic few-shot)
+  app.post("/api/training/embeddings/backfill", ctrl.postBackfillEmbeddings);
+
+  // Timeline + drift
+  app.get<{ Querystring: { days?: string; threshold?: string } }>(
+    "/api/training/eval/timeline", ctrl.getEvalTimelineRoute
+  );
+
+  // Feedback patterns -> auto-curation
+  app.post("/api/training/feedback/patterns", ctrl.postFeedbackPatterns);
 }

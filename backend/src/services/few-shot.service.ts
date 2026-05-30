@@ -77,6 +77,10 @@ interface ItemRow {
 /**
  * Devuelve un bloque few-shot armado dinámicamente según el query del usuario.
  * Si no hay matches buenos, devuelve block vacío (no inyecta nada).
+ *
+ * Estrategia:
+ *   1) Intenta búsqueda semántica con embeddings (kb_training_*_embeddings).
+ *   2) Si no hay vectores indexados todavía, cae al match léxico Jaccard.
  */
 export async function buildFewShotBlock(userQuery: string, module?: string): Promise<FewShotResult> {
   if (!userQuery || userQuery.trim().length < 3) {
@@ -88,6 +92,45 @@ export async function buildFewShotBlock(userQuery: string, module?: string): Pro
     return { block: cached.block, qaIds: cached.qaIds, itemIds: cached.itemIds };
   }
 
+  // ---------- Intento semántico ----------
+  try {
+    const { buildSemanticFewShot } = await import("./training-embeddings.service");
+    const sem = await buildSemanticFewShot(userQuery, module);
+    if (sem.qas.length > 0 || sem.items.length > 0) {
+      const lines: string[] = [];
+      lines.push("", "---", "# 📚 CONOCIMIENTO CURADO RELEVANTE (entrenamiento humano)", "");
+      lines.push("El equipo AMS aprobó los siguientes ejemplos para este tipo de consulta.");
+      lines.push("Usalos como referencia. **NO inventes** transacciones SAP que no aparezcan aquí.", "");
+
+      if (sem.items.length > 0) {
+        lines.push("## Artículos relacionados (PUBLISHED)");
+        sem.items.forEach((it) => {
+          lines.push(`- **${it.title}** _(${it.module}, similitud ${(it.similarity * 100).toFixed(0)}%)_`);
+          lines.push(`  ${it.summary}`);
+        });
+        lines.push("");
+      }
+      if (sem.qas.length > 0) {
+        lines.push("## Q&A aprobadas (ejemplos de respuesta correcta)");
+        sem.qas.forEach((q, i) => {
+          lines.push(`### Ejemplo ${i + 1}${q.module ? ` · ${q.module}` : ""} _(similitud ${(q.similarity * 100).toFixed(0)}%)_`);
+          lines.push(`**Pregunta del usuario:** ${q.question}`);
+          lines.push("");
+          lines.push(`**Respuesta esperada:**`);
+          lines.push(q.expected_answer);
+          lines.push("");
+        });
+      }
+      lines.push("---", "");
+      const result: FewShotResult = { block: lines.join("\n"), qaIds: sem.qaIds, itemIds: sem.itemIds };
+      cache.set(key, { ...result, expiresAt: Date.now() + TTL_MS });
+      return result;
+    }
+  } catch (err) {
+    logger.debug({ err }, "semantic few-shot fail, fallback to lexical");
+  }
+
+  // ---------- Fallback léxico ----------
   const qTokens = tokenize(userQuery);
   if (qTokens.size === 0) {
     return { block: "", qaIds: [], itemIds: [] };
