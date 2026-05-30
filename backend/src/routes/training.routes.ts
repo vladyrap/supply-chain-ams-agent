@@ -77,4 +77,15 @@ export async function trainingRoutes(app: FastifyInstance) {
 
   // Feedback patterns -> auto-curation
   app.post("/api/training/feedback/patterns", ctrl.postFeedbackPatterns);
+
+  // Reasoning trace por response_id
+  app.get<{ Params: { id: string } }>("/api/training/reasoning/:id", ctrl.getReasoningTraceRoute);
+
+  // Hallucination detection
+  app.get("/api/training/hallucinations/report", ctrl.getHallucinationReportRoute);
+  app.get("/api/training/hallucinations/whitelist", ctrl.getHallucinationWhitelist);
+  app.post("/api/training/hallucinations/invalidate", ctrl.postInvalidateWhitelist);
+
+  // Active learning · borderline Q&A
+  app.get<{ Querystring: { limit?: string } }>("/api/training/active/borderline", ctrl.getBorderlineQAsRoute);
 }

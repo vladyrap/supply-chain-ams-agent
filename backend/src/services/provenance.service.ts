@@ -76,6 +76,112 @@ interface ProvenanceRow {
   item_ids: string[];
 }
 
+export interface ReasoningTrace {
+  responseId: string;
+  userQuery: string | null;
+  module: string | null;
+  createdAt: string;
+  fewShotQas: { id: string; question: string; expected_answer: string; module: string | null }[];
+  fewShotItems: { id: string; title: string; module: string; status: string; score: number }[];
+  ragDocs: { id: string; title: string | null; source_file: string | null }[];
+  feedback: { kind: string; reason: string | null; created_at: string }[];
+  hallucination: { suspicious: string[]; custom_z_y: string[]; risk_score: number } | null;
+}
+
+export async function getReasoningTrace(responseId: string): Promise<ReasoningTrace | null> {
+  if (!responseId) return null;
+  await ensureSchema();
+  let prov: { qa_ids: string[]; item_ids: string[]; rag_doc_ids: string[]; user_query: string | null; module: string | null; created_at: string } | null = null;
+  try {
+    const { rows } = await query<{
+      qa_ids: string[]; item_ids: string[]; rag_doc_ids: string[];
+      user_query: string | null; module: string | null; created_at: string;
+    }>(
+      `SELECT qa_ids, item_ids, rag_doc_ids, user_query, module, created_at
+         FROM agent_response_provenance
+        WHERE response_id = $1`,
+      [responseId]
+    );
+    prov = rows[0] ?? null;
+  } catch (err) {
+    logger.debug({ err }, "getReasoningTrace prov fail");
+  }
+  if (!prov) return null;
+
+  // Q&A details
+  let fewShotQas: ReasoningTrace["fewShotQas"] = [];
+  if (prov.qa_ids.length > 0) {
+    try {
+      const { rows } = await query<{ id: string; question: string; expected_answer: string; module: string | null }>(
+        `SELECT q.id, q.question, q.expected_answer, i.module
+           FROM kb_training_qa q
+           LEFT JOIN kb_training_items i ON i.id = q.knowledge_item_id
+          WHERE q.id = ANY($1::uuid[])`,
+        [prov.qa_ids]
+      );
+      fewShotQas = rows;
+    } catch { /* */ }
+  }
+
+  let fewShotItems: ReasoningTrace["fewShotItems"] = [];
+  if (prov.item_ids.length > 0) {
+    try {
+      const { rows } = await query<{ id: string; title: string; module: string; status: string; score: number }>(
+        `SELECT id, title, module, status, score FROM kb_training_items WHERE id = ANY($1::uuid[])`,
+        [prov.item_ids]
+      );
+      fewShotItems = rows;
+    } catch { /* */ }
+  }
+
+  let ragDocs: ReasoningTrace["ragDocs"] = [];
+  if (prov.rag_doc_ids.length > 0) {
+    try {
+      const { rows } = await query<{ id: string; title: string | null; source_file: string | null }>(
+        `SELECT id, title, source_file FROM knowledge_documents WHERE id = ANY($1::uuid[])`,
+        [prov.rag_doc_ids]
+      );
+      ragDocs = rows;
+    } catch { /* */ }
+  }
+
+  // Feedback asociado
+  let feedback: ReasoningTrace["feedback"] = [];
+  try {
+    const { rows } = await query<{ kind: string; reason: string | null; created_at: string }>(
+      `SELECT kind, reason, created_at
+         FROM ai_response_feedback
+        WHERE metadata->>'responseId' = $1
+        ORDER BY created_at DESC
+        LIMIT 5`,
+      [responseId]
+    );
+    feedback = rows;
+  } catch { /* */ }
+
+  // Hallucination
+  let hallucination: ReasoningTrace["hallucination"] = null;
+  try {
+    const { rows } = await query<{ suspicious: string[]; custom_z_y: string[]; risk_score: number }>(
+      `SELECT suspicious, custom_z_y, risk_score
+         FROM agent_hallucinations
+        WHERE response_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [responseId]
+    );
+    if (rows[0]) hallucination = rows[0];
+  } catch { /* */ }
+
+  return {
+    responseId,
+    userQuery: prov.user_query,
+    module: prov.module,
+    createdAt: prov.created_at,
+    fewShotQas, fewShotItems, ragDocs, feedback, hallucination,
+  };
+}
+
 export async function getProvenance(responseId: string): Promise<ProvenanceRow | null> {
   if (!responseId) return null;
   await ensureSchema();

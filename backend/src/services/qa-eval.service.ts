@@ -230,14 +230,16 @@ export async function runQaEvaluation(opts: {
   );
   const runId = runRows[0]!.id;
 
-  // 3. Tomar Q&A aprobadas a evaluar
+  // 3. Tomar Q&A aprobadas a evaluar (con turnos si los tiene)
   const { rows: qas } = await query<{
     id: string; question: string; expected_answer: string;
     knowledge_item_id: string | null;
     item_module: string | null;
+    turns: { user: string; expectedAgent: string }[] | null;
   }>(
     `SELECT q.id, q.question, q.expected_answer, q.knowledge_item_id,
-            i.module AS item_module
+            i.module AS item_module,
+            q.turns
        FROM kb_training_qa q
        LEFT JOIN kb_training_items i ON i.id = q.knowledge_item_id
       WHERE q.approved = true
@@ -257,13 +259,45 @@ export async function runQaEvaluation(opts: {
     };
   }
 
-  // 4. Para cada Q&A: ejecutar agente + juez
+  // 4. Para cada Q&A: ejecutar agente + juez (single o multi-turno)
   const results: EvalSingleResult[] = [];
   const start = Date.now();
   for (const qa of qas) {
     try {
-      const { text: actual, latencyMs } = await callAgent(qa.question, qa.item_module, opts.systemPromptOverride);
-      const judged = await judgeWithGemini(qa.question, qa.expected_answer, actual);
+      let actual: string;
+      let latencyMs: number;
+      let questionForJudge = qa.question;
+      let expectedForJudge = qa.expected_answer;
+
+      if (Array.isArray(qa.turns) && qa.turns.length > 0) {
+        // Multi-turno: ejecutar turn-by-turn manteniendo contexto
+        const transcript: string[] = [];
+        let totalLatency = 0;
+        let finalAgentAnswer = "";
+        for (const t of qa.turns) {
+          const contextPrefix = transcript.length > 0
+            ? `Conversación previa:\n${transcript.join("\n")}\n\nNuevo turno del usuario: `
+            : "";
+          const turnQuery = contextPrefix + t.user;
+          const { text, latencyMs: lm } = await callAgent(turnQuery, qa.item_module, opts.systemPromptOverride);
+          transcript.push(`USER: ${t.user}`, `AGENT: ${text}`);
+          finalAgentAnswer = text;
+          totalLatency += lm;
+        }
+        actual = finalAgentAnswer;
+        latencyMs = totalLatency;
+        // Para el juez usamos el último turno como pregunta y expectedAgent como respuesta esperada
+        const lastTurn = qa.turns[qa.turns.length - 1];
+        questionForJudge = lastTurn.user;
+        expectedForJudge = lastTurn.expectedAgent;
+      } else {
+        // Single-turno (Q&A existentes)
+        const r = await callAgent(qa.question, qa.item_module, opts.systemPromptOverride);
+        actual = r.text;
+        latencyMs = r.latencyMs;
+      }
+
+      const judged = await judgeWithGemini(questionForJudge, expectedForJudge, actual);
       const result: EvalSingleResult = {
         qaId: qa.id,
         itemId: qa.knowledge_item_id,

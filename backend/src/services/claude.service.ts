@@ -259,6 +259,20 @@ export async function chatWithAgent(input: ClaudeChatInput): Promise<ClaudeChatR
       logger.debug({ err }, "provenance.record fail (continuo)");
     }
 
+    // Hallucination check fire-and-forget — no bloquea la respuesta
+    (async () => {
+      try {
+        const { checkHallucinations } = await import("./hallucination-detector.service");
+        await checkHallucinations({
+          responseId,
+          userQuery: input.userMessage,
+          responseText: text,
+        });
+      } catch (err) {
+        logger.debug({ err }, "hallucination check fail");
+      }
+    })();
+
     return {
       text,
       model,

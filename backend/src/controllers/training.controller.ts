@@ -17,6 +17,9 @@ import {
 import { backfillTrainingEmbeddings } from "../services/training-embeddings.service";
 import { getEvalTimeline } from "../services/eval-timeline.service";
 import { runFeedbackPatternDetection } from "../services/feedback-patterns.service";
+import { getReasoningTrace } from "../services/provenance.service";
+import { getHallucinationReport, getWhitelistFromCorpus, invalidateWhitelist } from "../services/hallucination-detector.service";
+import { getBorderlineQAs } from "../services/active-learning.service";
 import type {
   KnowledgeStatus, KnowledgeType, Priority, ValidationStage,
   TrainingVersionStatus, GapStatus,
@@ -670,5 +673,68 @@ export async function postFeedbackPatterns(
     logger.error({ err }, "feedback-patterns fail");
     const msg = err instanceof Error ? err.message : "Error detectando patrones";
     return reply.code(500).send({ success: false, error: msg });
+  }
+}
+
+// ============================================================
+// REASONING TRACE
+// ============================================================
+export async function getReasoningTraceRoute(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply
+) {
+  const { id } = req.params;
+  try {
+    const trace = await getReasoningTrace(id);
+    if (!trace) return reply.code(404).send({ success: false, error: "Trace no encontrado" });
+    return reply.send({ success: true, trace });
+  } catch (err) {
+    logger.error({ err, id }, "reasoning-trace fail");
+    return reply.code(500).send({ success: false, error: "Error obteniendo trace" });
+  }
+}
+
+// ============================================================
+// HALLUCINATION REPORT + WHITELIST
+// ============================================================
+export async function getHallucinationReportRoute(_req: FastifyRequest, reply: FastifyReply) {
+  try {
+    const report = await getHallucinationReport();
+    return reply.send({ success: true, report });
+  } catch (err) {
+    logger.error({ err }, "hallucination-report fail");
+    return reply.code(500).send({ success: false, error: "Error obteniendo reporte" });
+  }
+}
+
+export async function getHallucinationWhitelist(_req: FastifyRequest, reply: FastifyReply) {
+  try {
+    const w = await getWhitelistFromCorpus();
+    return reply.send({ success: true, count: w.size, transactions: Array.from(w).sort() });
+  } catch (err) {
+    logger.error({ err }, "whitelist fail");
+    return reply.code(500).send({ success: false, error: "Error obteniendo whitelist" });
+  }
+}
+
+export async function postInvalidateWhitelist(_req: FastifyRequest, reply: FastifyReply) {
+  invalidateWhitelist();
+  return reply.send({ success: true, message: "Whitelist invalidada — se reconstruirá en la próxima consulta" });
+}
+
+// ============================================================
+// ACTIVE LEARNING · Q&A borderline
+// ============================================================
+export async function getBorderlineQAsRoute(
+  req: FastifyRequest<{ Querystring: { limit?: string } }>,
+  reply: FastifyReply
+) {
+  try {
+    const limit = req.query?.limit ? parseInt(req.query.limit, 10) : 30;
+    const report = await getBorderlineQAs({ limit });
+    return reply.send({ success: true, ...report });
+  } catch (err) {
+    logger.error({ err }, "borderline QAs fail");
+    return reply.code(500).send({ success: false, error: "Error obteniendo Q&A borderline" });
   }
 }

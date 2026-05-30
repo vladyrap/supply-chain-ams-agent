@@ -59,9 +59,12 @@ async function ensureSchema(): Promise<void> {
         question          TEXT NOT NULL,
         expected_answer   TEXT NOT NULL DEFAULT '',
         approved          BOOLEAN NOT NULL DEFAULT false,
+        turns             JSONB,
         created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
+    // Idempotent: si la tabla ya existía, agregar la columna turns
+    await query(`ALTER TABLE kb_training_qa ADD COLUMN IF NOT EXISTS turns JSONB`).catch(() => null);
     await query(`CREATE INDEX IF NOT EXISTS idx_kbt_qa_item ON kb_training_qa(knowledge_item_id);`);
 
     await query(`
@@ -321,13 +324,14 @@ export async function createQA(items: { knowledgeItemId: string; question: strin
   return rows;
 }
 
-export async function updateQA(id: string, patch: { question?: string; expectedAnswer?: string; approved?: boolean }): Promise<TrainingQARow | null> {
+export async function updateQA(id: string, patch: { question?: string; expectedAnswer?: string; approved?: boolean; turns?: { user: string; expectedAgent: string }[] | null }): Promise<TrainingQARow | null> {
   await ensureSchema();
   const sets: string[] = [];
   const params: unknown[] = [];
   if (patch.question !== undefined)       { params.push(patch.question); sets.push(`question = $${params.length}`); }
   if (patch.expectedAnswer !== undefined) { params.push(patch.expectedAnswer); sets.push(`expected_answer = $${params.length}`); }
   if (patch.approved !== undefined)       { params.push(patch.approved); sets.push(`approved = $${params.length}`); }
+  if (patch.turns !== undefined)          { params.push(patch.turns === null ? null : JSON.stringify(patch.turns)); sets.push(`turns = $${params.length}::jsonb`); }
   if (sets.length === 0) {
     const { rows } = await query<TrainingQARow>(`SELECT * FROM kb_training_qa WHERE id = $1`, [id]);
     return rows[0] ?? null;
