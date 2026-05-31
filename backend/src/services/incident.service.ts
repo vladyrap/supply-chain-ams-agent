@@ -6,6 +6,17 @@ import type {
   ConfidenceLevel,
   Attachment,
 } from "../types/ams.types";
+import {
+  ensureEstimateSchema, enrichIncidentLazy, estimateIncident,
+} from "./ticket-estimate.service";
+import type {
+  TicketEstimatedResolution, EnvironmentLevel,
+} from "../utils/estimation";
+
+// Extiende IncidentRecord opcionalmente con la estimación autoembebida.
+export type IncidentWithEstimate = IncidentRecord & {
+  estimatedResolution?: TicketEstimatedResolution | null;
+};
 
 export interface SaveIncidentInput {
   input: AmsChatInputNormalized;
@@ -44,8 +55,9 @@ function rowToRecord(row: IncidentRowRaw): IncidentRecord {
   };
 }
 
-export async function saveIncident(data: SaveIncidentInput): Promise<IncidentRecord> {
+export async function saveIncident(data: SaveIncidentInput): Promise<IncidentWithEstimate> {
   const { input, response, confidence, model } = data;
+  // 1. INSERT base (sin estimación) para tener el id real
   const { rows } = await query<IncidentRowRaw>(
     `INSERT INTO incidents
        (user_name, client_name, sap_module, environment, message, response,
@@ -66,7 +78,35 @@ export async function saveIncident(data: SaveIncidentInput): Promise<IncidentRec
     ]
   );
   const rec = rowToRecord(rows[0]!);
-  // Indexar en búsqueda semántica (no bloqueante)
+
+  // 2. Autoestimación inmediata + UPDATE de la columna jsonb (lazy schema)
+  let estimatedResolution: TicketEstimatedResolution | null = null;
+  try {
+    await ensureEstimateSchema();
+    const envU = String(input.environment ?? "NO_INFORMADO").toUpperCase() as EnvironmentLevel;
+    estimatedResolution = estimateIncident({
+      ticketId: rec.id,
+      origin: "agent_chat",
+      kind: "incident",
+      title: input.message.slice(0, 80),
+      description: input.message,
+      sapModule: input.module || undefined,
+      environment: envU,
+      isProductive: envU === "PRD",
+      agentConfidence: confidence,
+      hasErrorEvidence: input.attachments.length > 0,
+    });
+    await query(
+      `UPDATE incidents SET estimated_resolution = $1::jsonb WHERE id = $2`,
+      [JSON.stringify(estimatedResolution), rec.id]
+    );
+  } catch (err) {
+    // No bloqueamos la creación del incidente si la autoestimación falla.
+    // El próximo GET aplicará enrichIncidentLazy automáticamente.
+    estimatedResolution = null;
+  }
+
+  // 3. Indexar en búsqueda semántica (no bloqueante)
   upsertSearchFireAndForget({
     source_type: "incident",
     source_id: rec.id,
@@ -75,11 +115,12 @@ export async function saveIncident(data: SaveIncidentInput): Promise<IncidentRec
     href: "/history",
     metadata: { module: rec.sap_module, client: rec.client_name, confidence: rec.confidence },
   });
-  return rec;
+  return { ...rec, estimatedResolution };
 }
 
 // Para los listados NO devolvemos el base64 (puede pesar varios MB).
 // Devolvemos solo metadata: nombre, mimeType, sizeBytes.
+// Sí devolvemos estimated_resolution para que la lista muestre la banda y la confianza.
 const LIST_SELECT = `
   id, user_name, client_name, sap_module, environment, message, response,
   confidence, model,
@@ -91,6 +132,7 @@ const LIST_SELECT = `
     )) FROM jsonb_array_elements(attachments) a),
     '[]'::jsonb
   ) AS attachments,
+  estimated_resolution,
   created_at
 `;
 
@@ -105,7 +147,13 @@ export interface ListFilters {
   limit?: number;        // default 50, max 200
 }
 
-export async function listIncidents(filters: ListFilters = {}): Promise<IncidentRecord[]> {
+// Tipo extendido del row para captar también la columna estimated_resolution.
+interface IncidentRowWithEst extends IncidentRowRaw {
+  estimated_resolution?: TicketEstimatedResolution | null;
+}
+
+export async function listIncidents(filters: ListFilters = {}): Promise<IncidentWithEstimate[]> {
+  await ensureEstimateSchema(); // asegura columna existe para SELECT
   const where: string[] = [];
   const params: unknown[] = [];
   function add(cond: string, val: unknown) {
@@ -127,7 +175,7 @@ export async function listIncidents(filters: ListFilters = {}): Promise<Incident
   params.push(limit);
 
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
-  const { rows } = await query<IncidentRowRaw>(
+  const { rows } = await query<IncidentRowWithEst>(
     `SELECT ${LIST_SELECT}
        FROM incidents
        ${whereSql}
@@ -135,14 +183,33 @@ export async function listIncidents(filters: ListFilters = {}): Promise<Incident
        LIMIT $${params.length}`,
     params
   );
-  return rows.map(rowToRecord);
+
+  // Backfill lazy: filas viejas sin estimación reciben una recién calculada.
+  const out: IncidentWithEstimate[] = [];
+  for (const row of rows) {
+    const base = rowToRecord(row);
+    let est: TicketEstimatedResolution | null = row.estimated_resolution ?? null;
+    if (!est) {
+      est = await enrichIncidentLazy({
+        id: row.id,
+        message: row.message,
+        sap_module: row.sap_module ?? null,
+        environment: row.environment ?? null,
+        confidence: (row.confidence ?? null) as string | null,
+        attachments: row.attachments,
+      });
+    }
+    out.push({ ...base, estimatedResolution: est });
+  }
+  return out;
 }
 
-export async function getIncidentById(id: string): Promise<IncidentRecord | null> {
+export async function getIncidentById(id: string): Promise<IncidentWithEstimate | null> {
+  await ensureEstimateSchema();
   // En el detalle SI devolvemos el base64 completo.
-  const { rows } = await query<IncidentRowRaw>(
+  const { rows } = await query<IncidentRowWithEst>(
     `SELECT id, user_name, client_name, sap_module, environment, message, response,
-            confidence, model, attachments, created_at
+            confidence, model, attachments, estimated_resolution, created_at
        FROM incidents
        WHERE id = $1`,
     [id]
@@ -151,7 +218,7 @@ export async function getIncidentById(id: string): Promise<IncidentRecord | null
   if (!row) return null;
   // En detalle, attachments puede traer dataBase64; lo dejamos pasar como esta.
   const att = Array.isArray(row.attachments) ? (row.attachments as unknown[]) : [];
-  return {
+  const base: IncidentRecord = {
     ...row,
     attachments: att.map((x) => {
       const o = (x ?? {}) as Record<string, unknown>;
@@ -159,10 +226,20 @@ export async function getIncidentById(id: string): Promise<IncidentRecord | null
         name: typeof o.name === "string" ? o.name : "adjunto",
         mimeType: typeof o.mimeType === "string" ? o.mimeType : "application/octet-stream",
         sizeBytes: typeof o.sizeBytes === "number" ? o.sizeBytes : 0,
-        // dataBase64 lo agregamos como propiedad extra; el type IncidentAttachmentMeta
-        // no lo declara, pero JSON.stringify lo serializa igual cuando el cliente pide /api/ams/incidents/:id
         ...(typeof o.dataBase64 === "string" ? { dataBase64: o.dataBase64 } : {}),
       };
     }) as IncidentRecord["attachments"],
   };
+  let est: TicketEstimatedResolution | null = row.estimated_resolution ?? null;
+  if (!est) {
+    est = await enrichIncidentLazy({
+      id: row.id,
+      message: row.message,
+      sap_module: row.sap_module ?? null,
+      environment: row.environment ?? null,
+      confidence: (row.confidence ?? null) as string | null,
+      attachments: row.attachments,
+    });
+  }
+  return { ...base, estimatedResolution: est };
 }
