@@ -21,6 +21,7 @@ import { demoRoutes } from "./routes/demo.routes";
 import { voiceRoutes } from "./routes/voice.routes";
 import { agentLabRoutes } from "./routes/agent-lab.routes";
 import { trainingRoutes } from "./routes/training.routes";
+import { escalationRoutes } from "./routes/escalation.routes";
 import { registry, httpRequestsTotal, httpRequestDuration } from "./utils/metrics";
 
 export function buildServer() {
@@ -85,6 +86,7 @@ export function buildServer() {
   app.register(voiceRoutes);
   app.register(agentLabRoutes);
   app.register(trainingRoutes);
+  app.register(escalationRoutes);
 
   app.setErrorHandler((err, _req, reply) => {
     logger.error({ err }, "Unhandled error");
