@@ -45,6 +45,7 @@ services:
         condition: service_started
     volumes:
       - ./prompts:/app/prompts:ro
+      - supply-chain-ams-uploads:/app/uploads
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:8000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
@@ -243,3 +244,5 @@ volumes:
     name: supply-chain-ams-prometheus-data
   supply-chain-ams-grafana-data:
     name: supply-chain-ams-grafana-data
+  supply-chain-ams-uploads:
+    name: supply-chain-ams-uploads

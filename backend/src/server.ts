@@ -2,6 +2,7 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import cookie from "@fastify/cookie";
 import formbody from "@fastify/formbody";
+import multipart from "@fastify/multipart";
 import { logger } from "./utils/logger";
 import { healthRoutes } from "./routes/health.routes";
 import { amsRoutes } from "./routes/ams.routes";
@@ -22,6 +23,7 @@ import { voiceRoutes } from "./routes/voice.routes";
 import { agentLabRoutes } from "./routes/agent-lab.routes";
 import { trainingRoutes } from "./routes/training.routes";
 import { escalationRoutes } from "./routes/escalation.routes";
+import { testingRoutes } from "./routes/testing.routes";
 import { registry, httpRequestsTotal, httpRequestDuration } from "./utils/metrics";
 
 export function buildServer() {
@@ -50,6 +52,15 @@ export function buildServer() {
   // Twilio webhooks usan application/x-www-form-urlencoded.
   // Sin este parser, req.body llega vacío en /api/voice/*.
   app.register(formbody);
+
+  // Multipart para upload de videos (Testing Intelligence).
+  // Limit 100MB por archivo. Si necesitás más, ajustar fileSize.
+  app.register(multipart, {
+    limits: {
+      fileSize: 100 * 1024 * 1024, // 100 MB
+      files: 1,
+    },
+  });
 
   // Métricas Prometheus
   app.addHook("onResponse", async (req, reply) => {
@@ -87,6 +98,7 @@ export function buildServer() {
   app.register(agentLabRoutes);
   app.register(trainingRoutes);
   app.register(escalationRoutes);
+  app.register(testingRoutes);
 
   app.setErrorHandler((err, _req, reply) => {
     logger.error({ err }, "Unhandled error");
