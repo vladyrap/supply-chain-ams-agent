@@ -24,6 +24,7 @@ import { agentLabRoutes } from "./routes/agent-lab.routes";
 import { trainingRoutes } from "./routes/training.routes";
 import { escalationRoutes } from "./routes/escalation.routes";
 import { testingRoutes } from "./routes/testing.routes";
+import { amsModulesRoutes } from "./routes/ams-modules.routes";
 import { registry, httpRequestsTotal, httpRequestDuration } from "./utils/metrics";
 
 export function buildServer() {
@@ -99,6 +100,7 @@ export function buildServer() {
   app.register(trainingRoutes);
   app.register(escalationRoutes);
   app.register(testingRoutes);
+  app.register(amsModulesRoutes);
 
   app.setErrorHandler((err, _req, reply) => {
     logger.error({ err }, "Unhandled error");
