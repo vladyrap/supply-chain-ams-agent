@@ -92,6 +92,8 @@ const ALL_SCREENS = [
   "usuarios", "roles", "entrenamiento_ia",
   "playbooks_ams", "document_factory", "quality_evaluator",
   "escalamiento_n2", "testing_intelligence", "time_estimator",
+  "ticket_command_center", "audit_trail", "global_search",
+  "agent_readiness", "business_value_dashboard",
 ];
 
 function noPerm(): RolePermission { return { view:false,create:false,edit:false,delete:false,export:false,configure:false,approve:false }; }
@@ -144,6 +146,11 @@ function seedRoles(): PlatformRole[] {
         escalamiento_n2: { ...viewCreateEdit(), export:true, configure:true, approve:true },
         testing_intelligence: { ...viewCreateEdit(), export:true, configure:true, approve:true },
         time_estimator: { ...viewCreateEdit(), export:true, approve:true },
+        ticket_command_center: { ...viewCreateEdit(), export:true, approve:true },
+        audit_trail:      viewExport(),
+        global_search:    viewOnly(),
+        agent_readiness:  viewExport(),
+        business_value_dashboard: viewExportApprove(),
       }),
     },
     {
@@ -168,6 +175,11 @@ function seedRoles(): PlatformRole[] {
         escalamiento_n2: { ...viewCreateEdit(), export:true },
         testing_intelligence: { ...viewCreateEdit(), export:true },
         time_estimator: { ...viewCreateEdit(), export:true },
+        ticket_command_center: viewCreateEdit(),
+        audit_trail:      viewOnly(),
+        global_search:    viewOnly(),
+        agent_readiness:  viewOnly(),
+        business_value_dashboard: viewOnly(),
       }),
     },
     {
@@ -187,6 +199,8 @@ function seedRoles(): PlatformRole[] {
         escalamiento_n2: viewOnly(),
         testing_intelligence: viewOnly(),
         time_estimator: viewOnly(),
+        ticket_command_center: viewOnly(),
+        global_search:    viewOnly(),
       }),
     },
     {
