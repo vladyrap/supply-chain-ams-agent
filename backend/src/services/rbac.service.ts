@@ -91,7 +91,7 @@ const ALL_SCREENS = [
   "canal_telefonico", "conocimiento_rag", "integraciones",
   "usuarios", "roles", "entrenamiento_ia",
   "playbooks_ams", "document_factory", "quality_evaluator",
-  "escalamiento_n2", "testing_intelligence",
+  "escalamiento_n2", "testing_intelligence", "time_estimator",
 ];
 
 function noPerm(): RolePermission { return { view:false,create:false,edit:false,delete:false,export:false,configure:false,approve:false }; }
@@ -143,6 +143,7 @@ function seedRoles(): PlatformRole[] {
         quality_evaluator: { ...viewCreateEdit(), export:true, approve:true },
         escalamiento_n2: { ...viewCreateEdit(), export:true, configure:true, approve:true },
         testing_intelligence: { ...viewCreateEdit(), export:true, configure:true, approve:true },
+        time_estimator: { ...viewCreateEdit(), export:true, approve:true },
       }),
     },
     {
@@ -166,6 +167,7 @@ function seedRoles(): PlatformRole[] {
         quality_evaluator: viewCreateEdit(),
         escalamiento_n2: { ...viewCreateEdit(), export:true },
         testing_intelligence: { ...viewCreateEdit(), export:true },
+        time_estimator: { ...viewCreateEdit(), export:true },
       }),
     },
     {
@@ -184,6 +186,7 @@ function seedRoles(): PlatformRole[] {
         document_factory: viewOnly(),
         escalamiento_n2: viewOnly(),
         testing_intelligence: viewOnly(),
+        time_estimator: viewOnly(),
       }),
     },
     {
@@ -241,7 +244,52 @@ async function seedIfEmpty(): Promise<void> {
   }
 }
 
-async function ready() { await ensureSchema(); await seedIfEmpty(); }
+// ============================================================
+// Backfill: cuando se agregan screens nuevas al código, los roles ya
+// persistidos en DB no las tienen en permissions jsonb. Esta función
+// las agrega:
+//  - Roles is_system=true → re-sincronizan permisos con el seed actual
+//    (idempotente, mantiene los roles del sistema siempre alineados al código).
+//  - Roles custom         → agregan screens faltantes con noPerm() para
+//    evitar undefined en hasPermission().
+// Se ejecuta una vez por boot dentro de ready().
+// ============================================================
+let backfilled = false;
+async function backfillMissingScreens(): Promise<void> {
+  if (backfilled) return;
+  try {
+    const r = await query<RoleRow>("SELECT * FROM platform_roles");
+    const seedByCode = new Map(seedRoles().map((s) => [s.code, s]));
+    for (const row of r.rows) {
+      const current = (row.permissions || {}) as RolePermissionMap;
+      let next: RolePermissionMap;
+      if (row.is_system && seedByCode.has(row.code)) {
+        // Pisar con el seed actual (siempre en sync con código).
+        next = seedByCode.get(row.code)!.permissions;
+      } else {
+        // Rol custom: agregar screens faltantes con noPerm().
+        next = { ...current } as RolePermissionMap;
+        let changed = false;
+        for (const s of ALL_SCREENS) {
+          if (!next[s as keyof RolePermissionMap]) {
+            next[s as keyof RolePermissionMap] = noPerm();
+            changed = true;
+          }
+        }
+        if (!changed) continue;
+      }
+      await query(
+        "UPDATE platform_roles SET permissions = $1::jsonb, updated_at = $2 WHERE id = $3",
+        [JSON.stringify(next), new Date().toISOString(), row.id]
+      );
+    }
+    backfilled = true;
+  } catch (err) {
+    logger.warn({ err }, "backfill rbac screens failed");
+  }
+}
+
+async function ready() { await ensureSchema(); await seedIfEmpty(); await backfillMissingScreens(); }
 
 // ============================================================
 // Mappers
