@@ -132,6 +132,10 @@ export interface EscalationRecord {
   mode: ItsmMode;
   payload?: unknown;
   events: EscalationEvent[];
+  /** Autoestimación copiada del incidente al escalar (puede ser recalculada por N2). */
+  estimatedResolution?: unknown;
+  /** Snapshot original al momento de la escalación, para mostrar diff N1↔N2. */
+  estimatedResolutionOriginal?: unknown;
   createdAt: string;
   updatedAt: string;
 }
@@ -536,6 +540,8 @@ interface RecRow {
   created_at: string; updated_at: string;
 }
 function mapRecord(r: RecRow): EscalationRecord {
+  // Extraer la autoestimación del payload jsonb (la metió createRecord/updateRecord).
+  const pl = (r.payload && typeof r.payload === "object") ? r.payload as Record<string, unknown> : {};
   return {
     id: r.id, incidentId: r.incident_id, escalationNumber: r.escalation_number,
     fromLevel: r.from_level as 1 | 2, toLevel: r.to_level as 2 | 3,
@@ -547,6 +553,8 @@ function mapRecord(r: RecRow): EscalationRecord {
     createdBy: r.created_by, approvedBy: r.approved_by, approvedAt: r.approved_at,
     requiresApproval: r.requires_approval, mode: r.mode as ItsmMode,
     payload: r.payload, events: Array.isArray(r.events) ? r.events : [],
+    estimatedResolution: pl.estimatedResolution ?? null,
+    estimatedResolutionOriginal: pl.estimatedResolutionOriginal ?? null,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
@@ -652,6 +660,26 @@ export async function deleteResponsible(id: string): Promise<void> {
 
 export async function createRecord(r: EscalationRecord): Promise<EscalationRecord> {
   await ready();
+
+  // Copiar la estimación del incidente al payload del record si existe.
+  // Esto deja la estimación adjunta al escalation para que la UI N2 pueda
+  // mostrar diff cuando ajusten complejidad/severidad y se recalcule.
+  let payloadOut = r.payload as Record<string, unknown> | null | undefined;
+  try {
+    const incEst = await query<{ estimated_resolution: unknown }>(
+      "SELECT estimated_resolution FROM incidents WHERE id = $1",
+      [r.incidentId]
+    );
+    const est = incEst.rows[0]?.estimated_resolution;
+    if (est) {
+      payloadOut = {
+        ...(payloadOut || {}),
+        estimatedResolution: est,
+        estimatedResolutionOriginal: est, // baseline para diff cuando recalculen
+      };
+    }
+  } catch { /* tabla incidents puede no existir en tests aislados */ }
+
   const res = await query<RecRow>(
     `INSERT INTO escalation_records (id,incident_id,escalation_number,from_level,to_level,reason,summary,
        client_summary,assigned_to,assigned_to_name,assigned_team,channel,rule_id,external_ticket_id,
@@ -663,7 +691,7 @@ export async function createRecord(r: EscalationRecord): Promise<EscalationRecor
      r.clientSummary || null, r.assignedTo || null, r.assignedToName || null, r.assignedTeam || null,
      r.channel, r.ruleId || null, r.externalTicketId || null, r.externalTicketUrl || null,
      r.status, r.slaTarget, r.slaMinutes, r.createdBy, r.approvedBy || null, r.approvedAt || null,
-     r.requiresApproval, r.mode, r.payload ? JSON.stringify(r.payload) : null,
+     r.requiresApproval, r.mode, payloadOut ? JSON.stringify(payloadOut) : null,
      JSON.stringify(r.events || []), r.createdAt, r.updatedAt]
   );
   return mapRecord(res.rows[0]);

@@ -8,6 +8,8 @@
 // SEGURIDAD: el token NUNCA sale del backend. El frontend nunca lo ve.
 
 import { logger } from "../utils/logger";
+import { appendEstimateToDescription } from "../utils/estimation-summary";
+import type { TicketEstimatedResolution } from "../utils/estimation";
 
 export interface JiraPayload {
   project: { key: string };
@@ -85,9 +87,23 @@ function demoResult(payload: JiraPayload, reason?: string): JiraCreateResult {
  * Crea un issue Jira real si las credenciales están presentes; si no, simula.
  * `confirmReal=true` es OBLIGATORIO para que efectúe el POST real:
  * desde la UI esto sólo se setea tras una confirmación humana explícita.
+ *
+ * `estimate` opcional: si viene, se anexa un bloque "## Estimación AMS" al
+ * description y se agrega la label "estimate-generated".
  */
-export async function createJiraIssue(payload: JiraPayload, opts: { confirmReal?: boolean } = {}): Promise<JiraCreateResult> {
+export async function createJiraIssue(
+  payload: JiraPayload,
+  opts: { confirmReal?: boolean; estimate?: TicketEstimatedResolution | null } = {},
+): Promise<JiraCreateResult> {
   const env = readEnv();
+  // Enriquecer payload con la estimación (idempotente — si ya está, la reemplaza).
+  if (opts.estimate) {
+    payload = {
+      ...payload,
+      description: appendEstimateToDescription(payload.description, opts.estimate),
+      labels: Array.from(new Set([...(payload.labels ?? []), "estimate-generated"])),
+    };
+  }
   if (!jiraIsRealAvailable()) {
     return demoResult(payload, "credentials_not_configured");
   }

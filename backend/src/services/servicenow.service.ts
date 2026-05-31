@@ -5,6 +5,8 @@
 // Endpoint: POST {instanceUrl}/api/now/table/{table}
 
 import { logger } from "../utils/logger";
+import { appendEstimateToDescription } from "../utils/estimation-summary";
+import type { TicketEstimatedResolution } from "../utils/estimation";
 
 export interface ServiceNowPayload {
   short_description: string;
@@ -77,7 +79,20 @@ function demoResult(payload: ServiceNowPayload, reason?: string): ServiceNowCrea
   };
 }
 
-export async function createServiceNowIncident(payload: ServiceNowPayload, opts: { confirmReal?: boolean } = {}): Promise<ServiceNowCreateResult> {
+export async function createServiceNowIncident(
+  payload: ServiceNowPayload,
+  opts: { confirmReal?: boolean; estimate?: TicketEstimatedResolution | null } = {},
+): Promise<ServiceNowCreateResult> {
+  // Enriquecer payload con la estimación (idempotente).
+  if (opts.estimate) {
+    const expectedRange = `${opts.estimate.totalMinHours}-${opts.estimate.totalMaxHours}h`;
+    const enriched: ServiceNowPayload & { expected_resolution_range?: string } = {
+      ...payload,
+      description: appendEstimateToDescription(payload.description, opts.estimate),
+      expected_resolution_range: expectedRange,
+    };
+    payload = enriched;
+  }
   const env = readEnv();
   if (!serviceNowIsRealAvailable()) {
     return demoResult(payload, "credentials_not_configured");
