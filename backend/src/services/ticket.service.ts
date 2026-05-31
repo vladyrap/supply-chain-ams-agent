@@ -160,6 +160,7 @@ const MOCK_TICKETS: Ticket[] = [
 // ============================================================
 
 let ticketsDemoSchemaReady = false;
+let mocksSeedRan = false;
 let ticketCounterCache: number | null = null;
 
 async function ensureTicketsDemoSchema(): Promise<void> {
@@ -183,9 +184,98 @@ async function ensureTicketsDemoSchema(): Promise<void> {
     `);
     await query(`CREATE INDEX IF NOT EXISTS idx_tickets_demo_created ON tickets_demo (created_at DESC);`);
     ticketsDemoSchemaReady = true;
+    await seedMockTicketsIfMissing();
   } catch (err) {
     logger.warn({ err }, "ensure tickets_demo schema failed");
   }
+}
+
+/**
+ * Inserta los mocks demo (AMS-101..105) en tickets_demo si no existen.
+ * ON CONFLICT DO NOTHING — idempotente. Cada mock recibe su autoestimación
+ * al insertarse para que tengan banda horas/días desde el primer GET.
+ */
+async function seedMockTicketsIfMissing(): Promise<void> {
+  if (mocksSeedRan) return;
+  try {
+    for (const m of MOCK_TICKETS) {
+      const env = (m.environment || "NO_INFORMADO").toUpperCase() as EnvironmentLevel;
+      const estimate = autoEstimateTicketResolution({
+        ticketId: m.key,
+        origin: "demo_cliente",
+        kind: "incident",
+        title: m.title,
+        description: m.description,
+        sapModule: m.sapModule || undefined,
+        environment: env,
+        severity: priorityToSeverity(m.priority),
+        isProductive: env === "PRD",
+        hasErrorEvidence: m.description.length > 80,
+      });
+      await query(
+        `INSERT INTO tickets_demo
+           (key, title, description, status, priority, reporter, assignee,
+            sap_module, environment, estimated_resolution, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12)
+         ON CONFLICT (key) DO NOTHING`,
+        [m.key, m.title, m.description, m.status, m.priority,
+         m.reporter, m.assignee, m.sapModule ?? null, m.environment ?? null,
+         JSON.stringify(estimate), m.created, m.updated]
+      );
+    }
+    mocksSeedRan = true;
+  } catch (err) {
+    logger.warn({ err }, "seed mock tickets failed");
+  }
+}
+
+/**
+ * Espejo de un ticket externo (Jira o cualquier fuente no-DB) en tickets_demo.
+ * Sirve para que las ediciones de estimación (recalc/ajuste manual) tengan
+ * dónde persistirse aunque la fuente de verdad sea Jira. Idempotente.
+ */
+async function ensureTicketMirror(key: string): Promise<Ticket | null> {
+  await ensureTicketsDemoSchema();
+  // 1. Ya está en DB → devolverlo
+  const existing = await getUserTicketByKey(key);
+  if (existing) return existing;
+  // 2. Buscar en Jira (los mocks ya están en DB tras el seed)
+  const env = getJiraEnv();
+  let source: Ticket | null = null;
+  if (env) {
+    const jiraList = await fetchFromJira();
+    source = jiraList.find((t) => t.key === key) ?? null;
+  }
+  if (!source) {
+    // Fallback: mock por si el seed aún no corrió (raro)
+    source = MOCK_TICKETS.find((t) => t.key === key) ?? null;
+  }
+  if (!source) return null;
+  // 3. Calcular estimación + INSERT espejo
+  const e = (source.environment || "NO_INFORMADO").toUpperCase() as EnvironmentLevel;
+  const estimate = source.estimatedResolution ?? autoEstimateTicketResolution({
+    ticketId: source.key,
+    origin: source.source === "jira" ? "jira_demo" : "demo_cliente",
+    kind: "incident",
+    title: source.title,
+    description: source.description,
+    sapModule: source.sapModule || undefined,
+    environment: e,
+    severity: priorityToSeverity(source.priority),
+    isProductive: e === "PRD",
+    hasErrorEvidence: source.description.length > 80,
+  });
+  await query(
+    `INSERT INTO tickets_demo
+       (key, title, description, status, priority, reporter, assignee,
+        sap_module, environment, estimated_resolution, created_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12)
+     ON CONFLICT (key) DO NOTHING`,
+    [source.key, source.title, source.description, source.status, source.priority,
+     source.reporter, source.assignee, source.sapModule ?? null, source.environment ?? null,
+     JSON.stringify(estimate), source.created, source.updated]
+  );
+  return getUserTicketByKey(key);
 }
 
 interface TicketRow {
@@ -343,14 +433,16 @@ export async function getUserTicketByKey(key: string): Promise<Ticket | null> {
 }
 
 /**
- * Recalcula la autoestimación de un ticket persistido y la actualiza.
- * Si la estimación actual fue ajustada manualmente, no la pisa salvo force=true.
+ * Recalcula la autoestimación de un ticket y la actualiza.
+ * Si el ticket no está en DB (caso Jira o mocks no seedados), primero
+ * se espeja en tickets_demo y después se recalcula.
+ * Preserva ajustes manuales salvo force=true.
  */
 export async function recalculateUserTicket(
   key: string,
   options: { force?: boolean; actor?: string } = {},
 ): Promise<Ticket | null> {
-  const ticket = await getUserTicketByKey(key);
+  const ticket = await ensureTicketMirror(key);
   if (!ticket) return null;
   const current = ticket.estimatedResolution;
   if (current?.manuallyAdjusted && !options.force) {
@@ -381,7 +473,8 @@ export async function applyManualEstimatePatch(
   actor: string,
   reason: string,
 ): Promise<Ticket | null> {
-  const ticket = await getUserTicketByKey(key);
+  // Espejo automático si el ticket es externo (Jira) y todavía no está en DB
+  const ticket = await ensureTicketMirror(key);
   if (!ticket || !ticket.estimatedResolution) return null;
   const cur = ticket.estimatedResolution;
   const next: TicketEstimatedResolution = {
@@ -411,13 +504,23 @@ async function persistEstimate(key: string, est: TicketEstimatedResolution): Pro
 }
 
 export async function listTickets(): Promise<{ source: TicketSource; tickets: Ticket[] }> {
+  // userTickets incluye TODO lo persistido: mocks seedeados (AMS-101..105) +
+  // tickets creados desde la UI (AMS-201++) + cualquier espejo de Jira que
+  // se haya editado alguna vez.
   const userTickets = await listUserTickets();
   const env = getJiraEnv();
   if (env) {
     const jiraTickets = await fetchFromJira();
-    if (jiraTickets.length > 0) return { source: "jira", tickets: [...userTickets, ...jiraTickets] };
+    if (jiraTickets.length > 0) {
+      // De-duplicar: si una key de Jira ya tiene espejo en DB, preferir el de DB
+      // (puede tener edición manual). Lo demás de Jira sale fresh.
+      const userKeys = new Set(userTickets.map((t) => t.key));
+      const jiraNew = jiraTickets.filter((t) => !userKeys.has(t.key));
+      return { source: "jira", tickets: [...userTickets, ...jiraNew] };
+    }
   }
-  return { source: "mock", tickets: [...userTickets, ...MOCK_TICKETS] };
+  // Sin Jira: todo viene de DB (mocks ya seedeados + user tickets)
+  return { source: "mock", tickets: userTickets };
 }
 
 export async function getTicketByKey(key: string): Promise<Ticket | null> {
