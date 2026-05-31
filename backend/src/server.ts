@@ -14,6 +14,7 @@ import { knowledgeRoutes } from "./routes/knowledge.routes";
 import { authRoutes } from "./routes/auth.routes";
 import { meetingRoutes } from "./routes/meeting.routes";
 import { ticketRoutes } from "./routes/ticket.routes";
+import { scopeItemsRoutes } from "./routes/scope-items.routes";
 import { sapRoutes } from "./routes/sap.routes";
 import { supportRoutes } from "./routes/support.routes";
 import { integrationRoutes } from "./routes/integration.routes";
@@ -107,6 +108,7 @@ export function buildServer() {
   app.register(testingRoutes);
   app.register(amsModulesRoutes);
   app.register(rbacRoutes);
+  app.register(scopeItemsRoutes);
 
   app.setErrorHandler((err, req, reply) => {
     logger.error({ err }, "Unhandled error");

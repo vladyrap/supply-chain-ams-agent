@@ -6,6 +6,7 @@ import { saveIncident, listIncidents, getIncidentById } from "../services/incide
 import { recordAudit, listAudit } from "../services/audit.service";
 import { getStats } from "../services/stats.service";
 import { emitEventFireAndForget } from "../services/integrations/delivery.service";
+import { buildAgentMetadata } from "../utils/agent-meta";
 import { logger } from "../utils/logger";
 import type { AmsChatRequest, Attachment, AttachmentMime } from "../types/ams.types";
 
@@ -182,6 +183,13 @@ export async function postChat(req: FastifyRequest, reply: FastifyReply) {
       has_attachments: normalized.attachments.length > 0,
     });
 
+    const metadata = await buildAgentMetadata({
+      model: result.model,
+      confidence: result.confidence,
+      timestamp: incident.created_at,
+      responseId: result.responseId,
+      ragSources: result.ragSources,
+    });
     return reply.send({
       success: true,
       agent: "ams-supply-chain-agent",
@@ -194,11 +202,7 @@ export async function postChat(req: FastifyRequest, reply: FastifyReply) {
         attachmentCount: normalized.attachments.length,
       },
       response: result.text,
-      metadata: {
-        model: result.model,
-        timestamp: incident.created_at,
-        confidence: result.confidence,
-      },
+      metadata,
     });
   } catch (err) {
     logger.error({ err }, "Fallo en /api/ams/chat");
@@ -324,15 +328,16 @@ export async function postResearch(req: FastifyRequest, reply: FastifyReply) {
       },
       response: result.text,
       metadata: {
-        model: result.model,
-        timestamp: incident.created_at,
-        confidence: result.confidence,
+        ...(await buildAgentMetadata({
+          model: result.model,
+          confidence: result.confidence,
+          timestamp: incident.created_at,
+        })),
         iterations: result.iterations,
         toolCalls: result.toolCalls.map((tc) => ({
           name: tc.name,
           args: tc.args,
           durationMs: tc.durationMs,
-          // resumen del resultado (sin volcar todo)
           resultSummary: summarizeToolResult(tc.result),
         })),
       },
@@ -542,7 +547,9 @@ export async function postChatStream(req: FastifyRequest, reply: FastifyReply) {
     send({
       type: "done",
       incidentId: incident.id,
-      metadata: { model, timestamp: incident.created_at, confidence },
+      metadata: await buildAgentMetadata({
+        model, confidence, timestamp: incident.created_at,
+      }),
     });
     reply.raw.end();
   } catch (err) {
