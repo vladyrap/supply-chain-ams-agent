@@ -1,7 +1,8 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
 import {
   listTickets, getTicketByKey, getTicketProviderStatus,
-  createUserTicket, type CreateTicketInput,
+  createUserTicket, recalculateUserTicket, applyManualEstimatePatch,
+  type CreateTicketInput, type ManualEstimatePatch,
 } from "../services/ticket.service";
 import { chatWithAgent } from "../services/claude.service";
 import { logger } from "../utils/logger";
@@ -52,11 +53,50 @@ export async function postCreateTicket(
     if (!body.description || !body.description.trim()) {
       return reply.code(400).send({ success: false, error: "description es requerida" });
     }
-    const ticket = createUserTicket(body);
+    const ticket = await createUserTicket(body);
     return reply.code(201).send({ success: true, ticket });
   } catch (err) {
     logger.error({ err }, "ticket create fail");
     return reply.code(500).send({ success: false, error: "Error creando ticket" });
+  }
+}
+
+export async function postRecalculateEstimate(
+  req: FastifyRequest<{ Params: { key: string }; Body: { force?: boolean; actor?: string } }>,
+  reply: FastifyReply
+) {
+  try {
+    const { force, actor } = req.body || {};
+    const ticket = await recalculateUserTicket(req.params.key, { force, actor });
+    if (!ticket) return reply.code(404).send({ success: false, error: "ticket no encontrado (solo se pueden recalcular tickets creados desde la UI)" });
+    return reply.send({ success: true, ticket });
+  } catch (err) {
+    logger.error({ err }, "ticket recalc fail");
+    return reply.code(500).send({ success: false, error: "Error recalculando" });
+  }
+}
+
+interface AdjustBody extends ManualEstimatePatch {
+  actor: string;
+  reason: string;
+}
+export async function patchManualEstimate(
+  req: FastifyRequest<{ Params: { key: string }; Body: AdjustBody }>,
+  reply: FastifyReply
+) {
+  try {
+    const body = req.body || ({} as AdjustBody);
+    if (!body.actor) return reply.code(400).send({ success: false, error: "actor es requerido" });
+    if (!body.reason || !body.reason.trim()) {
+      return reply.code(400).send({ success: false, error: "reason es requerido para auditoría" });
+    }
+    const { actor, reason, ...patch } = body;
+    const ticket = await applyManualEstimatePatch(req.params.key, patch, actor, reason);
+    if (!ticket) return reply.code(404).send({ success: false, error: "ticket no encontrado" });
+    return reply.send({ success: true, ticket });
+  } catch (err) {
+    logger.error({ err }, "ticket manual adjust fail");
+    return reply.code(500).send({ success: false, error: "Error ajustando estimación" });
   }
 }
 
