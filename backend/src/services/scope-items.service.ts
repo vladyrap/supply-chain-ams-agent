@@ -135,11 +135,12 @@ const SEED: Array<Omit<SapScopeItem, "hasKnowledge" | "hasPlaybook" | "hasQa" | 
 ];
 
 async function seedIfEmpty(): Promise<void> {
+  // Idempotente: corre siempre y usa ON CONFLICT DO NOTHING para no pisar
+  // ediciones del usuario. Garantiza que filas nuevas del SEED (cuando se
+  // amplía el catálogo en el código) aparezcan al próximo boot sin requerir
+  // truncar la tabla.
   if (seedRan) return;
   try {
-    const { rows } = await query<{ c: string }>("SELECT count(*)::text AS c FROM sap_scope_items");
-    const count = Number(rows[0]?.c ?? "0");
-    if (count > 0) { seedRan = true; return; }
     for (const it of SEED) {
       await query(
         `INSERT INTO sap_scope_items (code, title, module, process, sub_process, description)
