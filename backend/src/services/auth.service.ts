@@ -6,10 +6,79 @@ import type { Role, User, UserWithPasswordHash } from "../types/auth.types";
 
 const VALID_ROLES = new Set<Role>(["viewer", "consultor", "aprobador", "admin"]);
 const SESSION_TTL_DAYS = 30;
-const BCRYPT_ROUNDS = 10;
+const REFRESH_TTL_DAYS = 60;
+// 12 rounds = ~250ms en CPU típica. Más seguro que 10. Si subís a 14 sumás 1s por login.
+const BCRYPT_ROUNDS = Number(process.env.AUTH_BCRYPT_ROUNDS || 12);
 
 function generateSessionToken(): string {
   return crypto.randomBytes(32).toString("hex");
+}
+
+let hardenedSchemaEnsured = false;
+async function ensureHardenedSchema(): Promise<void> {
+  if (hardenedSchemaEnsured) return;
+  try {
+    // Sessions con metadata extra (idempotente).
+    await query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ`).catch(() => null);
+    await query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ`).catch(() => null);
+    await query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ip_address TEXT`).catch(() => null);
+
+    // Tabla de refresh tokens separada (rotation-friendly).
+    await query(`
+      CREATE TABLE IF NOT EXISTS refresh_tokens (
+        id            TEXT PRIMARY KEY,
+        user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        session_id    TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+        expires_at    TIMESTAMPTZ NOT NULL,
+        used_at       TIMESTAMPTZ,
+        revoked_at    TIMESTAMPTZ,
+        replaced_by   TEXT,
+        user_agent    TEXT,
+        ip_address    TEXT,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_rt_user    ON refresh_tokens(user_id);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_rt_session ON refresh_tokens(session_id);`);
+
+    // Audit log auth
+    await query(`
+      CREATE TABLE IF NOT EXISTS auth_events (
+        id         BIGSERIAL PRIMARY KEY,
+        user_id    UUID REFERENCES users(id) ON DELETE SET NULL,
+        event      TEXT NOT NULL,
+        ip_address TEXT,
+        user_agent TEXT,
+        details    JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_auth_evt_user    ON auth_events(user_id);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_auth_evt_event   ON auth_events(event);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_auth_evt_created ON auth_events(created_at DESC);`);
+
+    hardenedSchemaEnsured = true;
+  } catch (err) {
+    logger.warn({ err }, "ensure auth hardened schema failed");
+  }
+}
+
+export async function recordAuthEvent(
+  event: "LOGIN_SUCCESS" | "LOGIN_FAIL" | "LOGOUT" | "REFRESH" | "REVOKE_ALL" | "SIGNUP",
+  userId: string | null,
+  meta: { ip?: string; userAgent?: string; details?: Record<string, unknown> } = {}
+): Promise<void> {
+  try {
+    await ensureHardenedSchema();
+    await query(
+      `INSERT INTO auth_events (user_id, event, ip_address, user_agent, details)
+       VALUES ($1, $2, $3, $4, $5::jsonb)`,
+      [userId, event, meta.ip || null, meta.userAgent || null,
+       meta.details ? JSON.stringify(meta.details) : null]
+    );
+  } catch (err) {
+    logger.debug({ err }, "auth event log failed");
+  }
 }
 
 export interface SignupInput {
@@ -62,30 +131,136 @@ export async function verifyPassword(plain: string, hash: string): Promise<boole
   return bcrypt.compare(plain, hash);
 }
 
-export async function createSession(userId: string, userAgent?: string): Promise<string> {
+export async function createSession(userId: string, userAgent?: string, ip?: string): Promise<string> {
+  await ensureHardenedSchema();
   const token = generateSessionToken();
   const expiresAt = new Date(Date.now() + SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
   await query(
-    `INSERT INTO sessions (id, user_id, expires_at, user_agent)
-     VALUES ($1, $2, $3, $4)`,
-    [token, userId, expiresAt.toISOString(), userAgent ?? null]
+    `INSERT INTO sessions (id, user_id, expires_at, user_agent, ip_address, last_used_at)
+     VALUES ($1, $2, $3, $4, $5, now())`,
+    [token, userId, expiresAt.toISOString(), userAgent ?? null, ip ?? null]
   );
   return token;
 }
 
+export interface SessionWithRefresh {
+  sessionToken: string;
+  refreshToken: string;
+  refreshExpiresAt: string;
+}
+
+/** Crea sesión + refresh token. Pensado para login. */
+export async function createSessionWithRefresh(userId: string, meta: { userAgent?: string; ip?: string } = {}): Promise<SessionWithRefresh> {
+  await ensureHardenedSchema();
+  const sessionToken = await createSession(userId, meta.userAgent, meta.ip);
+  const refreshToken = crypto.randomBytes(48).toString("hex");
+  const refreshExpiresAt = new Date(Date.now() + REFRESH_TTL_DAYS * 24 * 60 * 60 * 1000);
+  await query(
+    `INSERT INTO refresh_tokens (id, user_id, session_id, expires_at, user_agent, ip_address)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [refreshToken, userId, sessionToken, refreshExpiresAt.toISOString(),
+     meta.userAgent || null, meta.ip || null]
+  );
+  return { sessionToken, refreshToken, refreshExpiresAt: refreshExpiresAt.toISOString() };
+}
+
+/** Rotación: marca el viejo como usado, crea uno nuevo. Si ya fue usado → es ataque, revocamos todo. */
+export async function rotateRefreshToken(oldRefresh: string, meta: { userAgent?: string; ip?: string } = {}): Promise<SessionWithRefresh | null> {
+  await ensureHardenedSchema();
+  const { rows } = await query<{
+    id: string; user_id: string; session_id: string | null;
+    expires_at: string; used_at: string | null; revoked_at: string | null;
+  }>(
+    `SELECT id, user_id, session_id, expires_at, used_at, revoked_at
+       FROM refresh_tokens WHERE id = $1`,
+    [oldRefresh]
+  );
+  const t = rows[0];
+  if (!t) return null;
+  if (t.revoked_at || new Date(t.expires_at).getTime() < Date.now()) return null;
+  if (t.used_at) {
+    // Reuso detectado → revocamos toda la familia de refresh tokens del usuario por seguridad.
+    logger.warn({ userId: t.user_id, oldRefresh: oldRefresh.slice(0, 8) }, "refresh token reuse detected, revoking all");
+    await query(`UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, [t.user_id]);
+    await query(`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, [t.user_id]);
+    await recordAuthEvent("REVOKE_ALL", t.user_id, { ip: meta.ip, userAgent: meta.userAgent, details: { reason: "refresh_reuse" } });
+    return null;
+  }
+  const fresh = await createSessionWithRefresh(t.user_id, meta);
+  await query(
+    `UPDATE refresh_tokens SET used_at = now(), replaced_by = $1 WHERE id = $2`,
+    [fresh.refreshToken, t.id]
+  );
+  await recordAuthEvent("REFRESH", t.user_id, { ip: meta.ip, userAgent: meta.userAgent });
+  return fresh;
+}
+
+/** Logout en TODOS los dispositivos del usuario. */
+export async function revokeAllSessions(userId: string, reason = "manual"): Promise<void> {
+  await ensureHardenedSchema();
+  await query(`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, [userId]);
+  await query(`UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, [userId]);
+  await recordAuthEvent("REVOKE_ALL", userId, { details: { reason } });
+}
+
+export interface SessionRow {
+  id: string;
+  userId: string;
+  userAgent: string | null;
+  ipAddress: string | null;
+  createdAt: string;
+  lastUsedAt: string | null;
+  expiresAt: string;
+  revokedAt: string | null;
+}
+
+/** Lista sesiones activas del usuario (para UI "tus dispositivos"). */
+export async function listUserSessions(userId: string): Promise<SessionRow[]> {
+  await ensureHardenedSchema();
+  const { rows } = await query<{
+    id: string; user_id: string; user_agent: string | null; ip_address: string | null;
+    created_at: string; last_used_at: string | null; expires_at: string; revoked_at: string | null;
+  }>(
+    `SELECT id, user_id, user_agent, ip_address, created_at, last_used_at, expires_at, revoked_at
+       FROM sessions WHERE user_id = $1 ORDER BY last_used_at DESC NULLS LAST, created_at DESC LIMIT 50`,
+    [userId]
+  );
+  return rows.map((r) => ({
+    id: r.id, userId: r.user_id, userAgent: r.user_agent, ipAddress: r.ip_address,
+    createdAt: r.created_at, lastUsedAt: r.last_used_at, expiresAt: r.expires_at,
+    revokedAt: r.revoked_at,
+  }));
+}
+
 export async function getUserBySession(sessionId: string): Promise<User | null> {
+  await ensureHardenedSchema();
   const { rows } = await query<User>(
     `SELECT u.id, u.email, u.name, u.role, u.active, u.created_at
        FROM sessions s
        JOIN users u ON u.id = s.user_id
-      WHERE s.id = $1 AND s.expires_at > now() AND u.active = true`,
+      WHERE s.id = $1
+        AND s.expires_at > now()
+        AND s.revoked_at IS NULL
+        AND u.active = true`,
     [sessionId]
   );
+  if (rows[0]) {
+    // touch last_used_at en background (no esperamos)
+    query(`UPDATE sessions SET last_used_at = now() WHERE id = $1`, [sessionId]).catch(() => null);
+  }
   return rows[0] ?? null;
 }
 
 export async function deleteSession(sessionId: string): Promise<void> {
-  await query(`DELETE FROM sessions WHERE id = $1`, [sessionId]);
+  // Soft-delete: marcar como revocada (auditable). El TTL hace el cleanup eventual.
+  await ensureHardenedSchema().catch(() => null);
+  await query(`UPDATE sessions SET revoked_at = now() WHERE id = $1`, [sessionId]).catch(async () => {
+    // Fallback si la columna no existe aún
+    await query(`DELETE FROM sessions WHERE id = $1`, [sessionId]);
+  });
+  // Revocar refresh tokens asociados
+  await query(`UPDATE refresh_tokens SET revoked_at = now() WHERE session_id = $1 AND revoked_at IS NULL`, [sessionId])
+    .catch(() => null);
 }
 
 export async function listUsers(): Promise<User[]> {

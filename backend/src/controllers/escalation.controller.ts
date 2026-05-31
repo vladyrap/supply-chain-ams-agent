@@ -1,6 +1,8 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { logger } from "../utils/logger";
 import * as svc from "../services/escalation.service";
+import { createJiraIssue, jiraStatus, type JiraPayload } from "../services/jira.service";
+import { createServiceNowIncident, serviceNowStatus, type ServiceNowPayload } from "../services/servicenow.service";
 
 // ============================================================
 // Snapshot
@@ -114,5 +116,95 @@ export async function postResetDemo(_req: FastifyRequest, reply: FastifyReply) {
   } catch (err) {
     logger.error({ err }, "escalation.reset fail");
     return reply.code(500).send({ success: false, error: "Error reseteando datos demo" });
+  }
+}
+
+// ============================================================
+// ITSM adapters status
+// ============================================================
+export async function getItsmStatus(_req: FastifyRequest, reply: FastifyReply) {
+  try {
+    return reply.send({
+      success: true,
+      jira: jiraStatus(),
+      serviceNow: serviceNowStatus(),
+    });
+  } catch (err) {
+    logger.error({ err }, "escalation.itsmStatus fail");
+    return reply.code(500).send({ success: false, error: "Error consultando estado ITSM" });
+  }
+}
+
+// ============================================================
+// Send to Jira (REAL if env vars present + confirmReal=true)
+// ============================================================
+export async function postSendJira(
+  req: FastifyRequest<{ Params: { id: string }; Body: { payload: JiraPayload; confirmReal?: boolean; by?: string } }>,
+  reply: FastifyReply
+) {
+  try {
+    const { payload, confirmReal, by } = req.body || ({} as { payload?: JiraPayload; confirmReal?: boolean; by?: string });
+    if (!payload) return reply.code(400).send({ success: false, error: "payload requerido" });
+
+    const result = await createJiraIssue(payload, { confirmReal });
+    // Actualizar el record con el ticket externo
+    const recPatch: Partial<svc.EscalationRecord> = {
+      status: "ESCALATED",
+      externalTicketId: result.ticketId,
+      externalTicketUrl: result.ticketUrl,
+      mode: result.mode as svc.ItsmMode,
+      payload: { channel: "JIRA", payload },
+    };
+    const cur = await svc.updateRecord(req.params.id, recPatch);
+    if (cur) {
+      // Append event
+      const event = {
+        type: "SENT_TO_JIRA",
+        at: new Date().toISOString(),
+        by: by || "system",
+        note: result.ok ? `Ticket ${result.mode}: ${result.ticketId}` : `Falla: ${result.error}`,
+      };
+      await svc.updateRecord(req.params.id, { events: [...(cur.events || []), event] });
+    }
+    return reply.send({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "escalation.sendJira fail");
+    return reply.code(500).send({ success: false, error: "Error enviando a Jira" });
+  }
+}
+
+// ============================================================
+// Send to ServiceNow
+// ============================================================
+export async function postSendServiceNow(
+  req: FastifyRequest<{ Params: { id: string }; Body: { payload: ServiceNowPayload; confirmReal?: boolean; by?: string } }>,
+  reply: FastifyReply
+) {
+  try {
+    const { payload, confirmReal, by } = req.body || ({} as { payload?: ServiceNowPayload; confirmReal?: boolean; by?: string });
+    if (!payload) return reply.code(400).send({ success: false, error: "payload requerido" });
+
+    const result = await createServiceNowIncident(payload, { confirmReal });
+    const recPatch: Partial<svc.EscalationRecord> = {
+      status: "ESCALATED",
+      externalTicketId: result.ticketId,
+      externalTicketUrl: result.ticketUrl,
+      mode: result.mode as svc.ItsmMode,
+      payload: { channel: "SERVICENOW", payload },
+    };
+    const cur = await svc.updateRecord(req.params.id, recPatch);
+    if (cur) {
+      const event = {
+        type: "SENT_TO_SERVICENOW",
+        at: new Date().toISOString(),
+        by: by || "system",
+        note: result.ok ? `Incident ${result.mode}: ${result.ticketId}` : `Falla: ${result.error}`,
+      };
+      await svc.updateRecord(req.params.id, { events: [...(cur.events || []), event] });
+    }
+    return reply.send({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "escalation.sendServiceNow fail");
+    return reply.code(500).send({ success: false, error: "Error enviando a ServiceNow" });
   }
 }

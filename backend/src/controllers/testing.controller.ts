@@ -1,6 +1,10 @@
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { logger } from "../utils/logger";
 import * as svc from "../services/testing.service";
+import {
+  exportTestCaseToCloudAlm, cloudAlmStatus, type CloudAlmTestCasePayload,
+} from "../services/cloud-alm.service";
+import { analyzeVideoEvidence } from "../services/testing-video-analysis.service";
 
 // ============================================================
 // Snapshot
@@ -188,5 +192,49 @@ export async function postResetDemo(_req: FastifyRequest, reply: FastifyReply) {
   } catch (err) {
     logger.error({ err }, "testing.resetDemo fail");
     return reply.code(500).send({ success: false, error: "Error reseteando datos demo" });
+  }
+}
+
+// ============================================================
+// Cloud ALM
+// ============================================================
+export async function getCloudAlmStatus(_req: FastifyRequest, reply: FastifyReply) {
+  try { return reply.send({ success: true, status: cloudAlmStatus() }); }
+  catch (err) { logger.error({ err }, "testing.cloudAlmStatus fail"); return reply.code(500).send({ success: false, error: "Error" }); }
+}
+
+export async function postCloudAlmExport(
+  req: FastifyRequest<{ Body: { payload: CloudAlmTestCasePayload; confirmReal?: boolean } }>,
+  reply: FastifyReply
+) {
+  try {
+    const { payload, confirmReal } = req.body || ({} as { payload?: CloudAlmTestCasePayload; confirmReal?: boolean });
+    if (!payload) return reply.code(400).send({ success: false, error: "payload requerido" });
+    const result = await exportTestCaseToCloudAlm(payload, { confirmReal });
+    return reply.send({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "testing.cloudAlmExport fail");
+    return reply.code(500).send({ success: false, error: "Error exportando a Cloud ALM" });
+  }
+}
+
+// ============================================================
+// Análisis IA de video (Whisper + Gemini)
+// POST /api/testing/evidences/:id/analyze
+// ============================================================
+export async function postAnalyzeVideo(
+  req: FastifyRequest<{ Params: { id: string }; Body?: { language?: string } }>,
+  reply: FastifyReply
+) {
+  try {
+    const language = req.body?.language || "es";
+    const result = await analyzeVideoEvidence(req.params.id, language);
+    return reply.send({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "testing.analyzeVideo fail");
+    return reply.code(500).send({
+      success: false,
+      error: err instanceof Error ? err.message : "Error analizando video",
+    });
   }
 }

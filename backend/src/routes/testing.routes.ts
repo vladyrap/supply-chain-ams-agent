@@ -30,4 +30,14 @@ export async function testingRoutes(app: FastifyInstance) {
   // Settings + reset demo
   app.patch<{ Body: Partial<TestingSettings> }>("/api/testing/settings", ctrl.updateSettings);
   app.post("/api/testing/reset-demo", ctrl.postResetDemo);
+
+  // Cloud ALM
+  app.get("/api/testing/cloud-alm/status", ctrl.getCloudAlmStatus);
+  app.post("/api/testing/cloud-alm/export", ctrl.postCloudAlmExport);
+
+  // Análisis IA de video (Whisper + Gemini)
+  app.post<{ Params: { id: string }; Body?: { language?: string } }>(
+    "/api/testing/evidences/:id/analyze",
+    ctrl.postAnalyzeVideo as never
+  );
 }

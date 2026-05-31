@@ -4,6 +4,11 @@ import {
   findUserByEmail,
   verifyPassword,
   createSession,
+  createSessionWithRefresh,
+  rotateRefreshToken,
+  revokeAllSessions,
+  listUserSessions,
+  recordAuthEvent,
   getUserBySession,
   deleteSession,
   listUsers,
@@ -13,6 +18,7 @@ import { logger } from "../utils/logger";
 import type { Role } from "../types/auth.types";
 
 const COOKIE_NAME = "ams_session";
+const REFRESH_COOKIE_NAME = "ams_refresh";
 const isProduction = process.env.NODE_ENV === "production";
 
 function setSessionCookie(reply: FastifyReply, token: string) {
@@ -24,8 +30,25 @@ function setSessionCookie(reply: FastifyReply, token: string) {
     maxAge: 30 * 24 * 60 * 60, // 30 días
   });
 }
+function setRefreshCookie(reply: FastifyReply, token: string) {
+  reply.setCookie(REFRESH_COOKIE_NAME, token, {
+    path: "/api/auth",       // sólo accesible a endpoints de auth (defensa en profundidad)
+    httpOnly: true,
+    sameSite: "lax",
+    secure: isProduction,
+    maxAge: 60 * 24 * 60 * 60, // 60 días
+  });
+}
 function clearSessionCookie(reply: FastifyReply) {
   reply.clearCookie(COOKIE_NAME, { path: "/" });
+  reply.clearCookie(REFRESH_COOKIE_NAME, { path: "/api/auth" });
+}
+
+function meta(req: FastifyRequest) {
+  return {
+    userAgent: req.headers["user-agent"] || undefined,
+    ip: (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip,
+  };
 }
 
 export async function postSignup(
@@ -55,8 +78,10 @@ export async function postSignup(
       name: b.name,
       role: safeRole,
     });
-    const token = await createSession(user.id, req.headers["user-agent"] || undefined);
-    setSessionCookie(reply, token);
+    const { sessionToken, refreshToken } = await createSessionWithRefresh(user.id, meta(req));
+    setSessionCookie(reply, sessionToken);
+    setRefreshCookie(reply, refreshToken);
+    await recordAuthEvent("SIGNUP", user.id, meta(req));
     return reply.send({ success: true, user });
   } catch (err) {
     logger.error({ err }, "Fallo en /api/auth/signup");
@@ -78,14 +103,18 @@ export async function postLogin(
   try {
     const user = await findUserByEmail(b.email);
     if (!user || !user.active) {
+      await recordAuthEvent("LOGIN_FAIL", user?.id || null, { ...meta(req), details: { reason: !user ? "no_user" : "inactive", email: b.email } });
       return reply.code(401).send({ success: false, error: "Credenciales inválidas" });
     }
     const ok = await verifyPassword(b.password, user.password_hash);
     if (!ok) {
+      await recordAuthEvent("LOGIN_FAIL", user.id, { ...meta(req), details: { reason: "bad_password" } });
       return reply.code(401).send({ success: false, error: "Credenciales inválidas" });
     }
-    const token = await createSession(user.id, req.headers["user-agent"] || undefined);
-    setSessionCookie(reply, token);
+    const { sessionToken, refreshToken } = await createSessionWithRefresh(user.id, meta(req));
+    setSessionCookie(reply, sessionToken);
+    setRefreshCookie(reply, refreshToken);
+    await recordAuthEvent("LOGIN_SUCCESS", user.id, meta(req));
     // No devolver password_hash
     const { password_hash: _ph, ...safe } = user;
     return reply.send({ success: true, user: safe });
@@ -97,7 +126,50 @@ export async function postLogin(
 
 export async function postLogout(req: FastifyRequest, reply: FastifyReply) {
   const token = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies?.[COOKIE_NAME];
-  if (token) await deleteSession(token);
+  let userId: string | null = null;
+  if (token) {
+    const u = await getUserBySession(token).catch(() => null);
+    userId = u?.id || null;
+    await deleteSession(token);
+  }
+  clearSessionCookie(reply);
+  if (userId) await recordAuthEvent("LOGOUT", userId, meta(req));
+  return reply.send({ success: true });
+}
+
+// POST /api/auth/refresh — rota el refresh token, emite session+refresh nuevos.
+export async function postRefresh(req: FastifyRequest, reply: FastifyReply) {
+  const refresh = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies?.[REFRESH_COOKIE_NAME];
+  if (!refresh) return reply.code(401).send({ success: false, error: "no_refresh_token" });
+  const result = await rotateRefreshToken(refresh, meta(req));
+  if (!result) {
+    clearSessionCookie(reply);
+    return reply.code(401).send({ success: false, error: "refresh_invalid" });
+  }
+  setSessionCookie(reply, result.sessionToken);
+  setRefreshCookie(reply, result.refreshToken);
+  return reply.send({ success: true, expiresAt: result.refreshExpiresAt });
+}
+
+// GET /api/auth/sessions — lista los dispositivos del usuario actual.
+export async function getSessions(req: FastifyRequest, reply: FastifyReply) {
+  const token = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies?.[COOKIE_NAME];
+  if (!token) return reply.code(401).send({ success: false, error: "no_session" });
+  const user = await getUserBySession(token);
+  if (!user) return reply.code(401).send({ success: false, error: "no_session" });
+  const sessions = await listUserSessions(user.id);
+  // Marcar cuál es la sesión actual
+  const annotated = sessions.map((s) => ({ ...s, current: s.id === token }));
+  return reply.send({ success: true, sessions: annotated });
+}
+
+// POST /api/auth/logout-all — revoca todas las sesiones del usuario actual.
+export async function postLogoutAll(req: FastifyRequest, reply: FastifyReply) {
+  const token = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies?.[COOKIE_NAME];
+  if (!token) return reply.code(401).send({ success: false, error: "no_session" });
+  const user = await getUserBySession(token);
+  if (!user) return reply.code(401).send({ success: false, error: "no_session" });
+  await revokeAllSessions(user.id, "user_initiated");
   clearSessionCookie(reply);
   return reply.send({ success: true });
 }

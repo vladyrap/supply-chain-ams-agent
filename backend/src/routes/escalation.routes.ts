@@ -26,4 +26,15 @@ export async function escalationRoutes(app: FastifyInstance) {
 
   // Reset demo
   app.post("/api/escalation/reset-demo", ctrl.postResetDemo);
+
+  // ITSM adapters (Jira / ServiceNow real)
+  app.get("/api/escalation/itsm/status", ctrl.getItsmStatus);
+  app.post<{ Params: { id: string }; Body: { payload: unknown; confirmReal?: boolean; by?: string } }>(
+    "/api/escalation/records/:id/send-jira",
+    ctrl.postSendJira as never
+  );
+  app.post<{ Params: { id: string }; Body: { payload: unknown; confirmReal?: boolean; by?: string } }>(
+    "/api/escalation/records/:id/send-servicenow",
+    ctrl.postSendServiceNow as never
+  );
 }

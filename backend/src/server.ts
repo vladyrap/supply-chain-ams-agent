@@ -1,5 +1,9 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import { initSentry, captureException } from "./utils/sentry";
+
+// Inicializa Sentry ANTES de Fastify (recomendado).
+initSentry();
 import cookie from "@fastify/cookie";
 import formbody from "@fastify/formbody";
 import multipart from "@fastify/multipart";
@@ -25,6 +29,7 @@ import { trainingRoutes } from "./routes/training.routes";
 import { escalationRoutes } from "./routes/escalation.routes";
 import { testingRoutes } from "./routes/testing.routes";
 import { amsModulesRoutes } from "./routes/ams-modules.routes";
+import { rbacRoutes } from "./routes/rbac.routes";
 import { registry, httpRequestsTotal, httpRequestDuration } from "./utils/metrics";
 
 export function buildServer() {
@@ -101,10 +106,15 @@ export function buildServer() {
   app.register(escalationRoutes);
   app.register(testingRoutes);
   app.register(amsModulesRoutes);
+  app.register(rbacRoutes);
 
-  app.setErrorHandler((err, _req, reply) => {
+  app.setErrorHandler((err, req, reply) => {
     logger.error({ err }, "Unhandled error");
     const status = (err as { statusCode?: number }).statusCode ?? 500;
+    // Sólo reportar a Sentry los 5xx (los 4xx son ruido).
+    if (status >= 500) {
+      captureException(err, { url: req.url, method: req.method });
+    }
     reply.code(status).send({
       success: false,
       error:
