@@ -1,6 +1,11 @@
 import { logger } from "../utils/logger";
+import {
+  autoEstimateTicketResolution,
+  type TicketEstimatedResolution, type SeverityLevel,
+  type EnvironmentLevel, type ComplexityLevel,
+} from "../utils/estimation";
 
-export type TicketSource = "jira" | "mock";
+export type TicketSource = "jira" | "mock" | "user";
 
 export interface Ticket {
   source: TicketSource;
@@ -11,9 +16,13 @@ export interface Ticket {
   priority: string;       // Highest / High / Medium / Low
   reporter: string | null;
   assignee: string | null;
+  sapModule?: string | null;
+  environment?: string | null;
   created: string;
   updated: string;
   url?: string;
+  /** Autoestimación generada al crear el ticket. */
+  estimatedResolution?: TicketEstimatedResolution | null;
 }
 
 interface JiraIssue {
@@ -143,13 +152,94 @@ const MOCK_TICKETS: Ticket[] = [
   },
 ];
 
+// ============================================================
+// Tickets creados desde la UI · persistencia in-memory (demo)
+// Se pierden al reiniciar el backend. Para persistencia real, migrar
+// a una tabla `tickets_demo` siguiendo el patrón de incidents.
+// ============================================================
+
+const USER_TICKETS: Ticket[] = [];
+let userTicketCounter = 200;
+
+function priorityToSeverity(priority: string): SeverityLevel {
+  const p = priority.toLowerCase();
+  if (p.includes("highest") || p.includes("critical")) return "CRITICAL";
+  if (p.includes("high")) return "HIGH";
+  if (p.includes("low")) return "LOW";
+  return "MEDIUM";
+}
+
+export interface CreateTicketInput {
+  title: string;
+  description: string;
+  priority?: string;          // Highest / High / Medium / Low
+  reporter?: string | null;
+  assignee?: string | null;
+  sapModule?: string | null;
+  environment?: string | null;
+  complexity?: ComplexityLevel;
+  requiresDevelopment?: boolean;
+  requiresIntegration?: boolean;
+  requiresUAT?: boolean;
+  requiresTransport?: boolean;
+}
+
+export function createUserTicket(input: CreateTicketInput): Ticket {
+  userTicketCounter += 1;
+  const key = `AMS-${userTicketCounter}`;
+  const now = new Date().toISOString();
+  const env = (input.environment || "NO_INFORMADO").toUpperCase() as EnvironmentLevel;
+  const ticket: Ticket = {
+    source: "user",
+    key,
+    title: input.title.trim(),
+    description: input.description.trim(),
+    status: "Open",
+    priority: input.priority || "Medium",
+    reporter: input.reporter ?? null,
+    assignee: input.assignee ?? null,
+    sapModule: input.sapModule ?? null,
+    environment: input.environment ?? null,
+    created: now,
+    updated: now,
+  };
+
+  // Autoestimación al crear
+  try {
+    ticket.estimatedResolution = autoEstimateTicketResolution({
+      ticketId: key,
+      origin: "manual_incident",
+      kind: "incident",
+      title: ticket.title,
+      description: ticket.description,
+      sapModule: input.sapModule || undefined,
+      environment: env,
+      severity: priorityToSeverity(ticket.priority),
+      isProductive: env === "PRD",
+      complexity: input.complexity,
+      requiresDevelopment: input.requiresDevelopment,
+      requiresIntegration: input.requiresIntegration,
+      requiresUAT: input.requiresUAT,
+      requiresTransport: input.requiresTransport,
+      hasErrorEvidence: ticket.description.length > 80, // heurística: descripción larga = más contexto
+    });
+  } catch (err) {
+    logger.warn({ err, key }, "auto-estimate failed for user ticket");
+  }
+
+  USER_TICKETS.unshift(ticket);
+  // Cap a 200 para no llenar memoria en demos largas
+  if (USER_TICKETS.length > 200) USER_TICKETS.length = 200;
+  return ticket;
+}
+
 export async function listTickets(): Promise<{ source: TicketSource; tickets: Ticket[] }> {
   const env = getJiraEnv();
   if (env) {
     const jiraTickets = await fetchFromJira();
-    if (jiraTickets.length > 0) return { source: "jira", tickets: jiraTickets };
+    if (jiraTickets.length > 0) return { source: "jira", tickets: [...USER_TICKETS, ...jiraTickets] };
   }
-  return { source: "mock", tickets: MOCK_TICKETS };
+  return { source: "mock", tickets: [...USER_TICKETS, ...MOCK_TICKETS] };
 }
 
 export async function getTicketByKey(key: string): Promise<Ticket | null> {
