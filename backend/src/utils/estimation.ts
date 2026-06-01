@@ -42,6 +42,7 @@ export interface TicketEstimateInput {
   description?: string;
   sapModule?: string;
   process?: string;
+  subProcess?: string;
   environment?: EnvironmentLevel;
   severity?: SeverityLevel;
   priority?: UrgencyLevel;
@@ -57,6 +58,17 @@ export interface TicketEstimateInput {
   hasErrorEvidence?: boolean;
   isProductive?: boolean;
   missingData?: string[];
+  /** Hints del análisis visual de imágenes (sin archivos). */
+  visualAnalysisHints?: {
+    detectedSapModule?: string;
+    detectedProcess?: string;
+    detectedSubProcess?: string;
+    detectedErrorCode?: string;
+    detectedTransaction?: string;
+    confidence?: string; // LOW/MEDIUM/HIGH
+    extraMissingData?: string[];
+    extraHints?: string[];
+  };
 }
 
 export interface TicketEstimatedResolution {
@@ -192,6 +204,15 @@ const uid = (pfx: string) => `${pfx}_${Math.random().toString(36).slice(2, 8)}${
 const nowIso = () => new Date().toISOString();
 
 export function autoEstimateTicketResolution(input: TicketEstimateInput): TicketEstimatedResolution {
+  // Aplicar hints del análisis visual ANTES de inferir
+  const visual = input.visualAnalysisHints;
+  if (visual) {
+    if (!input.sapModule && visual.detectedSapModule) input = { ...input, sapModule: visual.detectedSapModule };
+    if (!input.process && visual.detectedProcess) input = { ...input, process: visual.detectedProcess };
+    if (!input.subProcess && visual.detectedSubProcess) input = { ...input, subProcess: visual.detectedSubProcess };
+    if (visual.detectedErrorCode || visual.detectedTransaction) input = { ...input, hasErrorEvidence: true };
+  }
+
   const kind = input.kind ?? "incident";
   const severity = input.severity ?? "MEDIUM";
   const env = input.environment ?? "NO_INFORMADO";
@@ -255,6 +276,7 @@ export function autoEstimateTicketResolution(input: TicketEstimateInput): Ticket
   if (!input.environment || input.environment === "NO_INFORMADO") missingData.push("Ambiente objetivo.");
   if (input.hasErrorEvidence === false) missingData.push("Mensaje de error o evidencia.");
   if (input.complexity === "UNKNOWN")   missingData.push("Estimación de complejidad.");
+  if (visual?.extraMissingData) missingData.push(...visual.extraMissingData);
 
   let score = 100;
   if (missingData.length) score -= missingData.length * 10;
@@ -267,6 +289,9 @@ export function autoEstimateTicketResolution(input: TicketEstimateInput): Ticket
   if (input.isRepeatedIncident) score += 8;
   if (agentConf === "LOW") score -= 12;
   if (agentConf === "HIGH") score += 6;
+  const visualConf = String(visual?.confidence ?? "").toUpperCase();
+  if (visualConf === "HIGH") score += 10;
+  else if (visualConf === "MEDIUM") score += 4;
   if (score < 0) score = 0; if (score > 100) score = 100;
   let confidence: ConfidenceLevel = "MEDIUM";
   if (score >= 75) confidence = "HIGH";
@@ -281,6 +306,12 @@ export function autoEstimateTicketResolution(input: TicketEstimateInput): Ticket
     "Equipo cliente disponible para validar en ventana acordada.",
   ];
   if (input.hasKnownPlaybook) assumptions.push("Playbook AMS aplicable, reuso completo.");
+  if (visual?.detectedErrorCode) {
+    assumptions.push(`Análisis visual identificó código ${visual.detectedErrorCode}${
+      visual.detectedTransaction ? ` en transacción ${visual.detectedTransaction}` : ""
+    }.`);
+  }
+  if (visual?.extraHints) assumptions.push(...visual.extraHints.map((h) => `Hint visual: ${h}`));
 
   const risks: string[] = [];
   if (complexity === "VERY_HIGH" || complexity === "HIGH") risks.push("Complejidad alta: banda amplia.");

@@ -8,6 +8,32 @@ import {
 
 export type TicketSource = "jira" | "mock" | "user";
 
+/**
+ * Resumen textual de un análisis visual sobre una imagen.
+ * NO incluye archivo, blob ni base64 — solo metadata + extractedText.
+ */
+export interface VisualEvidenceNote {
+  id: string;
+  fileName: string;
+  fileType: string;
+  fileSize: number;
+  analysisSummary: string;
+  extractedText: string;
+  detectedTransaction?: string;
+  detectedErrorCode?: string;
+  detectedSapModule?: string;
+  detectedProcess?: string;
+  detectedSubProcess?: string;
+  detectedObjects?: Record<string, string | undefined>;
+  confidence: "LOW" | "MEDIUM" | "HIGH";
+  analysisMode: "AI_VISION" | "DEMO_SIMULATED" | "MANUAL_SUMMARY";
+  userComment: string;
+  consideredForEstimate: boolean;
+  estimationHints: string[];
+  missingData: string[];
+  createdAt: string;
+}
+
 export interface Ticket {
   source: TicketSource;
   key: string;            // Ej "AMS-123"
@@ -24,6 +50,8 @@ export interface Ticket {
   url?: string;
   /** Autoestimación generada al crear el ticket. */
   estimatedResolution?: TicketEstimatedResolution | null;
+  /** Resúmenes textuales del análisis visual de imágenes adjuntas (sin archivos). */
+  visualEvidenceNotes?: VisualEvidenceNote[] | null;
 }
 
 interface JiraIssue {
@@ -183,6 +211,8 @@ async function ensureTicketsDemoSchema(): Promise<void> {
       );
     `);
     await query(`CREATE INDEX IF NOT EXISTS idx_tickets_demo_created ON tickets_demo (created_at DESC);`);
+    // Migración aditiva: columna nueva visual_evidence_notes para tickets ya existentes.
+    await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS visual_evidence_notes JSONB;`);
     ticketsDemoSchemaReady = true;
     await seedMockTicketsIfMissing();
   } catch (err) {
@@ -289,6 +319,7 @@ interface TicketRow {
   sap_module: string | null;
   environment: string | null;
   estimated_resolution: TicketEstimatedResolution | null;
+  visual_evidence_notes: VisualEvidenceNote[] | null;
   created_at: string;
   updated_at: string;
 }
@@ -308,6 +339,7 @@ function rowToTicket(r: TicketRow): Ticket {
     created: r.created_at,
     updated: r.updated_at,
     estimatedResolution: r.estimated_resolution,
+    visualEvidenceNotes: r.visual_evidence_notes,
   };
 }
 
@@ -349,12 +381,43 @@ export interface CreateTicketInput {
   requiresIntegration?: boolean;
   requiresUAT?: boolean;
   requiresTransport?: boolean;
+  /** Notas del análisis visual (sin archivos) que mejoran la autoestimación. */
+  visualEvidenceNotes?: VisualEvidenceNote[];
+}
+
+/**
+ * Construye los hints visuales agregados desde TODAS las notas marcadas
+ * como `consideredForEstimate`. Si hay varias imágenes, el último gana
+ * para campos escalares (suficiente para demo).
+ */
+function aggregateVisualHints(notes: VisualEvidenceNote[] | undefined) {
+  if (!notes || notes.length === 0) return undefined;
+  const considered = notes.filter((n) => n.consideredForEstimate);
+  if (considered.length === 0) return undefined;
+  const last = considered[considered.length - 1];
+  const allHints = considered.flatMap((n) => n.estimationHints || []);
+  const allMissing = considered.flatMap((n) => n.missingData || []);
+  // Subir confianza si CUALQUIERA es HIGH
+  const confs = considered.map((n) => n.confidence);
+  const confidence = confs.includes("HIGH") ? "HIGH"
+                   : confs.includes("MEDIUM") ? "MEDIUM"
+                   : "LOW";
+  return {
+    detectedSapModule: last.detectedSapModule,
+    detectedProcess: last.detectedProcess,
+    detectedSubProcess: last.detectedSubProcess,
+    detectedErrorCode: last.detectedErrorCode,
+    detectedTransaction: last.detectedTransaction,
+    confidence,
+    extraMissingData: Array.from(new Set(allMissing)),
+    extraHints: Array.from(new Set(allHints)),
+  };
 }
 
 function buildEstimateForTicket(
   key: string,
   ticket: { title: string; description: string; priority: string; sapModule: string | null; environment: string | null },
-  input: Pick<CreateTicketInput, "complexity" | "requiresDevelopment" | "requiresIntegration" | "requiresUAT" | "requiresTransport">,
+  input: Pick<CreateTicketInput, "complexity" | "requiresDevelopment" | "requiresIntegration" | "requiresUAT" | "requiresTransport" | "visualEvidenceNotes">,
 ): TicketEstimatedResolution | null {
   try {
     const env = (ticket.environment || "NO_INFORMADO").toUpperCase() as EnvironmentLevel;
@@ -373,7 +436,8 @@ function buildEstimateForTicket(
       requiresIntegration: input.requiresIntegration,
       requiresUAT: input.requiresUAT,
       requiresTransport: input.requiresTransport,
-      hasErrorEvidence: ticket.description.length > 80,
+      hasErrorEvidence: ticket.description.length > 80 || (input.visualEvidenceNotes?.length ?? 0) > 0,
+      visualAnalysisHints: aggregateVisualHints(input.visualEvidenceNotes),
     });
   } catch (err) {
     logger.warn({ err, key }, "auto-estimate failed");
@@ -391,24 +455,27 @@ export async function createUserTicket(input: CreateTicketInput): Promise<Ticket
     sapModule: input.sapModule ?? null,
     environment: input.environment ?? null,
   };
+  const notes = (input.visualEvidenceNotes ?? []).slice(0, 4); // sanity cap
   const estimate = buildEstimateForTicket(key, ticketShape, {
     complexity: input.complexity,
     requiresDevelopment: input.requiresDevelopment,
     requiresIntegration: input.requiresIntegration,
     requiresUAT: input.requiresUAT,
     requiresTransport: input.requiresTransport,
+    visualEvidenceNotes: notes,
   });
 
   const { rows } = await query<TicketRow>(
     `INSERT INTO tickets_demo
        (key, title, description, status, priority, reporter, assignee,
-        sap_module, environment, estimated_resolution)
-     VALUES ($1,$2,$3,'Open',$4,$5,$6,$7,$8,$9::jsonb)
+        sap_module, environment, estimated_resolution, visual_evidence_notes)
+     VALUES ($1,$2,$3,'Open',$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)
      RETURNING *`,
     [key, ticketShape.title, ticketShape.description, ticketShape.priority,
      input.reporter ?? null, input.assignee ?? null,
      ticketShape.sapModule, ticketShape.environment,
-     estimate ? JSON.stringify(estimate) : null]
+     estimate ? JSON.stringify(estimate) : null,
+     notes.length > 0 ? JSON.stringify(notes) : null]
   );
   return rowToTicket(rows[0]!);
 }
