@@ -570,6 +570,94 @@ async function persistEstimate(key: string, est: TicketEstimatedResolution): Pro
   return rows[0] ? rowToTicket(rows[0]) : null;
 }
 
+/**
+ * Cierra un ticket capturando las horas reales y computando la desviación.
+ *
+ * Side effects:
+ * 1. Mueve `status` a "Done".
+ * 2. Enriquece `estimated_resolution` con actualHours, varianceHours,
+ *    variancePct, withinBand, closedAt, closedBy.
+ *
+ * Esta data alimenta el tile "Desviación promedio" del dashboard y el cron de
+ * re-calibración del motor (cuando exista). Sin estas horas, el motor queda
+ * en BOOTSTRAP para siempre.
+ *
+ * Si el ticket no tiene `estimated_resolution`, igual se cierra pero no aporta
+ * a la calibración (no hay contra qué comparar).
+ */
+export interface CloseTicketInput {
+  actualHours: number;
+  closedBy: string;
+  closeNote?: string;
+}
+
+export async function closeTicketWithActualHours(
+  key: string,
+  input: CloseTicketInput,
+): Promise<Ticket | null> {
+  const ticket = await ensureTicketMirror(key);
+  if (!ticket) return null;
+
+  const actualHours = Math.max(0, Number(input.actualHours) || 0);
+  const closedAt = new Date().toISOString();
+  const actualBusinessDays = +(actualHours / 8).toFixed(2);
+
+  // Enriquecer estimación con horas reales (si había estimación)
+  let nextEstimate: TicketEstimatedResolution | null = ticket.estimatedResolution ?? null;
+  if (nextEstimate) {
+    const mid = (nextEstimate.totalMinHours + nextEstimate.totalMaxHours) / 2;
+    const varianceHours = +(actualHours - mid).toFixed(2);
+    const variancePct = mid > 0 ? +(((actualHours - mid) / mid) * 100).toFixed(1) : 0;
+    const withinBand = actualHours >= nextEstimate.totalMinHours && actualHours <= nextEstimate.totalMaxHours;
+    nextEstimate = {
+      ...nextEstimate,
+      actualHours,
+      actualBusinessDays,
+      closedAt,
+      closedBy: input.closedBy,
+      varianceHours,
+      variancePct,
+      withinBand,
+    } as TicketEstimatedResolution & {
+      actualHours?: number;
+      actualBusinessDays?: number;
+      closedAt?: string;
+      closedBy?: string;
+      varianceHours?: number;
+      variancePct?: number;
+      withinBand?: boolean;
+    };
+    logger.info(
+      { key, actualHours, varianceHours, variancePct, withinBand },
+      "ticket closed con horas reales — variance computada",
+    );
+  } else {
+    logger.warn({ key, actualHours }, "ticket cerrado sin estimación previa — no hay calibración");
+  }
+
+  // Update DB: status + estimated_resolution
+  const { rows } = await query<TicketRow>(
+    `UPDATE tickets_demo
+       SET status = 'Done',
+           estimated_resolution = $1::jsonb,
+           updated_at = now()
+     WHERE key = $2
+     RETURNING *`,
+    [
+      nextEstimate ? JSON.stringify(nextEstimate) : null,
+      key,
+    ],
+  );
+
+  // Si el ticket original era de Jira, también podríamos cerrarlo allá. Hoy
+  // solo cerramos espejo local. Mirror a Jira queda como TODO si se necesita.
+  if (input.closeNote) {
+    logger.info({ key, closeNote: input.closeNote }, "ticket close note");
+  }
+
+  return rows[0] ? rowToTicket(rows[0]) : null;
+}
+
 export async function listTickets(): Promise<{ source: TicketSource; tickets: Ticket[] }> {
   // userTickets incluye TODO lo persistido: mocks seedeados (AMS-101..105) +
   // tickets creados desde la UI (AMS-201++) + cualquier espejo de Jira que

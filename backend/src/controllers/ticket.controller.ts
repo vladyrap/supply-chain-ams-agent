@@ -2,7 +2,8 @@ import type { FastifyRequest, FastifyReply } from "fastify";
 import {
   listTickets, getTicketByKey, getTicketProviderStatus,
   createUserTicket, recalculateUserTicket, applyManualEstimatePatch,
-  type CreateTicketInput, type ManualEstimatePatch,
+  closeTicketWithActualHours,
+  type CreateTicketInput, type ManualEstimatePatch, type CloseTicketInput,
 } from "../services/ticket.service";
 import { chatWithAgent } from "../services/claude.service";
 import { logger } from "../utils/logger";
@@ -131,5 +132,36 @@ export async function postClassifyTicket(
   } catch (err) {
     logger.error({ err }, "ticket classify fail");
     return reply.code(500).send({ success: false, error: "Error clasificando ticket" });
+  }
+}
+
+/**
+ * Cierra un ticket capturando las horas reales. Computa desviación contra la
+ * estimación y persiste todo en el jsonb del ticket. Crítico para que el motor
+ * pueda aprender — sin estas horas, queda en BOOTSTRAP para siempre.
+ */
+export async function postCloseTicket(
+  req: FastifyRequest<{ Params: { key: string }; Body: CloseTicketInput }>,
+  reply: FastifyReply,
+) {
+  try {
+    const body = req.body || ({} as CloseTicketInput);
+    const actualHours = Number(body.actualHours);
+    if (!Number.isFinite(actualHours) || actualHours < 0) {
+      return reply.code(400).send({ success: false, error: "actualHours debe ser un número >= 0" });
+    }
+    if (!body.closedBy || !body.closedBy.trim()) {
+      return reply.code(400).send({ success: false, error: "closedBy requerido" });
+    }
+    const ticket = await closeTicketWithActualHours(req.params.key, {
+      actualHours,
+      closedBy: body.closedBy.trim(),
+      closeNote: body.closeNote?.trim() || undefined,
+    });
+    if (!ticket) return reply.code(404).send({ success: false, error: "ticket no encontrado" });
+    return reply.send({ success: true, ticket });
+  } catch (err) {
+    logger.error({ err }, "ticket close fail");
+    return reply.code(500).send({ success: false, error: "Error cerrando ticket" });
   }
 }
