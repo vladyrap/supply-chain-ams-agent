@@ -2,9 +2,10 @@ import type { FastifyRequest, FastifyReply } from "fastify";
 import {
   listTickets, getTicketByKey, getTicketProviderStatus,
   createUserTicket, recalculateUserTicket, applyManualEstimatePatch,
-  closeTicketWithActualHours,
+  closeTicketWithActualHours, replaceTicketEstimate,
   type CreateTicketInput, type ManualEstimatePatch, type CloseTicketInput,
 } from "../services/ticket.service";
+import type { TicketEstimatedResolution } from "../utils/estimation";
 import { chatWithAgent } from "../services/claude.service";
 import { logger } from "../utils/logger";
 
@@ -132,6 +133,42 @@ export async function postClassifyTicket(
   } catch (err) {
     logger.error({ err }, "ticket classify fail");
     return reply.code(500).send({ success: false, error: "Error clasificando ticket" });
+  }
+}
+
+/**
+ * Reemplaza la estimación completa de un ticket — usado por el motor contextual
+ * cuando el consultor decide "aplicar al ticket" su resultado v2.
+ *
+ * Diferencia con patchManualEstimate: acá reemplaza TODO el objeto
+ * estimated_resolution (phases, assumptions, missingData, appliedRules, etc.).
+ * El patch solo modifica campos sueltos.
+ */
+export async function postReplaceEstimate(
+  req: FastifyRequest<{
+    Params: { key: string };
+    Body: { estimate: TicketEstimatedResolution; actor: string; reason?: string };
+  }>,
+  reply: FastifyReply,
+) {
+  try {
+    const body = req.body || ({} as { estimate: TicketEstimatedResolution; actor: string });
+    if (!body.estimate || typeof body.estimate !== "object") {
+      return reply.code(400).send({ success: false, error: "estimate (TicketEstimatedResolution) requerido" });
+    }
+    if (!body.actor || !body.actor.trim()) {
+      return reply.code(400).send({ success: false, error: "actor requerido" });
+    }
+    // Validación básica del shape antes de persistir
+    if (typeof body.estimate.totalMinHours !== "number" || typeof body.estimate.totalMaxHours !== "number") {
+      return reply.code(400).send({ success: false, error: "totalMinHours y totalMaxHours requeridos" });
+    }
+    const ticket = await replaceTicketEstimate(req.params.key, body.estimate);
+    if (!ticket) return reply.code(404).send({ success: false, error: "ticket no encontrado" });
+    return reply.send({ success: true, ticket });
+  } catch (err) {
+    logger.error({ err }, "ticket replace estimate fail");
+    return reply.code(500).send({ success: false, error: "Error reemplazando estimación" });
   }
 }
 

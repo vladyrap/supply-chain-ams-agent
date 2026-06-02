@@ -7,9 +7,11 @@ import {
   postRecalculateEstimate,
   patchManualEstimate,
   postCloseTicket,
+  postReplaceEstimate,
   getProviderStatus,
 } from "../controllers/ticket.controller";
 import type { CreateTicketInput, ManualEstimatePatch, CloseTicketInput } from "../services/ticket.service";
+import type { TicketEstimatedResolution } from "../utils/estimation";
 
 export async function ticketRoutes(app: FastifyInstance) {
   app.get("/api/tickets", getTickets);
@@ -23,4 +25,6 @@ export async function ticketRoutes(app: FastifyInstance) {
     "/api/tickets/:key/estimate", patchManualEstimate);
   app.post<{ Params: { key: string }; Body: CloseTicketInput }>(
     "/api/tickets/:key/close", postCloseTicket);
+  app.post<{ Params: { key: string }; Body: { estimate: TicketEstimatedResolution; actor: string; reason?: string } }>(
+    "/api/tickets/:key/estimate/full", postReplaceEstimate);
 }

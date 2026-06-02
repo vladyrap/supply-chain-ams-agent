@@ -571,6 +571,23 @@ async function persistEstimate(key: string, est: TicketEstimatedResolution): Pro
 }
 
 /**
+ * Reemplaza la estimación entera de un ticket con una nueva (usado cuando se
+ * aplica el resultado del motor contextual al ticket). Diferencia con
+ * applyManualEstimatePatch: acá sobreescribimos TODO el objeto, no solo
+ * 4 campos. Preserva metadatos del nuevo objeto pasado.
+ */
+export async function replaceTicketEstimate(
+  key: string,
+  newEstimate: TicketEstimatedResolution,
+): Promise<Ticket | null> {
+  const ticket = await ensureTicketMirror(key);
+  if (!ticket) return null;
+  // newEstimate viene del cliente — asegurar que ticketId coincida.
+  const safe: TicketEstimatedResolution = { ...newEstimate, ticketId: ticket.key };
+  return persistEstimate(key, safe);
+}
+
+/**
  * Cierra un ticket capturando las horas reales y computando la desviación.
  *
  * Side effects:
