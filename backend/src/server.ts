@@ -28,6 +28,7 @@ import { voiceRoutes } from "./routes/voice.routes";
 import { agentLabRoutes } from "./routes/agent-lab.routes";
 import { trainingRoutes } from "./routes/training.routes";
 import { escalationRoutes } from "./routes/escalation.routes";
+import { customerResponseRoutes } from "./routes/customer-response.routes";
 import { testingRoutes } from "./routes/testing.routes";
 import { amsModulesRoutes } from "./routes/ams-modules.routes";
 import { rbacRoutes } from "./routes/rbac.routes";
@@ -109,6 +110,7 @@ export function buildServer() {
   app.register(amsModulesRoutes);
   app.register(rbacRoutes);
   app.register(scopeItemsRoutes);
+  app.register(customerResponseRoutes);
 
   app.setErrorHandler((err, req, reply) => {
     logger.error({ err }, "Unhandled error");
