@@ -1,0 +1,80 @@
+name: ams-dev
+
+# =============================================================================
+# AMS Agent stack — ambiente DEV (puerto host 6601 backend)
+# =============================================================================
+# Levantar: docker compose -f docker-compose.dev.yml --env-file .env.dev up -d
+# Logs:     docker compose -f docker-compose.dev.yml logs -f
+
+services:
+  db-dev:
+    image: pgvector/pgvector:pg16
+    container_name: ams-db-dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ams-db-dev-data:/var/lib/postgresql/data
+    networks:
+      - ams-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-dev:
+    image: redis:7-alpine
+    container_name: ams-redis-dev
+    restart: unless-stopped
+    volumes:
+      - ams-redis-dev-data:/data
+    networks:
+      - ams-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backend-dev:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ams-backend-dev
+    restart: unless-stopped
+    depends_on:
+      db-dev:
+        condition: service_healthy
+      redis-dev:
+        condition: service_healthy
+    ports:
+      - "6601:8000"
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db-dev:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis-dev:6379/0
+      RAG_ENABLED: ${RAG_ENABLED:-true}
+      RAG_TOP_K: ${RAG_TOP_K:-6}
+      RAG_MIN_SCORE: ${RAG_MIN_SCORE:-0.55}
+      GEMINI_EMBEDDING_MODEL: ${GEMINI_EMBEDDING_MODEL:-gemini-embedding-001}
+      GEMINI_EMBEDDING_DIM: ${GEMINI_EMBEDDING_DIM:-768}
+      AMS_BOOTSTRAP_ADMIN_EMAIL: ${AMS_BOOTSTRAP_ADMIN_EMAIL}
+      AMS_BOOTSTRAP_ADMIN_PASSWORD: ${AMS_BOOTSTRAP_ADMIN_PASSWORD}
+      FORCE_MOCK_LLM: ${FORCE_MOCK_LLM:-}
+    networks:
+      - ams-network
+
+networks:
+  ams-network:
+    name: ams-network
+    driver: bridge
+
+volumes:
+  ams-db-dev-data:
+  ams-redis-dev-data:

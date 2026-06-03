@@ -1,0 +1,89 @@
+name: ams-prod
+
+# =============================================================================
+# AMS Agent stack — ambiente PROD (puerto host 6901 backend)
+# =============================================================================
+# Diferencias vs DEV/QAS:
+#   - log level warn (menos verbose)
+#   - restart: always (vs unless-stopped)
+#   - healthcheck más estricto en backend
+#   - sin override de RAG defaults
+
+services:
+  db-prod:
+    image: pgvector/pgvector:pg16
+    container_name: ams-db-prod
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ams-db-prod-data:/var/lib/postgresql/data
+    networks:
+      - ams-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-prod:
+    image: redis:7-alpine
+    container_name: ams-redis-prod
+    restart: always
+    volumes:
+      - ams-redis-prod-data:/data
+    networks:
+      - ams-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backend-prod:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ams-backend-prod
+    restart: always
+    depends_on:
+      db-prod:
+        condition: service_healthy
+      redis-prod:
+        condition: service_healthy
+    ports:
+      - "6901:8000"
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-warn}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db-prod:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis-prod:6379/0
+      RAG_ENABLED: ${RAG_ENABLED:-true}
+      RAG_TOP_K: ${RAG_TOP_K:-6}
+      RAG_MIN_SCORE: ${RAG_MIN_SCORE:-0.55}
+      GEMINI_EMBEDDING_MODEL: ${GEMINI_EMBEDDING_MODEL:-gemini-embedding-001}
+      GEMINI_EMBEDDING_DIM: ${GEMINI_EMBEDDING_DIM:-768}
+      AMS_BOOTSTRAP_ADMIN_EMAIL: ${AMS_BOOTSTRAP_ADMIN_EMAIL}
+      AMS_BOOTSTRAP_ADMIN_PASSWORD: ${AMS_BOOTSTRAP_ADMIN_PASSWORD}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    networks:
+      - ams-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+networks:
+  ams-network:
+    name: ams-network
+    external: true
+
+volumes:
+  ams-db-prod-data:
+  ams-redis-prod-data:

@@ -1,0 +1,77 @@
+name: ams-qas
+
+# =============================================================================
+# AMS Agent stack — ambiente QAS (puerto host 6801 backend)
+# =============================================================================
+
+services:
+  db-qas:
+    image: pgvector/pgvector:pg16
+    container_name: ams-db-qas
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ams-db-qas-data:/var/lib/postgresql/data
+    networks:
+      - ams-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-qas:
+    image: redis:7-alpine
+    container_name: ams-redis-qas
+    restart: unless-stopped
+    volumes:
+      - ams-redis-qas-data:/data
+    networks:
+      - ams-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backend-qas:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ams-backend-qas
+    restart: unless-stopped
+    depends_on:
+      db-qas:
+        condition: service_healthy
+      redis-qas:
+        condition: service_healthy
+    ports:
+      - "6801:8000"
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db-qas:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis-qas:6379/0
+      RAG_ENABLED: ${RAG_ENABLED:-true}
+      RAG_TOP_K: ${RAG_TOP_K:-6}
+      RAG_MIN_SCORE: ${RAG_MIN_SCORE:-0.55}
+      GEMINI_EMBEDDING_MODEL: ${GEMINI_EMBEDDING_MODEL:-gemini-embedding-001}
+      GEMINI_EMBEDDING_DIM: ${GEMINI_EMBEDDING_DIM:-768}
+      AMS_BOOTSTRAP_ADMIN_EMAIL: ${AMS_BOOTSTRAP_ADMIN_EMAIL}
+      AMS_BOOTSTRAP_ADMIN_PASSWORD: ${AMS_BOOTSTRAP_ADMIN_PASSWORD}
+    networks:
+      - ams-network
+
+networks:
+  ams-network:
+    name: ams-network
+    external: true   # creado por docker-compose.dev.yml o crear manualmente
+
+volumes:
+  ams-db-qas-data:
+  ams-redis-qas-data:
