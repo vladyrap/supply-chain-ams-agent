@@ -78,4 +78,7 @@ export type AuditAction =
   | "CLAUDE_REQUEST_SENT"
   | "CLAUDE_RESPONSE_RECEIVED"
   | "INCIDENT_SAVED"
-  | "ERROR";
+  | "ERROR"
+  // RBAC / seguridad — agregado en DH v0.9
+  | "UNAUTHORIZED_API_ACCESS_ATTEMPT"
+  | "UNAUTHORIZED_ROUTE_ACCESS_ATTEMPT";

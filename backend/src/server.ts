@@ -32,6 +32,8 @@ import { customerResponseRoutes } from "./routes/customer-response.routes";
 import { testingRoutes } from "./routes/testing.routes";
 import { amsModulesRoutes } from "./routes/ams-modules.routes";
 import { rbacRoutes } from "./routes/rbac.routes";
+// DH v0.9 — Audit Trail backend rico
+import { auditEventsRoutes } from "./routes/audit-events.routes";
 import { registry, httpRequestsTotal, httpRequestDuration } from "./utils/metrics";
 
 export function buildServer() {
@@ -109,6 +111,8 @@ export function buildServer() {
   app.register(testingRoutes);
   app.register(amsModulesRoutes);
   app.register(rbacRoutes);
+  // DH v0.9 — nuevo audit_events backend
+  app.register(auditEventsRoutes);
   app.register(scopeItemsRoutes);
   app.register(customerResponseRoutes);
 

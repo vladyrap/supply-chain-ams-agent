@@ -8,7 +8,12 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:smoke": "tsx scripts/smoke-health.ts && tsx scripts/smoke-rbac.ts && tsx scripts/smoke-audit.ts && tsx scripts/smoke-tickets.ts",
+    "test:smoke:health": "tsx scripts/smoke-health.ts",
+    "test:smoke:rbac": "tsx scripts/smoke-rbac.ts",
+    "test:smoke:audit": "tsx scripts/smoke-audit.ts",
+    "test:smoke:tickets": "tsx scripts/smoke-tickets.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^9.4.0",
