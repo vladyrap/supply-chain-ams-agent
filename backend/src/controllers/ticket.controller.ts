@@ -3,7 +3,9 @@ import {
   listTickets, getTicketByKey, getTicketProviderStatus,
   createUserTicket, recalculateUserTicket, applyManualEstimatePatch,
   closeTicketWithActualHours, replaceTicketEstimate,
+  upsertTicketIntelligence, getTicketIntelligence,
   type CreateTicketInput, type ManualEstimatePatch, type CloseTicketInput,
+  type TicketIntelligence,
 } from "../services/ticket.service";
 import type { TicketEstimatedResolution } from "../utils/estimation";
 import { chatWithAgent } from "../services/claude.service";
@@ -200,5 +202,58 @@ export async function postCloseTicket(
   } catch (err) {
     logger.error({ err }, "ticket close fail");
     return reply.code(500).send({ success: false, error: "Error cerrando ticket" });
+  }
+}
+
+// =============================================================================
+// AIE v0.10 — Auto Intelligence Enrichment endpoints
+// =============================================================================
+
+/**
+ * PUT /api/tickets/:key/intelligence
+ * Body: { intelligence: TicketIntelligence }
+ *
+ * Persiste el resultado del enrichment pipeline (ejecutado en frontend).
+ * Idempotente: si el server ya tiene intelligence con mismo inputHash y
+ * status=enriched, devuelve `conflict: true` (cliente debe ignorar).
+ */
+export async function putTicketIntelligence(
+  req: FastifyRequest<{ Params: { key: string }; Body: { intelligence: TicketIntelligence } }>,
+  reply: FastifyReply
+) {
+  try {
+    const body = req.body;
+    if (!body?.intelligence || !body.intelligence.status) {
+      return reply.code(400).send({ success: false, error: "intelligence.status es requerido" });
+    }
+    const result = await upsertTicketIntelligence(req.params.key, { intelligence: body.intelligence });
+    if (!result.ticket) {
+      return reply.code(404).send({ success: false, error: "ticket no encontrado" });
+    }
+    return reply.send({
+      success: true,
+      ticket: result.ticket,
+      conflict: result.conflict ?? null,
+    });
+  } catch (err) {
+    logger.error({ err }, "putTicketIntelligence fail");
+    return reply.code(500).send({ success: false, error: "Error persistiendo intelligence" });
+  }
+}
+
+/**
+ * GET /api/tickets/:key/intelligence
+ * Devuelve solo el intelligence del ticket (lighter que GET /tickets/:key).
+ */
+export async function getTicketIntelligenceHandler(
+  req: FastifyRequest<{ Params: { key: string } }>,
+  reply: FastifyReply
+) {
+  try {
+    const intel = await getTicketIntelligence(req.params.key);
+    return reply.send({ success: true, intelligence: intel });
+  } catch (err) {
+    logger.error({ err }, "getTicketIntelligence fail");
+    return reply.code(500).send({ success: false, error: "Error leyendo intelligence" });
   }
 }

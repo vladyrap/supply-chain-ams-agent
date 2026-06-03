@@ -9,8 +9,12 @@ import {
   postCloseTicket,
   postReplaceEstimate,
   getProviderStatus,
+  putTicketIntelligence,
+  getTicketIntelligenceHandler,
 } from "../controllers/ticket.controller";
-import type { CreateTicketInput, ManualEstimatePatch, CloseTicketInput } from "../services/ticket.service";
+import type {
+  CreateTicketInput, ManualEstimatePatch, CloseTicketInput, TicketIntelligence,
+} from "../services/ticket.service";
 import type { TicketEstimatedResolution } from "../utils/estimation";
 // DH v0.9 — RBAC backend enforcement
 import { requirePermission } from "../middleware/requirePermission";
@@ -60,4 +64,16 @@ export async function ticketRoutes(app: FastifyInstance) {
     "/api/tickets/:key/estimate/full",
     { preHandler: requirePermission("time_estimator", "edit") },
     postReplaceEstimate);
+
+  // AIE v0.10 — Auto Intelligence Enrichment
+  // PUT intelligence (persistir resultado del pipeline frontend)
+  app.put<{ Params: { key: string }; Body: { intelligence: TicketIntelligence } }>(
+    "/api/tickets/:key/intelligence",
+    { preHandler: requirePermission("ticket_command_center", "edit") },
+    putTicketIntelligence);
+  // GET intelligence (lighter que GET /tickets/:key — útil para badge en lista)
+  app.get<{ Params: { key: string } }>(
+    "/api/tickets/:key/intelligence",
+    { preHandler: requirePermission("ticket_command_center", "view") },
+    getTicketIntelligenceHandler);
 }

@@ -34,6 +34,39 @@ export interface VisualEvidenceNote {
   createdAt: string;
 }
 
+/** Estados de enriquecimiento automático del ticket (AIE v0.10). */
+export type IntelligenceStatus =
+  | "pending_enrichment"
+  | "enriching"
+  | "enriched"
+  | "enrichment_failed"
+  | "enrichment_skipped";
+
+/**
+ * Resultado del Auto Intelligence Enrichment Pipeline (AIE v0.10).
+ * JSON estructurado producido por el frontend (Intelligence Core +
+ * N1 Package builder) y persistido en el backend para cache + multi-device.
+ *
+ * El backend NO ejecuta el pipeline — solo persiste lo que el frontend
+ * computa con sus engines determinísticos. Convivencia con el endpoint
+ * legacy /classify que sí llama Gemini.
+ */
+export interface TicketIntelligence {
+  status: IntelligenceStatus;
+  enrichedAt?: string;
+  enrichedBy?: string;
+  /** Hash del input usado para idempotencia (cambia → reanalizar). */
+  inputHash?: string;
+  /** Output de analyzeTicket() del Intelligence Core. JSON opaco. */
+  analysis?: Record<string, unknown>;
+  /** Output de buildN1Package(). JSON opaco. */
+  n1Package?: Record<string, unknown>;
+  /** Clasificación opcional de Gemini (texto). */
+  agentClassification?: { response: string; model: string; confidence: string };
+  /** Error si status=enrichment_failed. */
+  error?: string;
+}
+
 export interface Ticket {
   source: TicketSource;
   key: string;            // Ej "AMS-123"
@@ -52,6 +85,8 @@ export interface Ticket {
   estimatedResolution?: TicketEstimatedResolution | null;
   /** Resúmenes textuales del análisis visual de imágenes adjuntas (sin archivos). */
   visualEvidenceNotes?: VisualEvidenceNote[] | null;
+  /** Enriquecimiento automático (AIE v0.10). */
+  intelligence?: TicketIntelligence | null;
 }
 
 interface JiraIssue {
@@ -213,6 +248,12 @@ async function ensureTicketsDemoSchema(): Promise<void> {
     await query(`CREATE INDEX IF NOT EXISTS idx_tickets_demo_created ON tickets_demo (created_at DESC);`);
     // Migración aditiva: columna nueva visual_evidence_notes para tickets ya existentes.
     await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS visual_evidence_notes JSONB;`);
+    // AIE v0.10 — Auto Intelligence Enrichment columns
+    await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence JSONB;`);
+    await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence_status TEXT NOT NULL DEFAULT 'pending_enrichment';`);
+    await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence_input_hash TEXT;`);
+    await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence_updated_at TIMESTAMPTZ;`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_tickets_intel_status ON tickets_demo (intelligence_status);`);
     ticketsDemoSchemaReady = true;
     await seedMockTicketsIfMissing();
   } catch (err) {
@@ -322,9 +363,26 @@ interface TicketRow {
   visual_evidence_notes: VisualEvidenceNote[] | null;
   created_at: string;
   updated_at: string;
+  // AIE v0.10
+  intelligence?: TicketIntelligence | null;
+  intelligence_status?: IntelligenceStatus | null;
+  intelligence_input_hash?: string | null;
+  intelligence_updated_at?: string | null;
 }
 
 function rowToTicket(r: TicketRow): Ticket {
+  // Reconstruir intelligence: si r.intelligence existe, usar; si no, usar status
+  let intel: TicketIntelligence | null = null;
+  if (r.intelligence) {
+    intel = {
+      ...r.intelligence,
+      status: r.intelligence_status ?? r.intelligence.status ?? "pending_enrichment",
+      inputHash: r.intelligence_input_hash ?? r.intelligence.inputHash,
+      enrichedAt: r.intelligence_updated_at ?? r.intelligence.enrichedAt,
+    };
+  } else if (r.intelligence_status) {
+    intel = { status: r.intelligence_status };
+  }
   return {
     source: "user",
     key: r.key,
@@ -340,7 +398,109 @@ function rowToTicket(r: TicketRow): Ticket {
     updated: r.updated_at,
     estimatedResolution: r.estimated_resolution,
     visualEvidenceNotes: r.visual_evidence_notes,
+    intelligence: intel,
   };
+}
+
+// =============================================================================
+// AIE v0.10 — Persistencia del enriquecimiento
+// =============================================================================
+
+export interface UpsertIntelligenceInput {
+  intelligence: TicketIntelligence;
+}
+
+export interface UpsertIntelligenceResult {
+  ticket: Ticket | null;
+  conflict?: { reason: string; serverHash: string };
+}
+
+/**
+ * Upsert del intelligence de un ticket. Idempotente: si serverHash == inputHash
+ * y ambos están en status=enriched, devuelve conflict (el cliente debe ignorar).
+ *
+ * Nunca falla si la tabla no existe — devuelve null y deja seguir.
+ */
+export async function upsertTicketIntelligence(
+  key: string, input: UpsertIntelligenceInput,
+): Promise<UpsertIntelligenceResult> {
+  await ensureTicketsDemoSchema();
+  const intel = input.intelligence;
+  if (!intel) return { ticket: null };
+
+  // Check conflict: si server ya tiene mismo hash enriched, skip
+  try {
+    const { rows: existing } = await query<{
+      intelligence_status: IntelligenceStatus | null;
+      intelligence_input_hash: string | null;
+    }>(
+      `SELECT intelligence_status, intelligence_input_hash
+         FROM tickets_demo WHERE key = $1`,
+      [key]
+    );
+    const cur = existing[0];
+    if (cur && cur.intelligence_status === "enriched"
+        && cur.intelligence_input_hash
+        && intel.inputHash
+        && cur.intelligence_input_hash === intel.inputHash
+        && intel.status === "enriched") {
+      // Idempotente — ya está enriched con mismo hash. No re-escribir.
+      const ticket = await getUserTicketByKey(key);
+      return { ticket, conflict: { reason: "already_enriched_with_same_hash", serverHash: cur.intelligence_input_hash } };
+    }
+  } catch (err) {
+    logger.debug({ err }, "intelligence conflict check skipped");
+  }
+
+  try {
+    await query(
+      `UPDATE tickets_demo
+          SET intelligence            = $2::jsonb,
+              intelligence_status     = $3,
+              intelligence_input_hash = $4,
+              intelligence_updated_at = now(),
+              updated_at              = now()
+        WHERE key = $1`,
+      [key, JSON.stringify(intel), intel.status, intel.inputHash ?? null]
+    );
+    const ticket = await getUserTicketByKey(key);
+    return { ticket };
+  } catch (err) {
+    logger.error({ err, key }, "upsertTicketIntelligence failed");
+    return { ticket: null };
+  }
+}
+
+/** Lee solo el intelligence de un ticket. Null si no existe el ticket. */
+export async function getTicketIntelligence(key: string): Promise<TicketIntelligence | null> {
+  await ensureTicketsDemoSchema();
+  try {
+    const { rows } = await query<{
+      intelligence: TicketIntelligence | null;
+      intelligence_status: IntelligenceStatus | null;
+      intelligence_input_hash: string | null;
+      intelligence_updated_at: string | null;
+    }>(
+      `SELECT intelligence, intelligence_status, intelligence_input_hash, intelligence_updated_at
+         FROM tickets_demo WHERE key = $1`,
+      [key]
+    );
+    const r = rows[0];
+    if (!r) return null;
+    if (r.intelligence) {
+      return {
+        ...r.intelligence,
+        status: r.intelligence_status ?? r.intelligence.status ?? "pending_enrichment",
+        inputHash: r.intelligence_input_hash ?? r.intelligence.inputHash,
+        enrichedAt: r.intelligence_updated_at ?? r.intelligence.enrichedAt,
+      };
+    }
+    if (r.intelligence_status) return { status: r.intelligence_status };
+    return null;
+  } catch (err) {
+    logger.error({ err, key }, "getTicketIntelligence failed");
+    return null;
+  }
 }
 
 async function nextTicketKey(): Promise<string> {
