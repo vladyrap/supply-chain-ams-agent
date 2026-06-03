@@ -113,7 +113,26 @@ export async function retrieveRelevantChunks(
     content: r.content,
     score: 1 - Number(r.distance),
   }));
-  return chunks.filter((c) => c.score >= MIN_SCORE);
+
+  // v0.13 — Priority boost por tipo de documento ANTES del filter+sort.
+  // playbook > caso histórico > knowledge base > scope item > otros
+  const boosted = chunks
+    .filter((c) => c.score >= MIN_SCORE)
+    .map((c) => ({ ...c, score: c.score * priorityBoost(c.sourceType) }))
+    .sort((a, b) => b.score - a.score);
+
+  return boosted;
+}
+
+/** Boost multiplicativo por tipo de fuente (G-F6). */
+function priorityBoost(sourceType: string | null | undefined): number {
+  if (!sourceType) return 1.0;
+  const norm = sourceType.toLowerCase();
+  if (norm.includes("playbook")) return 2.0;
+  if (norm.includes("historical_case") || norm.includes("case")) return 1.5;
+  if (norm.includes("knowledge") || norm === "kb") return 1.2;
+  if (norm.includes("scope")) return 1.0;
+  return 0.9; // otros tipos (manual upload, etc.) — leve penalty
 }
 
 export function formatContextBlock(chunks: RetrievedChunk[]): string {
