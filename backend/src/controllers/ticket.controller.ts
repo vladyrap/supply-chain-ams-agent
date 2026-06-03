@@ -3,7 +3,8 @@ import {
   listTickets, getTicketByKey, getTicketProviderStatus,
   createUserTicket, recalculateUserTicket, applyManualEstimatePatch,
   closeTicketWithActualHours, replaceTicketEstimate,
-  upsertTicketIntelligence, getTicketIntelligence,
+  upsertTicketIntelligence, getTicketIntelligence, listIntelligenceHistory,
+  updateTicketGeneral, type UpdateTicketGeneralInput,
   type CreateTicketInput, type ManualEstimatePatch, type CloseTicketInput,
   type TicketIntelligence,
 } from "../services/ticket.service";
@@ -255,5 +256,44 @@ export async function getTicketIntelligenceHandler(
   } catch (err) {
     logger.error({ err }, "getTicketIntelligence fail");
     return reply.code(500).send({ success: false, error: "Error leyendo intelligence" });
+  }
+}
+
+/**
+ * GET /api/tickets/:key/intelligence/history
+ * Histórico de versiones del intelligence (TCC v0.12). Max 20 versiones.
+ */
+export async function getTicketIntelligenceHistory(
+  req: FastifyRequest<{ Params: { key: string } }>,
+  reply: FastifyReply
+) {
+  try {
+    const entries = await listIntelligenceHistory(req.params.key);
+    return reply.send({ success: true, entries });
+  } catch (err) {
+    logger.error({ err }, "getTicketIntelligenceHistory fail");
+    return reply.code(500).send({ success: false, error: "Error leyendo historial" });
+  }
+}
+
+/**
+ * PATCH /api/tickets/:key
+ * Edita campos generales del ticket (TCC v0.12). Whitelist en el service.
+ * No toca intelligence ni estimated_resolution.
+ */
+export async function patchTicketGeneral(
+  req: FastifyRequest<{ Params: { key: string }; Body: UpdateTicketGeneralInput }>,
+  reply: FastifyReply
+) {
+  try {
+    const body = req.body ?? {};
+    const ticket = await updateTicketGeneral(req.params.key, body);
+    if (!ticket) {
+      return reply.code(404).send({ success: false, error: "ticket no encontrado" });
+    }
+    return reply.send({ success: true, ticket });
+  } catch (err) {
+    logger.error({ err }, "patchTicketGeneral fail");
+    return reply.code(500).send({ success: false, error: "Error actualizando ticket" });
   }
 }

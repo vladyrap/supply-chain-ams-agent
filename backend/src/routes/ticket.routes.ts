@@ -11,6 +11,8 @@ import {
   getProviderStatus,
   putTicketIntelligence,
   getTicketIntelligenceHandler,
+  getTicketIntelligenceHistory,
+  patchTicketGeneral,
 } from "../controllers/ticket.controller";
 import type {
   CreateTicketInput, ManualEstimatePatch, CloseTicketInput, TicketIntelligence,
@@ -76,4 +78,21 @@ export async function ticketRoutes(app: FastifyInstance) {
     "/api/tickets/:key/intelligence",
     { preHandler: requirePermission("ticket_command_center", "view") },
     getTicketIntelligenceHandler);
+
+  // TCC v0.12 — historial de versiones del intelligence
+  app.get<{ Params: { key: string } }>(
+    "/api/tickets/:key/intelligence/history",
+    { preHandler: requirePermission("ticket_command_center", "view") },
+    getTicketIntelligenceHistory);
+
+  // TCC v0.12 — PATCH ticket campos generales (title, description, sapModule,
+  // environment, priority, assignee, reporter, status). Whitelist en service.
+  app.patch<{ Params: { key: string }; Body: Partial<{
+    title: string; description: string; sapModule: string | null;
+    environment: string | null; priority: string;
+    assignee: string | null; reporter: string | null; status: string;
+  }> }>(
+    "/api/tickets/:key",
+    { preHandler: requirePermission("ticket_command_center", "edit") },
+    patchTicketGeneral);
 }

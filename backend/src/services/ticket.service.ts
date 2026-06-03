@@ -254,6 +254,20 @@ async function ensureTicketsDemoSchema(): Promise<void> {
     await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence_input_hash TEXT;`);
     await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence_updated_at TIMESTAMPTZ;`);
     await query(`CREATE INDEX IF NOT EXISTS idx_tickets_intel_status ON tickets_demo (intelligence_status);`);
+    // TCC v0.12 — versionamiento histórico del análisis (audit + comparativa)
+    await query(`
+      CREATE TABLE IF NOT EXISTS ticket_intelligence_history (
+        id                BIGSERIAL PRIMARY KEY,
+        ticket_key        TEXT NOT NULL,
+        version           INT NOT NULL,
+        intelligence      JSONB NOT NULL,
+        input_hash        TEXT,
+        snapshot_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        snapshot_reason   TEXT
+      );
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_tih_ticket_key ON ticket_intelligence_history (ticket_key, snapshot_at DESC);`);
+    await query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_tih_ticket_version ON ticket_intelligence_history (ticket_key, version);`);
     ticketsDemoSchemaReady = true;
     await seedMockTicketsIfMissing();
   } catch (err) {
@@ -453,6 +467,20 @@ export async function upsertTicketIntelligence(
   }
 
   try {
+    // TCC v0.12 — snapshot del análisis previo (si existía enriched) antes de overwrite.
+    // Best-effort, no bloquea el upsert si falla.
+    try {
+      const { rows: prev } = await query<{ intelligence: TicketIntelligence | null; intelligence_input_hash: string | null }>(
+        `SELECT intelligence, intelligence_input_hash FROM tickets_demo WHERE key = $1`, [key]
+      );
+      const prior = prev[0]?.intelligence;
+      if (prior && prior.status === "enriched") {
+        await appendIntelligenceHistory(key, prior, prev[0].intelligence_input_hash ?? null, "pre_overwrite");
+      }
+    } catch (err) {
+      logger.debug({ err, key }, "intelligence history snapshot skipped");
+    }
+
     await query(
       `UPDATE tickets_demo
           SET intelligence            = $2::jsonb,
@@ -468,6 +496,81 @@ export async function upsertTicketIntelligence(
   } catch (err) {
     logger.error({ err, key }, "upsertTicketIntelligence failed");
     return { ticket: null };
+  }
+}
+
+// =============================================================================
+// TCC v0.12 — Versionamiento histórico de intelligence
+// =============================================================================
+
+export interface IntelligenceHistoryEntry {
+  id: string;
+  ticketKey: string;
+  version: number;
+  intelligence: TicketIntelligence;
+  inputHash: string | null;
+  snapshotAt: string;
+  snapshotReason: string | null;
+}
+
+/** Append snapshot a la tabla history. Devuelve version asignada. */
+async function appendIntelligenceHistory(
+  key: string, intel: TicketIntelligence, inputHash: string | null, reason: string,
+): Promise<number> {
+  // Calcular próxima version
+  const { rows: maxRows } = await query<{ next: number | null }>(
+    `SELECT COALESCE(MAX(version), 0) + 1 AS next FROM ticket_intelligence_history WHERE ticket_key = $1`,
+    [key]
+  );
+  const nextVersion = maxRows[0]?.next ?? 1;
+  await query(
+    `INSERT INTO ticket_intelligence_history (ticket_key, version, intelligence, input_hash, snapshot_reason)
+     VALUES ($1, $2, $3::jsonb, $4, $5)`,
+    [key, nextVersion, JSON.stringify(intel), inputHash, reason]
+  );
+  // Cap a últimas 20 versiones por ticket (DELETE más viejas)
+  await query(
+    `DELETE FROM ticket_intelligence_history
+       WHERE ticket_key = $1
+         AND id NOT IN (
+           SELECT id FROM ticket_intelligence_history
+            WHERE ticket_key = $1
+            ORDER BY snapshot_at DESC
+            LIMIT 20
+         )`,
+    [key]
+  );
+  return nextVersion;
+}
+
+/** Lee el historial de un ticket (más reciente primero, max 20). */
+export async function listIntelligenceHistory(key: string): Promise<IntelligenceHistoryEntry[]> {
+  await ensureTicketsDemoSchema();
+  try {
+    const { rows } = await query<{
+      id: number; ticket_key: string; version: number;
+      intelligence: TicketIntelligence; input_hash: string | null;
+      snapshot_at: string; snapshot_reason: string | null;
+    }>(
+      `SELECT id, ticket_key, version, intelligence, input_hash, snapshot_at, snapshot_reason
+         FROM ticket_intelligence_history
+        WHERE ticket_key = $1
+        ORDER BY snapshot_at DESC
+        LIMIT 20`,
+      [key]
+    );
+    return rows.map((r) => ({
+      id: String(r.id),
+      ticketKey: r.ticket_key,
+      version: r.version,
+      intelligence: r.intelligence,
+      inputHash: r.input_hash,
+      snapshotAt: r.snapshot_at,
+      snapshotReason: r.snapshot_reason,
+    }));
+  } catch (err) {
+    logger.warn({ err, key }, "listIntelligenceHistory failed");
+    return [];
   }
 }
 
@@ -886,5 +989,87 @@ export async function getTicketProviderStatus(): Promise<TicketProviderStatus> {
     return { jiraConfigured: true, jiraReachable: false, source: "mock", totalLastFetch: MOCK_TICKETS.length };
   } catch {
     return { jiraConfigured: true, jiraReachable: false, source: "mock", totalLastFetch: MOCK_TICKETS.length };
+  }
+}
+
+// =============================================================================
+// TCC v0.12 — Edición general de ticket (PATCH /api/tickets/:key)
+// =============================================================================
+
+export interface UpdateTicketGeneralInput {
+  title?: string;
+  description?: string;
+  sapModule?: string | null;
+  environment?: string | null;
+  priority?: string;
+  assignee?: string | null;
+  reporter?: string | null;
+  status?: string;
+}
+
+/**
+ * Whitelist explícita de campos editables. Si un campo viene undefined en el
+ * patch, se ignora; si viene null, se persiste null. Garantiza que el caller
+ * no pueda escribir columnas sensibles (intelligence, estimated_resolution).
+ */
+export async function updateTicketGeneral(
+  key: string, patch: UpdateTicketGeneralInput,
+): Promise<Ticket | null> {
+  await ensureTicketsDemoSchema();
+
+  // Construir SET dinámico solo con campos definidos
+  const sets: string[] = [];
+  const params: unknown[] = [key];
+  let idx = 2;
+
+  if (patch.title !== undefined) {
+    sets.push(`title = $${idx++}`);
+    params.push(patch.title.trim());
+  }
+  if (patch.description !== undefined) {
+    sets.push(`description = $${idx++}`);
+    params.push(patch.description.trim());
+  }
+  if (patch.sapModule !== undefined) {
+    sets.push(`sap_module = $${idx++}`);
+    params.push(patch.sapModule);
+  }
+  if (patch.environment !== undefined) {
+    sets.push(`environment = $${idx++}`);
+    params.push(patch.environment);
+  }
+  if (patch.priority !== undefined) {
+    sets.push(`priority = $${idx++}`);
+    params.push(patch.priority);
+  }
+  if (patch.assignee !== undefined) {
+    sets.push(`assignee = $${idx++}`);
+    params.push(patch.assignee);
+  }
+  if (patch.reporter !== undefined) {
+    sets.push(`reporter = $${idx++}`);
+    params.push(patch.reporter);
+  }
+  if (patch.status !== undefined) {
+    sets.push(`status = $${idx++}`);
+    params.push(patch.status);
+  }
+
+  if (sets.length === 0) {
+    return getUserTicketByKey(key);
+  }
+
+  sets.push(`updated_at = now()`);
+
+  try {
+    const { rows } = await query<TicketRow>(
+      `UPDATE tickets_demo SET ${sets.join(", ")} WHERE key = $1 RETURNING *`,
+      params,
+    );
+    if (rows.length === 0) return null;
+    return rowToTicket(rows[0]);
+  } catch (err) {
+    logger.error({ err, key }, "updateTicketGeneral failed");
+    return null;
   }
 }
