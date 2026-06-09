@@ -14,10 +14,17 @@ export interface IngestJobData {
   process?: string;
   client?: string;
   title?: string;
+  /** FIX G4 (audit MT v1.2.0): tenant_id obligatorio para aislamiento RAG.
+   *  Si no viene en el job payload, fallback a 'default' (legacy single-tenant). */
+  tenantId?: string;
 }
 
 export async function processIngest(data: IngestJobData): Promise<void> {
   const { documentId, fileName, mimeType, dataBase64 } = data;
+  const tenantId = data.tenantId || "default";
+  if (!data.tenantId) {
+    logger.warn({ documentId, fileName }, "ingest job sin tenantId — fallback 'default' (job payload viejo?)");
+  }
 
   const type = detectSourceType(mimeType, fileName) as SourceType | null;
   if (!type) {
@@ -48,12 +55,14 @@ export async function processIngest(data: IngestJobData): Promise<void> {
       const c = chunks[i];
       const v = vectors[i];
       totalTokens += c.estimatedTokens;
+      // FIX G4: tenant_id en INSERT para aislamiento RAG real
       await query(
         `INSERT INTO knowledge_items
-           (document_id, title, source_type, source_file, module, process, client,
+           (tenant_id, document_id, title, source_type, source_file, module, process, client,
             chunk_index, content, tokens, embedding, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, 'indexed')`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::vector, 'indexed')`,
         [
+          tenantId,
           documentId,
           data.title ?? fileName,
           type,

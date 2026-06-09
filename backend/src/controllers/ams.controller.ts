@@ -636,9 +636,9 @@ export async function getAmsStats(req: FastifyRequest, reply: FastifyReply) {
   }
 }
 
-export async function getAudit(_req: FastifyRequest, reply: FastifyReply) {
+export async function getAudit(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const rows = await listAudit(100);
+    const rows = await listAudit(req.tenantId, 100);
     return reply.send({ success: true, count: rows.length, audit: rows });
   } catch (err) {
     logger.error({ err }, "Fallo listando audit");

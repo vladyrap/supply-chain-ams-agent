@@ -228,9 +228,12 @@ function seedUsers(): PlatformUser[] {
   ];
 }
 
-async function seedIfEmpty(): Promise<void> {
-  if (seeded) return;
+// FIX G3 (audit MT v1.2.0): seed per-tenant. platform_users tiene tenant_id.
+const seededTenants = new Set<string>();
+async function seedIfEmpty(tenantId: string): Promise<void> {
+  if (seededTenants.has(tenantId)) return;
   try {
+    // platform_roles es global (catálogo del producto)
     const rc = await query<{ c: string }>("SELECT count(*)::text AS c FROM platform_roles");
     if (Number(rc.rows[0]?.c || "0") === 0) {
       for (const r of seedRoles()) {
@@ -242,19 +245,23 @@ async function seedIfEmpty(): Promise<void> {
         );
       }
     }
-    const uc = await query<{ c: string }>("SELECT count(*)::text AS c FROM platform_users");
+    // platform_users es per-tenant
+    const uc = await query<{ c: string }>(
+      "SELECT count(*)::text AS c FROM platform_users WHERE tenant_id = $1",
+      [tenantId],
+    );
     if (Number(uc.rows[0]?.c || "0") === 0) {
       for (const u of seedUsers()) {
         await query(
-          `INSERT INTO platform_users (id,name,email,role_code,service_level,status,created_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-          [u.id, u.name, u.email, u.roleCode, u.serviceLevel, u.status, u.createdAt]
+          `INSERT INTO platform_users (tenant_id,id,name,email,role_code,service_level,status,created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [tenantId, u.id, u.name, u.email, u.roleCode, u.serviceLevel, u.status, u.createdAt]
         );
       }
     }
-    seeded = true;
+    seededTenants.add(tenantId);
   } catch (err) {
-    logger.warn({ err }, "seed rbac failed");
+    logger.warn({ err, tenantId }, "seed rbac failed");
   }
 }
 
@@ -303,7 +310,7 @@ async function backfillMissingScreens(): Promise<void> {
   }
 }
 
-async function ready() { await ensureSchema(); await seedIfEmpty(); await backfillMissingScreens(); }
+async function ready(tenantId: string) { await ensureSchema(); await seedIfEmpty(tenantId); await backfillMissingScreens(); }
 
 // ============================================================
 // Mappers
@@ -337,17 +344,34 @@ function mapUser(r: UserRow): PlatformUser {
 // API
 // ============================================================
 
-export async function getSnapshot(): Promise<{ roles: PlatformRole[]; users: PlatformUser[] }> {
-  await ready();
+// FIX G3 (audit MT v1.2.0): TODAS las funciones reciben tenantId.
+// platform_users es per-tenant. platform_roles es global (catálogo del producto).
+// resetDemo: solo borra users del tenant, NO borra roles globales.
+
+export async function getSnapshot(tenantId: string): Promise<{ roles: PlatformRole[]; users: PlatformUser[] }> {
+  await ready(tenantId);
   const [rR, uR] = await Promise.all([
     query<RoleRow>("SELECT * FROM platform_roles ORDER BY name"),
-    query<UserRow>("SELECT * FROM platform_users ORDER BY name"),
+    query<UserRow>("SELECT * FROM platform_users WHERE tenant_id = $1 ORDER BY name", [tenantId]),
   ]);
   return { roles: rR.rows.map(mapRole), users: uR.rows.map(mapUser) };
 }
 
+/**
+ * Lista solo los roles globales (catálogo del producto). Usado por
+ * rbac-permission.service.ts para resolver permisos sin requerir tenantId.
+ */
+export async function listGlobalRoles(): Promise<PlatformRole[]> {
+  await ensureSchema();
+  await backfillMissingScreens();
+  const { rows } = await query<RoleRow>("SELECT * FROM platform_roles ORDER BY name");
+  return rows.map(mapRole);
+}
+
 export async function upsertRole(r: PlatformRole): Promise<PlatformRole> {
-  await ready();
+  await ensureSchema();
+  await backfillMissingScreens();
+  // platform_roles GLOBAL — super_admin only (controller enforce)
   const now = new Date().toISOString();
   const res = await query<RoleRow>(
     `INSERT INTO platform_roles (id,name,code,description,is_system,permissions,created_at,updated_at)
@@ -364,34 +388,36 @@ export async function upsertRole(r: PlatformRole): Promise<PlatformRole> {
 }
 
 export async function deleteRole(id: string): Promise<void> {
-  await ready();
+  await ensureSchema();
+  // platform_roles GLOBAL — super_admin only
   await query("DELETE FROM platform_roles WHERE id = $1 AND is_system = false", [id]);
 }
 
-export async function upsertUser(u: PlatformUser): Promise<PlatformUser> {
-  await ready();
+export async function upsertUser(tenantId: string, u: PlatformUser): Promise<PlatformUser> {
+  await ready(tenantId);
   const now = new Date().toISOString();
   const res = await query<UserRow>(
-    `INSERT INTO platform_users (id,name,email,role_code,service_level,status,created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7)
+    `INSERT INTO platform_users (tenant_id,id,name,email,role_code,service_level,status,created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
      ON CONFLICT (id) DO UPDATE SET
        name=EXCLUDED.name, email=EXCLUDED.email, role_code=EXCLUDED.role_code,
        service_level=EXCLUDED.service_level, status=EXCLUDED.status
+     WHERE platform_users.tenant_id = $1
      RETURNING *`,
-    [u.id, u.name, u.email, u.roleCode, u.serviceLevel, u.status, u.createdAt || now]
+    [tenantId, u.id, u.name, u.email, u.roleCode, u.serviceLevel, u.status, u.createdAt || now]
   );
   return mapUser(res.rows[0]);
 }
 
-export async function deleteUser(id: string): Promise<void> {
-  await ready();
-  await query("DELETE FROM platform_users WHERE id = $1", [id]);
+export async function deleteUser(tenantId: string, id: string): Promise<void> {
+  await ready(tenantId);
+  await query("DELETE FROM platform_users WHERE id = $1 AND tenant_id = $2", [id, tenantId]);
 }
 
-export async function resetDemo(): Promise<void> {
+export async function resetDemo(tenantId: string): Promise<void> {
   await ensureSchema();
-  await query("DELETE FROM platform_users");
-  await query("DELETE FROM platform_roles");
-  seeded = false;
-  await seedIfEmpty();
+  // SOLO borra users del tenant (no roles globales). Después reseed.
+  await query("DELETE FROM platform_users WHERE tenant_id = $1", [tenantId]);
+  seededTenants.delete(tenantId);
+  await seedIfEmpty(tenantId);
 }

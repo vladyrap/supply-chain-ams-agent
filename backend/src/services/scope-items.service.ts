@@ -176,17 +176,23 @@ function rowToItem(r: ScopeItemRow, coverage: Map<string, { kb: boolean; pb: boo
  * mencionando el código del scope item.
  * Implementación tolerante: si las tablas no existen, asume false.
  */
-async function computeCoverage(codes: string[]): Promise<Map<string, { kb: boolean; pb: boolean; qa: boolean }>> {
+/**
+ * FIX G6 (audit MT v1.2.0): JOIN entre sap_scope_items (global catalog) y
+ * agent_knowledge/agent_qa (tenant-scoped) sin filtro tenant_id leakeaba
+ * cobertura cross-tenant en el readiness. Ahora computeCoverage recibe
+ * tenantId obligatorio y filtra agent_knowledge.tenant_id + agent_qa.tenant_id.
+ */
+async function computeCoverage(tenantId: string, codes: string[]): Promise<Map<string, { kb: boolean; pb: boolean; qa: boolean }>> {
   const map = new Map<string, { kb: boolean; pb: boolean; qa: boolean }>();
   for (const c of codes) map.set(c, { kb: false, pb: false, qa: false });
-  // Marcadores: buscamos códigos en agent_knowledge.tags (jsonb), agent_qa.tags (jsonb),
-  // o cualquier columna title/body que contenga el código. Si las tablas no existen, salimos limpio.
   try {
     const { rows } = await query<{ code: string }>(
       `SELECT DISTINCT code FROM (
          SELECT s.code FROM sap_scope_items s
          JOIN agent_knowledge k ON (k.tags @> to_jsonb(ARRAY[s.code]::text[]) OR k.title ILIKE '%' || s.code || '%')
-       ) sub`
+         WHERE k.tenant_id = $1
+       ) sub`,
+      [tenantId]
     );
     for (const r of rows) {
       const v = map.get(r.code); if (v) v.kb = true;
@@ -195,7 +201,9 @@ async function computeCoverage(codes: string[]): Promise<Map<string, { kb: boole
   try {
     const { rows } = await query<{ code: string }>(
       `SELECT DISTINCT s.code FROM sap_scope_items s
-         JOIN agent_qa q ON (q.tags @> to_jsonb(ARRAY[s.code]::text[]) OR q.question ILIKE '%' || s.code || '%')`
+         JOIN agent_qa q ON (q.tags @> to_jsonb(ARRAY[s.code]::text[]) OR q.question ILIKE '%' || s.code || '%')
+        WHERE q.tenant_id = $1`,
+      [tenantId]
     );
     for (const r of rows) {
       const v = map.get(r.code); if (v) v.qa = true;
@@ -204,7 +212,10 @@ async function computeCoverage(codes: string[]): Promise<Map<string, { kb: boole
   return map;
 }
 
-export async function listScopeItems(filter?: { module?: SapModule }): Promise<SapScopeItem[]> {
+// FIX G6: listScopeItems / getScopeItemByCode / findScopeItemsForTicket
+// reciben tenantId para computar coverage scoped (sap_scope_items es catálogo
+// global, pero la cobertura agent_knowledge/agent_qa es per-tenant).
+export async function listScopeItems(tenantId: string, filter?: { module?: SapModule }): Promise<SapScopeItem[]> {
   await ensureSchema();
   const where: string[] = [];
   const params: unknown[] = [];
@@ -214,28 +225,28 @@ export async function listScopeItems(filter?: { module?: SapModule }): Promise<S
   }
   const sql = `SELECT * FROM sap_scope_items ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY module, code`;
   const { rows } = await query<ScopeItemRow>(sql, params);
-  const coverage = await computeCoverage(rows.map((r) => r.code));
+  const coverage = await computeCoverage(tenantId, rows.map((r) => r.code));
   return rows.map((r) => rowToItem(r, coverage));
 }
 
-export async function getScopeItemByCode(code: string): Promise<SapScopeItem | null> {
+export async function getScopeItemByCode(tenantId: string, code: string): Promise<SapScopeItem | null> {
   await ensureSchema();
   const { rows } = await query<ScopeItemRow>(`SELECT * FROM sap_scope_items WHERE code = $1`, [code]);
   if (!rows[0]) return null;
-  const coverage = await computeCoverage([code]);
+  const coverage = await computeCoverage(tenantId, [code]);
   return rowToItem(rows[0], coverage);
 }
 
 /**
- * Devuelve scope items que matchean un ticket por módulo + texto del título/descripción.
- * Heurística simple para sugerir items relacionados desde el Decision Engine.
+ * Devuelve scope items que matchean un ticket por módulo + texto.
+ * tenantId required para scoping de coverage.
  */
-export async function findScopeItemsForTicket(input: {
+export async function findScopeItemsForTicket(tenantId: string, input: {
   module?: string | null;
   title?: string;
   description?: string;
 }): Promise<SapScopeItem[]> {
-  const items = await listScopeItems({ module: (input.module || undefined) as SapModule | undefined });
+  const items = await listScopeItems(tenantId, { module: (input.module || undefined) as SapModule | undefined });
   if (items.length === 0) return [];
   const haystack = `${input.title || ""} ${input.description || ""}`.toLowerCase();
   return items.filter((it) => {

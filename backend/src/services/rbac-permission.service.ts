@@ -18,7 +18,7 @@ import {
 } from "../types/permissions.types";
 import type { User } from "../types/auth.types";
 import { getPermissionsForRoleCode, legacyRoleToCode } from "../lib/default-permissions";
-import { getSnapshot as getRbacSnapshot } from "./rbac.service";
+import { listGlobalRoles } from "./rbac.service";
 import { logger } from "../utils/logger";
 
 /**
@@ -47,16 +47,16 @@ export async function hasPermission(
     return !!defaultPerms[screen]?.[action];
   }
 
-  // 2) Fallback: buscar en platform_roles (rol custom)
+  // 2) Fallback: buscar en platform_roles (rol custom). Roles son globales.
   try {
-    const snap = await getRbacSnapshot();
-    const role = snap.roles.find((r) => r.code === code);
+    const roles = await listGlobalRoles();
+    const role = roles.find((r) => r.code === code);
     if (role && role.permissions) {
       const perms = role.permissions as unknown as RolePermissionMap;
       return !!perms[screen]?.[action];
     }
   } catch (err) {
-    logger.debug({ err, screen, action }, "rbac snapshot lookup failed");
+    logger.debug({ err, screen, action }, "rbac roles lookup failed");
   }
 
   // 3) Fail-closed

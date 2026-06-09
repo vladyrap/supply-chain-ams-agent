@@ -86,13 +86,13 @@ export async function getStats(tenantId: string): Promise<AmsStats> {
       [tenantId]
     ),
     query<{ action: string; created_at: string }>(
-      // audit_logs es una tabla legacy global; se conserva pero filtramos
-      // por tenant cuando exista la columna. Si no existe la columna,
-      // simplemente devolvemos las últimas 12 (fallback).
+      // FIX G2 (audit v1.2.0): scoped por tenant_id (migration 005 lo agregó).
       `SELECT action, created_at::text
          FROM audit_logs
+        WHERE tenant_id = $1
         ORDER BY created_at DESC
-        LIMIT 12`
+        LIMIT 12`,
+      [tenantId]
     ),
   ]);
 
