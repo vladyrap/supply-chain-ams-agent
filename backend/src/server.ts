@@ -38,6 +38,10 @@ import { rbacRoutes } from "./routes/rbac.routes";
 import { auditEventsRoutes } from "./routes/audit-events.routes";
 // v0.12.4 — Admin usage panel (costos Gemini visibles en /admin/costs)
 import { adminUsageRoutes } from "./routes/admin-usage.routes";
+// v1.1.0 — SSO Google OAuth (solo activa si GOOGLE_OAUTH_CLIENT_ID seteado)
+import { googleAuthRoutes } from "./routes/auth-google.routes";
+// v1.1.0 — Multi-tenancy plugin
+import { tenantPlugin } from "./middleware/tenant";
 import { registry, httpRequestsTotal, httpRequestDuration } from "./utils/metrics";
 
 export function buildServer() {
@@ -195,6 +199,10 @@ export function buildServer() {
   app.register(auditEventsRoutes);
   // v0.12.4 — admin usage / cost panel
   app.register(adminUsageRoutes);
+  // v1.1.0 — Multi-tenancy plugin (decora request.tenantId)
+  app.register(tenantPlugin);
+  // v1.1.0 — SSO Google (no-op si no hay credenciales)
+  app.register(googleAuthRoutes);
   app.register(scopeItemsRoutes);
   app.register(customerResponseRoutes);
 
