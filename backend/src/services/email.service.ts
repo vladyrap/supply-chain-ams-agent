@@ -1,14 +1,12 @@
 // =============================================================================
-// email.service.ts — Email transaccional con Resend (v1.1.0)
+// email.service.ts — Email transaccional con Resend (v1.1.1-hotfix)
 // =============================================================================
+// FIX C11 (audit v1.1.0): escapeHtml() en TODOS los `${...}` HTML para
+// prevenir XSS via display name de Google ("<script>"). CRLF stripping en
+// subject para prevenir header injection.
+//
 // Envía emails transaccionales si RESEND_API_KEY está seteada.
 // Si no, log no-op (compatible con dev sin internet).
-//
-// Templates incluidos:
-//   - sendWelcome: bienvenida + credenciales temporales
-//   - sendPasswordReset: link de reset con token expirable
-//   - sendAlertNotification: alerta de Alertmanager redirigida
-//   - sendCustomerResponse: respuesta al cliente externo (con mirror Jira)
 // =============================================================================
 
 import { Resend } from "resend";
@@ -17,6 +15,30 @@ import { logger } from "../utils/logger";
 const FROM = process.env.EMAIL_FROM ?? "AMS Platform <noreply@tuempresa.cl>";
 let cachedClient: Resend | null = null;
 let warned = false;
+
+/** Escape HTML para evitar XSS al interpolar input no-trusted en templates. */
+function esc(input: string | undefined | null): string {
+  if (input == null) return "";
+  return String(input)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/** Quitar CR/LF de subject + cualquier header para evitar header injection. */
+function stripCrlf(input: string): string {
+  return String(input).replace(/[\r\n]+/g, " ").trim();
+}
+
+/** Sanitizar URL: solo http/https permitido (evita javascript:, data:). */
+function safeUrl(url: string | undefined): string {
+  if (!url) return "#";
+  const s = String(url).trim();
+  if (!/^https?:\/\//i.test(s)) return "#";
+  return esc(s); // y escape para atributo HTML
+}
 
 function getClient(): Resend | null {
   if (!process.env.RESEND_API_KEY) {
@@ -50,7 +72,7 @@ export async function sendEmail(opts: {
     const { data, error } = await client.emails.send({
       from: FROM,
       to: opts.to,
-      subject: opts.subject,
+      subject: stripCrlf(opts.subject), // FIX C11: header injection
       html: opts.html,
       text: opts.text,
       replyTo: opts.replyTo,
@@ -74,7 +96,7 @@ export async function sendWelcome(opts: {
   tempPassword?: string;
 }): Promise<EmailResult> {
   const credsBlock = opts.tempPassword
-    ? `<p><strong>Tu password temporal:</strong> <code>${opts.tempPassword}</code></p>
+    ? `<p><strong>Tu password temporal:</strong> <code>${esc(opts.tempPassword)}</code></p>
        <p style="color: #ef4444;">⚠ Cambiá esta contraseña en tu primer login.</p>`
     : "";
   return sendEmail({
@@ -84,11 +106,11 @@ export async function sendWelcome(opts: {
 <!DOCTYPE html>
 <html>
 <body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-  <h1 style="color: #22d3ee;">¡Bienvenido a AMS Platform, ${opts.name}! 👋</h1>
-  <p>Tu cuenta ya está activa. Podés acceder con tu email <strong>${opts.to}</strong>.</p>
+  <h1 style="color: #22d3ee;">¡Bienvenido a AMS Platform, ${esc(opts.name)}! 👋</h1>
+  <p>Tu cuenta ya está activa. Podés acceder con tu email <strong>${esc(opts.to)}</strong>.</p>
   ${credsBlock}
   <div style="margin: 30px 0;">
-    <a href="${opts.loginUrl}" style="background: #22d3ee; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px;">
+    <a href="${safeUrl(opts.loginUrl)}" style="background: #22d3ee; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px;">
       Acceder a AMS Platform
     </a>
   </div>
@@ -123,14 +145,14 @@ export async function sendPasswordReset(opts: {
 <html>
 <body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
   <h1>🔐 Reseteo de contraseña</h1>
-  <p>Hola ${opts.name},</p>
+  <p>Hola ${esc(opts.name)},</p>
   <p>Recibimos una solicitud para resetear tu contraseña. Click en el botón abajo:</p>
   <div style="margin: 30px 0;">
-    <a href="${opts.resetUrl}" style="background: #22d3ee; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px;">
+    <a href="${safeUrl(opts.resetUrl)}" style="background: #22d3ee; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px;">
       Crear nueva contraseña
     </a>
   </div>
-  <p style="color: #f59e0b;">⏱ Este link expira en ${opts.expiresInMinutes} minutos.</p>
+  <p style="color: #f59e0b;">⏱ Este link expira en ${Number(opts.expiresInMinutes) || 60} minutos.</p>
   <p style="color: #94a3b8; font-size: 12px;">
     Si NO solicitaste este reseteo, ignorá este email. Tu contraseña no cambiará.
   </p>
@@ -150,22 +172,24 @@ export async function sendAlertNotification(opts: {
   runbookUrl?: string;
 }): Promise<EmailResult> {
   const sevColor = opts.severity === "critical" ? "#ef4444" : opts.severity === "warning" ? "#f59e0b" : "#22d3ee";
+  // Subject NO se interpola con esc() porque va plain text — pero sí strip CRLF
+  // que hace stripCrlf en sendEmail. El severity ya viene controlado.
   return sendEmail({
     to: opts.to,
-    subject: `🚨 [${opts.severity.toUpperCase()}] ${opts.alertName} — AMS Platform`,
+    subject: `🚨 [${String(opts.severity).toUpperCase()}] ${opts.alertName} — AMS Platform`,
     html: `
 <!DOCTYPE html>
 <html>
 <body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
   <div style="background: ${sevColor}22; border-left: 4px solid ${sevColor}; padding: 14px;">
-    <h2 style="margin: 0; color: ${sevColor};">⚠ ${opts.alertName}</h2>
-    <p><strong>Severity:</strong> ${opts.severity}</p>
+    <h2 style="margin: 0; color: ${sevColor};">⚠ ${esc(opts.alertName)}</h2>
+    <p><strong>Severity:</strong> ${esc(opts.severity)}</p>
   </div>
   <h3 style="margin-top: 20px;">Resumen</h3>
-  <p>${opts.summary}</p>
+  <p>${esc(opts.summary)}</p>
   <h3>Detalle</h3>
-  <p>${opts.description}</p>
-  ${opts.runbookUrl ? `<p><a href="${opts.runbookUrl}">Ver runbook</a></p>` : ""}
+  <p>${esc(opts.description)}</p>
+  ${opts.runbookUrl ? `<p><a href="${safeUrl(opts.runbookUrl)}">Ver runbook</a></p>` : ""}
 </body>
 </html>`.trim(),
   });

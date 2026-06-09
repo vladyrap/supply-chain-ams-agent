@@ -1,16 +1,23 @@
 name: Deploy on tag
 
 # =============================================================================
-# v1.1.0 — Deploy automático al VPS cuando se pushea un tag vX.Y.Z
+# v1.1.1-hotfix — Deploy automático al VPS cuando se pushea un tag vX.Y.Z
 # =============================================================================
+# FIX C8 (audit v1.1.0):
+#   - Validar formato del TAG con regex ANTES de pasar al VPS (shell injection)
+#   - Pasar el script remoto vía bash -s -- "$TAG" stdin (no string interpolation)
+#   - `set -euo pipefail` ahora SÍ aplica al script remoto
+#   - ssh-keyscan pin con VPS_HOST_FINGERPRINT secret (no MITM en primer deploy)
+#
 # Requiere secrets configurados en el repo (Settings → Secrets):
-#   - VPS_HOST          (ej: 49.13.x.x)
-#   - VPS_USER          (ej: ams)
-#   - VPS_SSH_KEY       (clave SSH privada, formato OpenSSH)
-#   - VPS_DEPLOY_PATH   (ej: /opt/supply-chain-ams-stack)
+#   - VPS_HOST              (ej: 49.13.x.x)
+#   - VPS_USER              (ej: ams)
+#   - VPS_SSH_KEY           (clave SSH privada, formato OpenSSH)
+#   - VPS_DEPLOY_PATH       (ej: /opt/supply-chain-ams-stack)
+#   - VPS_HOST_FINGERPRINT  (output de: ssh-keyscan -t ed25519 IP)
+#   - AMS_DOMAIN            (ej: ams.tudominio.cl) — para smoke test
 #
 # El workflow se dispara SOLO en tags con formato v*.*.* (ej: v1.1.0)
-# Llama a `bash deploy.sh prod` en el VPS (idempotente).
 # =============================================================================
 
 on:
@@ -29,45 +36,98 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - name: Echo tag
+      - name: Resolve and validate tag
+        id: tagcheck
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_TAG: ${{ github.ref_name }}
         run: |
-          echo "Desplegando tag: ${{ github.ref_name || github.event.inputs.tag }}"
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$REF_TAG}"
+          # FIX C8: validar formato estricto vX.Y.Z[-suffix] — bloquea injection.
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::Tag inválido: '$TAG'. Esperado: vX.Y.Z o vX.Y.Z-suffix"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Desplegando tag validado: $TAG"
+
+      - name: Verify required secrets
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
+          AMS_DOMAIN: ${{ secrets.AMS_DOMAIN }}
+          VPS_HOST_FINGERPRINT: ${{ secrets.VPS_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -z "${VPS_HOST:-}" ] && missing+=("VPS_HOST")
+          [ -z "${VPS_USER:-}" ] && missing+=("VPS_USER")
+          [ -z "${VPS_DEPLOY_PATH:-}" ] && missing+=("VPS_DEPLOY_PATH")
+          [ -z "${AMS_DOMAIN:-}" ] && missing+=("AMS_DOMAIN")
+          [ -z "${VPS_HOST_FINGERPRINT:-}" ] && missing+=("VPS_HOST_FINGERPRINT")
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::Faltan secrets: ${missing[*]}"
+            exit 1
+          fi
 
       - name: Setup SSH key
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
 
-      - name: Add VPS host fingerprint
+      - name: Pin VPS host fingerprint (no MITM)
         run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          # FIX C8 derivado: usar fingerprint conocido en vez de ssh-keyscan ciego.
+          echo "${{ secrets.VPS_HOST_FINGERPRINT }}" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
 
       - name: Pull + redeploy stack
         env:
-          TAG: ${{ github.ref_name || github.event.inputs.tag }}
+          TAG: ${{ steps.tagcheck.outputs.tag }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
         run: |
-          ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} bash -lc "'
-            set -euo pipefail
-            cd ${{ secrets.VPS_DEPLOY_PATH }}
-            echo \"==> Deploying tag $TAG\"
-            cd ../supply-chain-ams-agent && git fetch --tags && git checkout $TAG
-            cd ../supply-chain-ams-platform && git fetch --tags && git checkout $TAG || true
-            cd ${{ secrets.VPS_DEPLOY_PATH }} && git pull
-            bash deploy.sh prod
-            echo \"==> Deploy OK\"
-          '"
+          set -euo pipefail
+          # FIX C8: pasar TAG como ARGUMENTO ($1 dentro del HEREDOC vía bash -s).
+          # El script remoto está QUOTED con 'REMOTE' → no se expande nada local.
+          # set -euo pipefail dentro del script remoto SÍ aplica (es bash real).
+          ssh "${VPS_USER}@${VPS_HOST}" bash -s -- "$TAG" "$VPS_DEPLOY_PATH" <<'REMOTE'
+          set -euo pipefail
+          TAG="$1"
+          DEPLOY_PATH="$2"
+          echo "==> Desplegando tag $TAG en $DEPLOY_PATH"
+          cd "$DEPLOY_PATH/../supply-chain-ams-agent"
+          git fetch --tags --quiet
+          git checkout "tags/$TAG" --quiet
+          cd "$DEPLOY_PATH/../supply-chain-ams-platform"
+          git fetch --tags --quiet
+          # platform puede no tener el mismo tag (deploy individual)
+          git checkout "tags/$TAG" --quiet || echo "(platform sin tag $TAG, sigue con HEAD actual)"
+          cd "$DEPLOY_PATH"
+          git pull --ff-only --quiet
+          bash deploy.sh prod
+          echo "==> Deploy OK"
+          REMOTE
 
       - name: Smoke test post-deploy
+        env:
+          AMS_DOMAIN: ${{ secrets.AMS_DOMAIN }}
         run: |
+          set -euo pipefail
+          # FIX C8: quitar -k (insecure). Si TLS no es válido el deploy falla.
           for i in $(seq 1 30); do
-            STATUS=$(curl -sk -o /dev/null -w "%{http_code}" https://${{ secrets.AMS_DOMAIN || 'ams.tudominio.cl' }}/status || echo 000)
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://${AMS_DOMAIN}/status" || echo 000)
             if [ "$STATUS" = "200" ]; then
-              echo "✓ /status responde 200"
+              echo "✓ /status responde 200 después de $((i*5))s"
               exit 0
             fi
             echo "Esperando warmup... (status: $STATUS, intento $i/30)"
             sleep 5
           done
-          echo "✗ Timeout esperando warmup post-deploy"
+          echo "::error::Timeout esperando warmup post-deploy en https://${AMS_DOMAIN}/status"
           exit 1

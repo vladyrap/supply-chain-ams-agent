@@ -139,8 +139,17 @@ export function buildServer() {
     // Sin PUT en CORS, el preflight rechaza con "Method PUT is not allowed".
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   });
+  // FIX C6 (audit v1.1.0): fail-fast en prod si COOKIE_SECRET no seteada o corta.
+  const COOKIE_SECRET = process.env.COOKIE_SECRET;
+  if (process.env.NODE_ENV === "production") {
+    if (!COOKIE_SECRET || COOKIE_SECRET.length < 32) {
+      throw new Error(
+        "COOKIE_SECRET required in production (>= 32 chars). Generar: openssl rand -hex 32",
+      );
+    }
+  }
   app.register(cookie, {
-    secret: process.env.COOKIE_SECRET || "ams-dev-cookie-secret-change-in-prod-please",
+    secret: COOKIE_SECRET || "ams-dev-cookie-secret-DO-NOT-USE-IN-PROD-padding-32",
   });
 
   // Twilio webhooks usan application/x-www-form-urlencoded.
@@ -173,6 +182,13 @@ export function buildServer() {
     return registry.metrics();
   });
 
+  // FIX C1 (audit v1.1.0): tenantPlugin DEBE registrarse ANTES que cualquier
+  // *Routes plugin. En Fastify, los onRequest hooks de un plugin solo se
+  // ejecutan en rutas registradas en el mismo encapsulation context o después.
+  // Antes estaba en línea ~203 (después de todos los routes) → req.tenantId
+  // quedaba "" en TODAS las rutas de negocio → multi-tenancy no se ejecutaba.
+  app.register(tenantPlugin);
+
   app.register(healthRoutes);
   app.register(authRoutes);
   app.register(amsRoutes);
@@ -199,8 +215,6 @@ export function buildServer() {
   app.register(auditEventsRoutes);
   // v0.12.4 — admin usage / cost panel
   app.register(adminUsageRoutes);
-  // v1.1.0 — Multi-tenancy plugin (decora request.tenantId)
-  app.register(tenantPlugin);
   // v1.1.0 — SSO Google (no-op si no hay credenciales)
   app.register(googleAuthRoutes);
   app.register(scopeItemsRoutes);
