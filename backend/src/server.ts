@@ -99,6 +99,31 @@ export function buildServer() {
     },
   });
 
+  // v0.12.11 — Origin-based CSRF protection.
+  // Para mutations (POST/PUT/PATCH/DELETE) validamos que el header Origin
+  // o Referer pertenezca a ALLOWED_ORIGINS. Si no → 403.
+  // Defense-in-depth contra CSRF sin requerir tokens explicitos en forms.
+  // GET/HEAD/OPTIONS quedan libres (son safe per spec).
+  const ENFORCE_CSRF = process.env.ENFORCE_ORIGIN_CSRF !== "false"; // ON por default
+  if (ENFORCE_CSRF) {
+    app.addHook("onRequest", async (req, reply) => {
+      const method = req.method.toUpperCase();
+      if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
+      // Skip si no hay Origin/Referer (curl, server-to-server)
+      const origin = req.headers.origin;
+      const referer = req.headers.referer;
+      if (!origin && !referer) return; // permitir clientes sin browser
+      const checkAgainst = origin || (referer ? new URL(referer).origin : null);
+      if (checkAgainst && !ALLOWED_ORIGINS.includes(checkAgainst)) {
+        reply.code(403).send({
+          success: false,
+          error: "Origen no permitido (CSRF protection).",
+          origin: checkAgainst,
+        });
+      }
+    });
+  }
+
   app.register(cors, {
     origin: (origin, cb) => {
       if (!origin || ALLOWED_ORIGINS.includes(origin)) cb(null, true);
