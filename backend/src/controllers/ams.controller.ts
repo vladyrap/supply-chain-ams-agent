@@ -131,7 +131,7 @@ export async function postChat(req: FastifyRequest, reply: FastifyReply) {
     throw err;
   }
 
-  await recordAudit("CHAT_REQUEST_RECEIVED", {
+  await recordAudit(req.tenantId, "CHAT_REQUEST_RECEIVED", {
     user: normalized.user,
     module: normalized.module,
     client: normalized.client,
@@ -141,7 +141,7 @@ export async function postChat(req: FastifyRequest, reply: FastifyReply) {
   });
 
   try {
-    await recordAudit("CLAUDE_REQUEST_SENT", {
+    await recordAudit(req.tenantId, "CLAUDE_REQUEST_SENT", {
       module: normalized.module,
       environment: normalized.environment,
       attachmentCount: normalized.attachments.length,
@@ -157,7 +157,7 @@ export async function postChat(req: FastifyRequest, reply: FastifyReply) {
       tenantId: req.tenantId,
     });
 
-    await recordAudit("CLAUDE_RESPONSE_RECEIVED", {
+    await recordAudit(req.tenantId, "CLAUDE_RESPONSE_RECEIVED", {
       model: result.model,
       confidence: result.confidence,
       length: result.text.length,
@@ -170,7 +170,7 @@ export async function postChat(req: FastifyRequest, reply: FastifyReply) {
       model: result.model,
     });
 
-    await recordAudit("INCIDENT_SAVED", { incidentId: incident.id });
+    await recordAudit(req.tenantId, "INCIDENT_SAVED", { incidentId: incident.id });
 
     emitEventFireAndForget(req.tenantId, "incident.created", {
       incident_id: incident.id,
@@ -207,7 +207,7 @@ export async function postChat(req: FastifyRequest, reply: FastifyReply) {
     });
   } catch (err) {
     logger.error({ err }, "Fallo en /api/ams/chat");
-    await recordAudit("ERROR", {
+    await recordAudit(req.tenantId, "ERROR", {
       where: "postChat",
       message: err instanceof Error ? err.message : String(err),
     });
@@ -265,7 +265,7 @@ export async function postResearch(req: FastifyRequest, reply: FastifyReply) {
     throw err;
   }
 
-  await recordAudit("CHAT_REQUEST_RECEIVED", {
+  await recordAudit(req.tenantId, "CHAT_REQUEST_RECEIVED", {
     user: normalized.user,
     module: normalized.module,
     client: normalized.client,
@@ -286,7 +286,7 @@ export async function postResearch(req: FastifyRequest, reply: FastifyReply) {
       attachments: normalized.attachments,
     });
 
-    await recordAudit("CLAUDE_RESPONSE_RECEIVED", {
+    await recordAudit(req.tenantId, "CLAUDE_RESPONSE_RECEIVED", {
       model: result.model,
       confidence: result.confidence,
       length: result.text.length,
@@ -301,7 +301,7 @@ export async function postResearch(req: FastifyRequest, reply: FastifyReply) {
       confidence: result.confidence,
       model: result.model + " (research)",
     });
-    await recordAudit("INCIDENT_SAVED", { incidentId: incident.id });
+    await recordAudit(req.tenantId, "INCIDENT_SAVED", { incidentId: incident.id });
 
     emitEventFireAndForget(req.tenantId, "incident.created", {
       incident_id: incident.id,
@@ -346,7 +346,7 @@ export async function postResearch(req: FastifyRequest, reply: FastifyReply) {
     });
   } catch (err) {
     logger.error({ err }, "Fallo en /api/ams/research");
-    await recordAudit("ERROR", {
+    await recordAudit(req.tenantId, "ERROR", {
       where: "postResearch",
       message: err instanceof Error ? err.message : String(err),
     });
@@ -485,7 +485,7 @@ export async function postChatStream(req: FastifyRequest, reply: FastifyReply) {
   };
   reply.hijack();
 
-  await recordAudit("CHAT_REQUEST_RECEIVED", {
+  await recordAudit(req.tenantId, "CHAT_REQUEST_RECEIVED", {
     user: normalized.user,
     module: normalized.module,
     client: normalized.client,
@@ -508,7 +508,7 @@ export async function postChatStream(req: FastifyRequest, reply: FastifyReply) {
   });
 
   try {
-    await recordAudit("CLAUDE_REQUEST_SENT", {
+    await recordAudit(req.tenantId, "CLAUDE_REQUEST_SENT", {
       module: normalized.module,
       environment: normalized.environment,
       attachmentCount: normalized.attachments.length,
@@ -537,7 +537,7 @@ export async function postChatStream(req: FastifyRequest, reply: FastifyReply) {
       }
     }
 
-    await recordAudit("CLAUDE_RESPONSE_RECEIVED", {
+    await recordAudit(req.tenantId, "CLAUDE_RESPONSE_RECEIVED", {
       model,
       confidence,
       length: fullText.length,
@@ -550,7 +550,7 @@ export async function postChatStream(req: FastifyRequest, reply: FastifyReply) {
       confidence,
       model,
     });
-    await recordAudit("INCIDENT_SAVED", { incidentId: incident.id });
+    await recordAudit(req.tenantId, "INCIDENT_SAVED", { incidentId: incident.id });
 
     emitEventFireAndForget(req.tenantId, "incident.created", {
       incident_id: incident.id,
@@ -575,7 +575,7 @@ export async function postChatStream(req: FastifyRequest, reply: FastifyReply) {
     reply.raw.end();
   } catch (err) {
     logger.error({ err }, "Fallo en /api/ams/chat/stream");
-    await recordAudit("ERROR", {
+    await recordAudit(req.tenantId, "ERROR", {
       where: "postChatStream",
       message: err instanceof Error ? err.message : String(err),
     });

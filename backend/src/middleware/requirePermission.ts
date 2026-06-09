@@ -39,7 +39,7 @@ export function requirePermission(screen: PlatformScreen, action: PermissionActi
     const allowed = await hasPermission(user, screen, action);
     if (!allowed) {
       // Audit best-effort
-      recordAudit("UNAUTHORIZED_API_ACCESS_ATTEMPT", {
+      recordAudit(req.tenantId, "UNAUTHORIZED_API_ACCESS_ATTEMPT", {
         userId: user.id,
         userEmail: user.email,
         role: user.role,
