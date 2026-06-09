@@ -13,6 +13,9 @@ import type {
   TicketEstimatedResolution, EnvironmentLevel,
 } from "../utils/estimation";
 
+// MT-2 (multi-tenant): incidents se aíslan por tenant_id. Todas las
+// queries filtran por tenant + INSERT incluye la columna.
+
 // Extiende IncidentRecord opcionalmente con la estimación autoembebida.
 export type IncidentWithEstimate = IncidentRecord & {
   estimatedResolution?: TicketEstimatedResolution | null;
@@ -55,17 +58,18 @@ function rowToRecord(row: IncidentRowRaw): IncidentRecord {
   };
 }
 
-export async function saveIncident(data: SaveIncidentInput): Promise<IncidentWithEstimate> {
+export async function saveIncident(tenantId: string, data: SaveIncidentInput): Promise<IncidentWithEstimate> {
   const { input, response, confidence, model } = data;
   // 1. INSERT base (sin estimación) para tener el id real
   const { rows } = await query<IncidentRowRaw>(
     `INSERT INTO incidents
-       (user_name, client_name, sap_module, environment, message, response,
+       (tenant_id, user_name, client_name, sap_module, environment, message, response,
         confidence, model, attachments)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
      RETURNING id, user_name, client_name, sap_module, environment, message, response,
                confidence, model, attachments, created_at`,
     [
+      tenantId,
       input.user,
       input.client,
       input.module,
@@ -97,8 +101,8 @@ export async function saveIncident(data: SaveIncidentInput): Promise<IncidentWit
       hasErrorEvidence: input.attachments.length > 0,
     });
     await query(
-      `UPDATE incidents SET estimated_resolution = $1::jsonb WHERE id = $2`,
-      [JSON.stringify(estimatedResolution), rec.id]
+      `UPDATE incidents SET estimated_resolution = $1::jsonb WHERE id = $2 AND tenant_id = $3`,
+      [JSON.stringify(estimatedResolution), rec.id, tenantId]
     );
   } catch (err) {
     // No bloqueamos la creación del incidente si la autoestimación falla.
@@ -152,10 +156,10 @@ interface IncidentRowWithEst extends IncidentRowRaw {
   estimated_resolution?: TicketEstimatedResolution | null;
 }
 
-export async function listIncidents(filters: ListFilters = {}): Promise<IncidentWithEstimate[]> {
+export async function listIncidents(tenantId: string, filters: ListFilters = {}): Promise<IncidentWithEstimate[]> {
   await ensureEstimateSchema(); // asegura columna existe para SELECT
-  const where: string[] = [];
-  const params: unknown[] = [];
+  const where: string[] = ["tenant_id = $1"];
+  const params: unknown[] = [tenantId];
   function add(cond: string, val: unknown) {
     params.push(val);
     where.push(cond.replace("$?", `$${params.length}`));
@@ -174,7 +178,7 @@ export async function listIncidents(filters: ListFilters = {}): Promise<Incident
   const limit = Math.min(Math.max(filters.limit ?? 50, 1), 200);
   params.push(limit);
 
-  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  const whereSql = `WHERE ${where.join(" AND ")}`;
   const { rows } = await query<IncidentRowWithEst>(
     `SELECT ${LIST_SELECT}
        FROM incidents
@@ -204,15 +208,15 @@ export async function listIncidents(filters: ListFilters = {}): Promise<Incident
   return out;
 }
 
-export async function getIncidentById(id: string): Promise<IncidentWithEstimate | null> {
+export async function getIncidentById(tenantId: string, id: string): Promise<IncidentWithEstimate | null> {
   await ensureEstimateSchema();
   // En el detalle SI devolvemos el base64 completo.
   const { rows } = await query<IncidentRowWithEst>(
     `SELECT id, user_name, client_name, sap_module, environment, message, response,
             confidence, model, attachments, estimated_resolution, created_at
        FROM incidents
-       WHERE id = $1`,
-    [id]
+       WHERE id = $1 AND tenant_id = $2`,
+    [id, tenantId]
   );
   const row = rows[0];
   if (!row) return null;

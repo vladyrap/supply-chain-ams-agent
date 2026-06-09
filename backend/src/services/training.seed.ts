@@ -8,9 +8,12 @@ import { logger } from "../utils/logger";
 import * as training from "./training.service";
 
 export async function seedTrainingIfEmpty(): Promise<void> {
+  // MT-2: seed boot sin contexto HTTP, usamos "default". TODO MT-6: per-tenant seed.
+  const tenantId = "default";
   try {
     const { rows } = await query<{ c: string }>(
-      `SELECT count(*)::text AS c FROM kb_training_items`
+      `SELECT count(*)::text AS c FROM kb_training_items WHERE tenant_id = $1`,
+      [tenantId]
     );
     if (Number(rows[0]?.c ?? 0) > 0) {
       logger.debug({ count: rows[0]?.c }, "kb_training_items ya tiene datos, skip seed");
@@ -19,13 +22,13 @@ export async function seedTrainingIfEmpty(): Promise<void> {
   } catch (err) {
     // tabla aún no existe → llamar a getSnapshot fuerza ensureSchema
     logger.debug({ err }, "kb_training_items ausente, ensureSchema antes de seed");
-    await training.getSnapshot();
+    await training.getSnapshot(tenantId);
   }
 
   logger.info("kb_training vacío — sembrando datos demo");
 
   // ----- 8 knowledge items -----
-  const itemsSeed: Array<Parameters<typeof training.createItem>[0]> = [
+  const itemsSeed: Array<Parameters<typeof training.createItem>[1]> = [
     {
       title: "MM · Entrada de mercancía no contabiliza contra OC",
       content:
@@ -109,10 +112,10 @@ export async function seedTrainingIfEmpty(): Promise<void> {
 
   for (const it of itemsSeed) {
     try {
-      const row = await training.createItem(it);
+      const row = await training.createItem(tenantId, it);
       // backfill: si era PUBLISHED, marcar validación completa
       if (it.status === "PUBLISHED" || it.status === "VALIDATED") {
-        await training.updateItem(row.id, {
+        await training.updateItem(tenantId, row.id, {
           validationStage: "FULLY_VALIDATED",
           functionalValidatedBy: "Consultor AMS",
           technicalValidatedBy: "Líder Servicio",
@@ -159,7 +162,7 @@ export async function seedTrainingIfEmpty(): Promise<void> {
     },
   ];
   for (const g of gapsSeed) {
-    try { await training.createGap(g); }
+    try { await training.createGap(tenantId, g); }
     catch (err) { logger.warn({ err }, "training.seed gap fail"); }
   }
 
@@ -196,15 +199,16 @@ export async function seedTrainingIfEmpty(): Promise<void> {
     },
   ];
   for (const v of versionsSeed) {
-    try { await training.createVersion(v); }
+    try { await training.createVersion(tenantId, v); }
     catch (err) { logger.warn({ err }, "training.seed version fail"); }
   }
   // marcar v0.3 como publicada para que el frontend la muestre como activa
   try {
     const { rows } = await query<{ id: string }>(
-      `SELECT id FROM kb_training_versions WHERE version = 'v0.3' ORDER BY created_at DESC LIMIT 1`
+      `SELECT id FROM kb_training_versions WHERE version = 'v0.3' AND tenant_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [tenantId]
     );
-    if (rows[0]) await training.updateVersionStatus(rows[0].id, "PUBLISHED");
+    if (rows[0]) await training.updateVersionStatus(tenantId, rows[0].id, "PUBLISHED");
   } catch (err) {
     logger.warn({ err }, "training.seed publish v0.3 fail");
   }

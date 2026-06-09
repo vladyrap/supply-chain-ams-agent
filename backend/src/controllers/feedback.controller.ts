@@ -19,7 +19,7 @@ async function getUserId(req: FastifyRequest): Promise<string | null> {
   const cookies = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies;
   const token = cookies?.[COOKIE];
   if (!token) return null;
-  const u = await getUserBySession(token);
+  const u = await getUserBySession(req.tenantId, token);
   return u?.id ?? null;
 }
 
@@ -73,7 +73,7 @@ export async function postFeedback(
     if (b.responseId) {
       try {
         const { adjustScoreFromFeedback } = await import("../services/provenance.service");
-        learning = await adjustScoreFromFeedback(b.responseId, b.kind as FeedbackKind);
+        learning = await adjustScoreFromFeedback(req.tenantId, b.responseId, b.kind as FeedbackKind);
       } catch (err) {
         logger.debug({ err }, "adjustScoreFromFeedback fail (continuo)");
       }
@@ -230,7 +230,7 @@ export async function postWizardCommit(
   }
   try {
     const userId = await getUserId(req);
-    const article = await createArticle({
+    const article = await createArticle(req.tenantId, {
       title: b.title.trim().slice(0, 200),
       problem: b.problem.trim(),
       solution: b.solution.trim(),

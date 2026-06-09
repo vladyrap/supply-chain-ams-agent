@@ -1,5 +1,10 @@
 // SAP Inbound: recibe eventos que SAP envía a la plataforma.
 // Cada source crea/relaciona una entidad downstream (incident, ticket, KB).
+//
+// Multi-tenant: los webhooks de SAP no traen credenciales JWT — solo un token
+// inbound en el header X-Inbound-Token. Por eso validateToken devuelve el
+// tenantId asociado al token, y el controller usa ESE tenantId para procesar
+// el evento (NO req.tenantId que en webhooks sin auth cae al DEFAULT_TENANT).
 import crypto from "node:crypto";
 import { query } from "../database/db";
 import { logger } from "../utils/logger";
@@ -17,6 +22,7 @@ const VALID_SOURCES: ReadonlySet<InboundSource> = new Set<InboundSource>([
 
 export interface InboundToken {
   id: string;
+  tenant_id: string;
   name: string;
   token_hash: string;
   sources: string[];
@@ -37,37 +43,54 @@ function generatePlainToken(): string {
   return "sapinb_" + crypto.randomBytes(24).toString("base64url");
 }
 
-export async function createToken(input: { name: string; sources?: string[]; createdBy?: string })
-  : Promise<{ token: string; record: InboundToken }> {
+export async function createToken(
+  tenantId: string,
+  input: { name: string; sources?: string[]; createdBy?: string },
+): Promise<{ token: string; record: InboundToken }> {
   const plain = generatePlainToken();
   const hash = hashToken(plain);
   const sources = input.sources && input.sources.length > 0 ? input.sources : ["*"];
   const { rows } = await query<InboundToken>(
-    `INSERT INTO sap_inbound_tokens (name, token_hash, sources, created_by, active)
-     VALUES ($1, $2, $3, $4, true)
+    `INSERT INTO sap_inbound_tokens (tenant_id, name, token_hash, sources, created_by, active)
+     VALUES ($1, $2, $3, $4, $5, true)
      RETURNING *`,
-    [input.name, hash, sources, input.createdBy ?? null]
+    [tenantId, input.name, hash, sources, input.createdBy ?? null]
   );
   return { token: plain, record: rows[0]! };
 }
 
-export async function listTokens(): Promise<InboundToken[]> {
+export async function listTokens(tenantId: string): Promise<InboundToken[]> {
   const { rows } = await query<InboundToken>(
-    `SELECT * FROM sap_inbound_tokens ORDER BY created_at DESC`
+    `SELECT * FROM sap_inbound_tokens WHERE tenant_id = $1 ORDER BY created_at DESC`,
+    [tenantId],
   );
   return rows;
 }
 
-export async function deleteToken(id: string): Promise<boolean> {
-  const r = await query(`DELETE FROM sap_inbound_tokens WHERE id = $1`, [id]);
+export async function deleteToken(tenantId: string, id: string): Promise<boolean> {
+  const r = await query(
+    `DELETE FROM sap_inbound_tokens WHERE id = $1 AND tenant_id = $2`,
+    [id, tenantId],
+  );
   return r.rowCount > 0;
 }
 
-export async function validateToken(plain: string, source: InboundSource): Promise<{ ok: true; tokenId: string } | { ok: false; reason: string }> {
+/**
+ * Valida un token inbound. Devuelve el tokenId Y el tenantId asociado.
+ * El caller (webhook) usa ese tenantId para procesar el evento, ya que
+ * los webhooks de SAP no llegan con JWT/sesión.
+ */
+export async function validateToken(
+  plain: string,
+  source: InboundSource,
+): Promise<
+  | { ok: true; tokenId: string; tenantId: string }
+  | { ok: false; reason: string }
+> {
   if (!plain) return { ok: false, reason: "missing token" };
   const hash = hashToken(plain);
-  const { rows } = await query<{ id: string; sources: string[]; active: boolean }>(
-    `SELECT id, sources, active FROM sap_inbound_tokens WHERE token_hash = $1`,
+  const { rows } = await query<{ id: string; tenant_id: string; sources: string[]; active: boolean }>(
+    `SELECT id, tenant_id, sources, active FROM sap_inbound_tokens WHERE token_hash = $1`,
     [hash]
   );
   const t = rows[0];
@@ -79,7 +102,7 @@ export async function validateToken(plain: string, source: InboundSource): Promi
   // Update last_used + count (fire-and-forget)
   query(`UPDATE sap_inbound_tokens SET last_used_at = now(), use_count = use_count + 1 WHERE id = $1`, [t.id])
     .catch(() => undefined);
-  return { ok: true, tokenId: t.id };
+  return { ok: true, tokenId: t.id, tenantId: t.tenant_id };
 }
 
 // ============================================================
@@ -99,6 +122,7 @@ export interface InboundEventInput {
 
 interface InboundEventRow {
   id: string;
+  tenant_id: string;
   source: string;
   sap_system: string | null;
   sap_client: string | null;
@@ -115,14 +139,15 @@ interface InboundEventRow {
   processed_at: string | null;
 }
 
-async function insertInboundRow(input: InboundEventInput): Promise<InboundEventRow> {
+async function insertInboundRow(tenantId: string, input: InboundEventInput): Promise<InboundEventRow> {
   const { rows } = await query<InboundEventRow>(
     `INSERT INTO sap_inbound_events
-       (source, sap_system, sap_client, severity, title, summary, payload,
+       (tenant_id, source, sap_system, sap_client, severity, title, summary, payload,
         auth_token_hint, received_from_ip)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10)
      RETURNING *`,
     [
+      tenantId,
       input.source,
       input.sap_system ?? null,
       input.sap_client ?? null,
@@ -138,10 +163,10 @@ async function insertInboundRow(input: InboundEventInput): Promise<InboundEventR
 }
 
 // Procesadores por source: cada uno crea la entidad downstream
-async function processIdoc(ev: InboundEventRow): Promise<{ incidentId?: string; ticketId?: string }> {
+async function processIdoc(tenantId: string, ev: InboundEventRow): Promise<{ incidentId?: string; ticketId?: string }> {
   // IDoc con error → incident + (si es crítico) ticket mesa
   try {
-    const incident = await saveIncident({
+    const incident = await saveIncident(tenantId, {
       input: {
         message: `IDoc ${ev.title}: ${ev.summary ?? ""}`,
         user: "sap-inbound",
@@ -161,11 +186,11 @@ async function processIdoc(ev: InboundEventRow): Promise<{ incidentId?: string; 
   }
 }
 
-async function processShortDump(ev: InboundEventRow): Promise<{ ticketId?: string }> {
+async function processShortDump(tenantId: string, ev: InboundEventRow): Promise<{ ticketId?: string }> {
   // Short dump (ST22) → ticket mesa con prioridad alta
   try {
     const sla = ev.severity === "critical" ? 60 : 240;
-    const ticket = await createTicket({
+    const ticket = await createTicket(tenantId, {
       title: `[ST22] ${ev.title}`,
       summary: ev.summary ?? `Short dump recibido de ${ev.sap_system ?? "SAP"}.`,
       systemAffected: extractModuleFromPayload(ev.payload) ?? "NO_INFORMADO",
@@ -186,12 +211,12 @@ async function processShortDump(ev: InboundEventRow): Promise<{ ticketId?: strin
   }
 }
 
-async function processOssNote(ev: InboundEventRow): Promise<{ kbArticleId?: string }> {
+async function processOssNote(tenantId: string, ev: InboundEventRow): Promise<{ kbArticleId?: string }> {
   // Nueva OSS Note aplicada → KB article draft
   try {
     const data = ev.payload as Record<string, unknown>;
     const noteNum = String(data.note ?? data.note_number ?? ev.title);
-    const article = await createArticle({
+    const article = await createArticle(tenantId, {
       title: `OSS Note ${noteNum}: ${ev.title}`,
       problem: (data.symptom as string) ?? ev.summary ?? "Problema descrito en nota OSS",
       solution: (data.solution as string) ?? `Aplicar la nota OSS ${noteNum}.\n\n${ev.summary ?? ""}`,
@@ -207,9 +232,9 @@ async function processOssNote(ev: InboundEventRow): Promise<{ kbArticleId?: stri
   }
 }
 
-async function processJobFailure(ev: InboundEventRow): Promise<{ ticketId?: string }> {
+async function processJobFailure(tenantId: string, ev: InboundEventRow): Promise<{ ticketId?: string }> {
   try {
-    const ticket = await createTicket({
+    const ticket = await createTicket(tenantId, {
       title: `[SM37] Job falló: ${ev.title}`,
       summary: ev.summary ?? "Job cancelado en SAP.",
       systemAffected: extractModuleFromPayload(ev.payload) ?? "NO_INFORMADO",
@@ -242,21 +267,24 @@ function extractModuleFromPayload(p: unknown): string | null {
 // ============================================================
 // Entry point principal
 // ============================================================
-export async function processInboundEvent(input: InboundEventInput): Promise<{
+export async function processInboundEvent(
+  tenantId: string,
+  input: InboundEventInput,
+): Promise<{
   event: InboundEventRow;
   downstream: { incidentId?: string; ticketId?: string; kbArticleId?: string };
 }> {
   if (!VALID_SOURCES.has(input.source)) {
     throw new Error(`source inválido: ${input.source}`);
   }
-  const ev = await insertInboundRow(input);
+  const ev = await insertInboundRow(tenantId, input);
 
   let downstream: { incidentId?: string; ticketId?: string; kbArticleId?: string } = {};
   try {
-    if (input.source === "idoc")            downstream = await processIdoc(ev);
-    else if (input.source === "short_dump") downstream = await processShortDump(ev);
-    else if (input.source === "oss_note")   downstream = await processOssNote(ev);
-    else if (input.source === "job_failure")downstream = await processJobFailure(ev);
+    if (input.source === "idoc")            downstream = await processIdoc(tenantId, ev);
+    else if (input.source === "short_dump") downstream = await processShortDump(tenantId, ev);
+    else if (input.source === "oss_note")   downstream = await processOssNote(tenantId, ev);
+    else if (input.source === "job_failure")downstream = await processJobFailure(tenantId, ev);
     // transport / generic: solo log, no entidad downstream
   } catch (err) {
     logger.warn({ err, source: input.source }, "sap-inbound: downstream processing fail");
@@ -266,8 +294,8 @@ export async function processInboundEvent(input: InboundEventInput): Promise<{
   await query(
     `UPDATE sap_inbound_events
         SET incident_id = $1, support_ticket_id = $2, kb_article_id = $3, processed_at = now()
-      WHERE id = $4`,
-    [downstream.incidentId ?? null, downstream.ticketId ?? null, downstream.kbArticleId ?? null, ev.id]
+      WHERE id = $4 AND tenant_id = $5`,
+    [downstream.incidentId ?? null, downstream.ticketId ?? null, downstream.kbArticleId ?? null, ev.id, tenantId]
   );
 
   // Emit integration event
@@ -282,15 +310,21 @@ export async function processInboundEvent(input: InboundEventInput): Promise<{
   });
 
   // refresh ev
-  const { rows } = await query<InboundEventRow>(`SELECT * FROM sap_inbound_events WHERE id = $1`, [ev.id]);
+  const { rows } = await query<InboundEventRow>(
+    `SELECT * FROM sap_inbound_events WHERE id = $1 AND tenant_id = $2`,
+    [ev.id, tenantId],
+  );
   return { event: rows[0]!, downstream };
 }
 
-export async function listInboundEvents(filters: { source?: InboundSource; limit?: number } = {}): Promise<InboundEventRow[]> {
-  const conds: string[] = [];
-  const params: unknown[] = [];
+export async function listInboundEvents(
+  tenantId: string,
+  filters: { source?: InboundSource; limit?: number } = {},
+): Promise<InboundEventRow[]> {
+  const conds: string[] = ["tenant_id = $1"];
+  const params: unknown[] = [tenantId];
   if (filters.source) { params.push(filters.source); conds.push(`source = $${params.length}`); }
-  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const where = `WHERE ${conds.join(" AND ")}`;
   const limit = Math.min(filters.limit ?? 100, 200);
   params.push(limit);
   const { rows } = await query<InboundEventRow>(
@@ -302,7 +336,13 @@ export async function listInboundEvents(filters: { source?: InboundSource; limit
   return rows;
 }
 
-export async function getInboundEventById(id: string): Promise<InboundEventRow | null> {
-  const { rows } = await query<InboundEventRow>(`SELECT * FROM sap_inbound_events WHERE id = $1`, [id]);
+export async function getInboundEventById(
+  tenantId: string,
+  id: string,
+): Promise<InboundEventRow | null> {
+  const { rows } = await query<InboundEventRow>(
+    `SELECT * FROM sap_inbound_events WHERE id = $1 AND tenant_id = $2`,
+    [id, tenantId],
+  );
   return rows[0] ?? null;
 }

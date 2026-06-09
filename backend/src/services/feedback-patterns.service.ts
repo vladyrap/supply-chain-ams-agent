@@ -88,8 +88,12 @@ export async function runFeedbackPatternDetection(opts: {
   const daysBack = Math.max(1, Math.min(60, opts.daysBack ?? 14));
   const minClusterSize = Math.max(2, opts.minClusterSize ?? MIN_CLUSTER_SIZE);
 
+  // MT-2: este job no tiene contexto HTTP, usamos "default" tenant. TODO MT-6:
+  // cuando el cron sea per-tenant, recibir tenantId como parámetro.
+  const tenantId = "default";
+
   // ensure schema kb_training_gaps
-  await training.getSnapshot().catch(() => null);
+  await training.getSnapshot(tenantId).catch(() => null);
 
   let negatives: NegativeRow[] = [];
   try {
@@ -186,7 +190,7 @@ export async function runFeedbackPatternDetection(opts: {
     let gapId: string | null = null;
     if (!alreadyExists) {
       try {
-        const gap = await training.createGap({
+        const gap = await training.createGap(tenantId, {
           title: `[sig:fb-cluster:${sig}] Patrón de feedback negativo · ${c.members.length} casos (${sourcesLabel})`,
           description: `Detectado patrón recurrente en feedback negativo de los últimos ${daysBack} días. Ejemplos:\n${sample}`,
           module: "AMS",

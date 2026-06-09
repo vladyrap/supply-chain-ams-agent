@@ -81,12 +81,16 @@ interface ItemRow {
  * Estrategia:
  *   1) Intenta búsqueda semántica con embeddings (kb_training_*_embeddings).
  *   2) Si no hay vectores indexados todavía, cae al match léxico Jaccard.
+ *
+ * MT-2 (multi-tenant): tenantId obligatorio para que la búsqueda semántica
+ * y léxica filtren por tenant. Sin tenantId podríamos inyectar conocimiento
+ * de otro cliente al system prompt.
  */
-export async function buildFewShotBlock(userQuery: string, module?: string): Promise<FewShotResult> {
+export async function buildFewShotBlock(tenantId: string, userQuery: string, module?: string): Promise<FewShotResult> {
   if (!userQuery || userQuery.trim().length < 3) {
     return { block: "", qaIds: [], itemIds: [] };
   }
-  const key = hashKey(userQuery, module);
+  const key = `${tenantId}::${hashKey(userQuery, module)}`;
   const cached = cache.get(key);
   if (cached && cached.expiresAt > Date.now()) {
     return { block: cached.block, qaIds: cached.qaIds, itemIds: cached.itemIds };
@@ -95,7 +99,7 @@ export async function buildFewShotBlock(userQuery: string, module?: string): Pro
   // ---------- Intento semántico ----------
   try {
     const { buildSemanticFewShot } = await import("./training-embeddings.service");
-    const sem = await buildSemanticFewShot(userQuery, module);
+    const sem = await buildSemanticFewShot(tenantId, userQuery, module);
     if (sem.qas.length > 0 || sem.items.length > 0) {
       const lines: string[] = [];
       lines.push("", "---", "# 📚 CONOCIMIENTO CURADO RELEVANTE (entrenamiento humano)", "");
@@ -136,7 +140,7 @@ export async function buildFewShotBlock(userQuery: string, module?: string): Pro
     return { block: "", qaIds: [], itemIds: [] };
   }
 
-  // 1) Q&A aprobadas (join con su item padre para módulo + score)
+  // 1) Q&A aprobadas (join con su item padre para módulo + score) — scoped al tenant
   let qas: QARow[] = [];
   try {
     const { rows } = await query<QARow>(
@@ -145,24 +149,28 @@ export async function buildFewShotBlock(userQuery: string, module?: string): Pro
          FROM kb_training_qa q
          LEFT JOIN kb_training_items i ON i.id = q.knowledge_item_id
         WHERE q.approved = true
+          AND q.tenant_id = $1
           AND (i.status IS NULL OR i.status NOT IN ('ARCHIVED','REJECTED'))
         ORDER BY q.created_at DESC
-        LIMIT 200`
+        LIMIT 200`,
+      [tenantId]
     );
     qas = rows;
   } catch (err) {
     logger.debug({ err }, "few-shot.qas fail (tabla no existe todavía?)");
   }
 
-  // 2) Knowledge items PUBLISHED
+  // 2) Knowledge items PUBLISHED — scoped al tenant
   let items: ItemRow[] = [];
   try {
     const { rows } = await query<ItemRow>(
       `SELECT id, title, summary, module, score, tags
          FROM kb_training_items
         WHERE status = 'PUBLISHED'
+          AND tenant_id = $1
         ORDER BY score DESC
-        LIMIT 100`
+        LIMIT 100`,
+      [tenantId]
     );
     items = rows;
   } catch (err) {

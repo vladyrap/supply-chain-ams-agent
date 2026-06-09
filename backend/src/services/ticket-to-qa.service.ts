@@ -135,8 +135,11 @@ export async function proposeQAsFromTickets(opts: {
   const limit = Math.max(1, Math.min(MAX_LIMIT, opts.limit ?? DEFAULT_LIMIT));
   const daysBack = Math.max(1, Math.min(180, opts.daysBack ?? 30));
 
+  // MT-2: cron sin contexto HTTP, usamos "default". TODO MT-6: parametrizar tenantId.
+  const tenantId = "default";
+
   // Ensure schema (kb_training_*)
-  await training.getSnapshot().catch(() => null);
+  await training.getSnapshot(tenantId).catch(() => null);
 
   // 1. Tickets resueltos sin Q&A asociadas (heurística: ticket sin kb item, o item sin Q&A)
   let tickets: TicketRow[] = [];
@@ -198,7 +201,7 @@ export async function proposeQAsFromTickets(opts: {
     try {
       const mod = t.sap_module || "AMS";
       const proc = PROCESS_BY_MODULE[mod.toUpperCase()] ?? "AMS Genérico";
-      const newItem = await training.createItem({
+      const newItem = await training.createItem(tenantId, {
         title: (proposal.itemTitle || `${mod} · ${t.title}`).slice(0, 200),
         content: `## Origen\nTicket ${t.code} — ${t.title}\n\n${transcript ? "## Transcripción base\n" + transcript.slice(0, 2000) : ""}`,
         summary: (proposal.itemSummary || t.summary || t.title).slice(0, 280),
@@ -214,7 +217,7 @@ export async function proposeQAsFromTickets(opts: {
       report.itemsCreated++;
 
       // Crear Q&A pending (approved=false)
-      await training.createQA(proposal.qas.slice(0, 6).map((q) => ({
+      await training.createQA(tenantId, proposal.qas.slice(0, 6).map((q) => ({
         knowledgeItemId: newItem.id,
         question: q.question?.slice(0, 500) ?? "",
         expectedAnswer: q.expectedAnswer?.slice(0, 2000) ?? "",

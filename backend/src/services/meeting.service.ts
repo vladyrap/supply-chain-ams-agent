@@ -3,6 +3,10 @@ import IORedis from "ioredis";
 import { query } from "../database/db";
 import { logger } from "../utils/logger";
 
+// MT-2 (multi-tenant): meetings ahora se aíslan por tenant_id.
+// El job de la cola lleva tenantId para que el worker pueda hacer
+// updates scoped al mismo tenant que creó la reunión.
+
 const REDIS_URL = process.env.REDIS_URL || "redis://supply-chain-ams-redis:6379";
 
 const connection = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
@@ -40,14 +44,15 @@ export interface CreateMeetingInput {
   userId?: string;
 }
 
-export async function createMeetingAndQueue(input: CreateMeetingInput): Promise<MeetingRecord> {
+export async function createMeetingAndQueue(tenantId: string, input: CreateMeetingInput): Promise<MeetingRecord> {
   const { rows } = await query<MeetingRecord>(
     `INSERT INTO meetings
-       (title, client, status, file_name, mime_type, size_bytes, created_by)
-     VALUES ($1, $2, 'pending', $3, $4, $5, $6)
+       (tenant_id, title, client, status, file_name, mime_type, size_bytes, created_by)
+     VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7)
      RETURNING id, title, client, status, error_message, duration_sec, file_name, mime_type,
                size_bytes, transcript, summary, minute, actions_text, created_at, processed_at`,
     [
+      tenantId,
       input.title,
       input.client ?? null,
       input.fileName,
@@ -60,6 +65,7 @@ export async function createMeetingAndQueue(input: CreateMeetingInput): Promise<
   await meetingQueue.add(
     "process",
     {
+      tenantId,
       meetingId: meeting.id,
       fileName: input.fileName,
       mimeType: input.mimeType,
@@ -78,24 +84,25 @@ const LIST_SELECT = `
   summary, minute, actions_text, created_at, processed_at
 `;
 
-export async function listMeetings(): Promise<MeetingRecord[]> {
+export async function listMeetings(tenantId: string): Promise<MeetingRecord[]> {
   const { rows } = await query<MeetingRecord>(
-    `SELECT ${LIST_SELECT} FROM meetings ORDER BY created_at DESC LIMIT 100`
+    `SELECT ${LIST_SELECT} FROM meetings WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 100`,
+    [tenantId]
   );
   return rows;
 }
 
-export async function getMeetingById(id: string): Promise<MeetingRecord | null> {
+export async function getMeetingById(tenantId: string, id: string): Promise<MeetingRecord | null> {
   const { rows } = await query<MeetingRecord>(
     `SELECT id, title, client, status, error_message, duration_sec, file_name, mime_type, size_bytes,
             transcript, summary, minute, actions_text, created_at, processed_at
-       FROM meetings WHERE id = $1`,
-    [id]
+       FROM meetings WHERE id = $1 AND tenant_id = $2`,
+    [id, tenantId]
   );
   return rows[0] ?? null;
 }
 
-export async function deleteMeeting(id: string): Promise<boolean> {
-  const res = await query(`DELETE FROM meetings WHERE id=$1`, [id]);
+export async function deleteMeeting(tenantId: string, id: string): Promise<boolean> {
+  const res = await query(`DELETE FROM meetings WHERE id = $1 AND tenant_id = $2`, [id, tenantId]);
   return res.rowCount > 0;
 }

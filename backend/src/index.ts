@@ -13,7 +13,8 @@ async function main() {
   const app = buildServer();
 
   // Crear admin de bootstrap si está configurado en env vars y no hay usuarios.
-  await bootstrapAdminIfNeeded().catch((err) => {
+  // TODO MT-6: scope per-tenant cron — actualmente usa 'default' implícito.
+  await bootstrapAdminIfNeeded("default").catch((err) => {
     logger.warn({ err }, "bootstrap admin falló");
   });
 

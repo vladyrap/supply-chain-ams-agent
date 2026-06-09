@@ -28,7 +28,7 @@ async function getUserId(req: FastifyRequest): Promise<string | null> {
   const cookies = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies;
   const token = cookies?.[COOKIE];
   if (!token) return null;
-  const u = await getUserBySession(token);
+  const u = await getUserBySession(req.tenantId, token);
   return u?.id ?? null;
 }
 
@@ -51,7 +51,7 @@ export async function postStartConversation(
   try {
     const b = req.body || {};
     const userId = await getUserId(req);
-    const conv = await createConversation({
+    const conv = await createConversation(req.tenantId, {
       channel: (b.channel ?? "chat") as SupportChannel,
       user_name: b.user_name,
       user_email: b.user_email,
@@ -59,7 +59,7 @@ export async function postStartConversation(
       client: b.client,
       created_by: userId ?? undefined,
     });
-    await recordSupportAudit({
+    await recordSupportAudit(req.tenantId, {
       conversationId: conv.id,
       action: "CONV_STARTED",
       actor: userId ?? "anonymous",
@@ -67,11 +67,11 @@ export async function postStartConversation(
     });
 
     if (b.initial_message && b.initial_message.trim()) {
-      const result = await handleFirstMessage(conv.id, b.initial_message.trim());
+      const result = await handleFirstMessage(req.tenantId, conv.id, b.initial_message.trim());
       return reply.send({ success: true, conversation: result.conversation, firstResponse: result });
     }
     // Sin mensaje inicial: agregamos saludo del bot
-    await appendMessage(conv.id, "system", welcomeText(), { greeting: true });
+    await appendMessage(req.tenantId, conv.id, "system", welcomeText(), { greeting: true });
     return reply.send({ success: true, conversation: conv, welcome: welcomeText() });
   } catch (err) {
     logger.error({ err }, "support.start fail");
@@ -87,7 +87,7 @@ export async function postSendMessage(
   const text = (req.body?.text ?? "").trim();
   if (!text) return reply.code(400).send({ success: false, error: "text es obligatorio" });
   try {
-    const result = await handleUserMessage(id, text);
+    const result = await handleUserMessage(req.tenantId, id, text);
     return reply.send({ success: true, ...result });
   } catch (err) {
     logger.error({ err }, "support.message fail");
@@ -102,7 +102,7 @@ export async function getConversations(
   try {
     const status = (req.query.status as SupportStatus) || undefined;
     const channel = (req.query.channel as SupportChannel) || undefined;
-    const data = await listConversations({ status, channel });
+    const data = await listConversations(req.tenantId, { status, channel });
     return reply.send({ success: true, count: data.length, conversations: data });
   } catch (err) {
     logger.error({ err }, "support.list convs fail");
@@ -115,9 +115,9 @@ export async function getConversationDetail(
   reply: FastifyReply
 ) {
   try {
-    const conv = await getConversationById(req.params.id);
+    const conv = await getConversationById(req.tenantId, req.params.id);
     if (!conv) return reply.code(404).send({ success: false, error: "no encontrada" });
-    const messages = await listMessages(req.params.id);
+    const messages = await listMessages(req.tenantId, req.params.id);
     return reply.send({ success: true, conversation: conv, messages });
   } catch (err) {
     logger.error({ err }, "support.conv detail fail");
@@ -135,10 +135,10 @@ export async function postManualEscalate(
     const userId = await getUserId(req);
     let actorLabel: string | undefined;
     if (userId) {
-      const u = await getUserBySession((req as FastifyRequest & { cookies?: Record<string, string> }).cookies?.[COOKIE] ?? "");
+      const u = await getUserBySession(req.tenantId, (req as FastifyRequest & { cookies?: Record<string, string> }).cookies?.[COOKIE] ?? "");
       actorLabel = u ? `${u.name} (${u.email}, ${u.role})` : userId;
     }
-    const ticket = await manualEscalate(id, { reason: reason || undefined, actor: actorLabel });
+    const ticket = await manualEscalate(req.tenantId, id, { reason: reason || undefined, actor: actorLabel });
     return reply.send({ success: true, ticket });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error escalando manualmente";
@@ -152,11 +152,11 @@ export async function postCloseConversation(
   reply: FastifyReply
 ) {
   try {
-    await updateConversation(req.params.id, {
+    await updateConversation(req.tenantId, req.params.id, {
       status: req.body?.resolved ? "resolved" : "closed",
       closed_at: new Date().toISOString(),
     });
-    await recordSupportAudit({
+    await recordSupportAudit(req.tenantId, {
       conversationId: req.params.id,
       action: "CONV_CLOSED",
       actor: (await getUserId(req)) ?? "system",
@@ -177,7 +177,7 @@ export async function getTicketsRoute(
   reply: FastifyReply
 ) {
   try {
-    const data = await listTickets({
+    const data = await listTickets(req.tenantId, {
       status: req.query.status,
       priority: req.query.priority,
       assignedTo: req.query.assignedTo,
@@ -195,8 +195,8 @@ export async function getTicketDetail(
 ) {
   try {
     const t = req.params.id.startsWith("MESA-")
-      ? await getTicketByCode(req.params.id)
-      : await getTicketById(req.params.id);
+      ? await getTicketByCode(req.tenantId, req.params.id)
+      : await getTicketById(req.tenantId, req.params.id);
     if (!t) return reply.code(404).send({ success: false, error: "no encontrado" });
     return reply.send({ success: true, ticket: t });
   } catch (err) {
@@ -213,9 +213,9 @@ export async function postAssignTicket(
     const me = await getUserId(req);
     const target = req.body?.userId || me;
     if (!target) return reply.code(401).send({ success: false, error: "no_session" });
-    const t = await assignTicket(req.params.id, target);
+    const t = await assignTicket(req.tenantId, req.params.id, target);
     if (!t) return reply.code(404).send({ success: false, error: "no encontrado" });
-    await recordSupportAudit({
+    await recordSupportAudit(req.tenantId, {
       ticketId: t.id,
       action: "TICKET_ASSIGNED",
       actor: me ?? "system",
@@ -239,12 +239,12 @@ export async function postResolveTicket(
     const me = await getUserId(req);
     const resolution = (req.body?.resolution || "").trim();
     if (!resolution) return reply.code(400).send({ success: false, error: "resolution requerida" });
-    const t = await resolveTicket(req.params.id, resolution);
+    const t = await resolveTicket(req.tenantId, req.params.id, resolution);
     if (!t) return reply.code(404).send({ success: false, error: "no encontrado" });
 
     let kbArticle = null;
     if (req.body?.create_kb_article) {
-      kbArticle = await createArticle({
+      kbArticle = await createArticle(req.tenantId, {
         title: t.title,
         problem: t.summary,
         solution: resolution,
@@ -254,8 +254,8 @@ export async function postResolveTicket(
         source_ticket_id: t.id,
         created_by: me ?? undefined,
       });
-      await linkKbArticle(t.id, kbArticle.id);
-      await recordSupportAudit({
+      await linkKbArticle(req.tenantId, t.id, kbArticle.id);
+      await recordSupportAudit(req.tenantId, {
         ticketId: t.id,
         action: "KB_ARTICLE_CREATED",
         actor: me ?? "system",
@@ -263,7 +263,7 @@ export async function postResolveTicket(
       });
     }
 
-    await recordSupportAudit({
+    await recordSupportAudit(req.tenantId, {
       ticketId: t.id,
       action: "TICKET_RESOLVED",
       actor: me ?? "system",
@@ -271,7 +271,7 @@ export async function postResolveTicket(
 
     // Si la conversación sigue abierta, marcarla como resuelta
     if (t.conversation_id) {
-      await updateConversation(t.conversation_id, {
+      await updateConversation(req.tenantId, t.conversation_id, {
         status: "resolved",
         closed_at: new Date().toISOString(),
       });
@@ -312,9 +312,9 @@ export async function patchTicketStatus(
   if (!valid.includes(status)) return reply.code(400).send({ success: false, error: "status inválido" });
   try {
     const me = await getUserId(req);
-    const t = await setTicketStatus(req.params.id, status);
+    const t = await setTicketStatus(req.tenantId, req.params.id, status);
     if (!t) return reply.code(404).send({ success: false, error: "no encontrado" });
-    await recordSupportAudit({
+    await recordSupportAudit(req.tenantId, {
       ticketId: t.id,
       action: `TICKET_STATUS_${status.toUpperCase()}`,
       actor: me ?? "system",
@@ -332,9 +332,9 @@ export async function postCloseTicket(
 ) {
   try {
     const me = await getUserId(req);
-    const t = await closeTicket(req.params.id);
+    const t = await closeTicket(req.tenantId, req.params.id);
     if (!t) return reply.code(404).send({ success: false, error: "no encontrado" });
-    await recordSupportAudit({
+    await recordSupportAudit(req.tenantId, {
       ticketId: t.id,
       action: "TICKET_CLOSED",
       actor: me ?? "system",
@@ -359,7 +359,7 @@ export async function getKbArticles(
   reply: FastifyReply
 ) {
   try {
-    const data = await listArticles({
+    const data = await listArticles(req.tenantId, {
       status: req.query.status,
       system: req.query.system,
       category: req.query.category,
@@ -376,7 +376,7 @@ export async function getKbArticleDetail(
   reply: FastifyReply
 ) {
   try {
-    const a = await getArticleById(req.params.id);
+    const a = await getArticleById(req.tenantId, req.params.id);
     if (!a) return reply.code(404).send({ success: false, error: "no encontrado" });
     return reply.send({ success: true, article: a });
   } catch (err) {
@@ -398,7 +398,7 @@ export async function postCreateKb(
       return reply.code(400).send({ success: false, error: "title, problem y solution son obligatorios" });
     }
     const me = await getUserId(req);
-    const article = await createArticle({
+    const article = await createArticle(req.tenantId, {
       title: b.title,
       problem: b.problem,
       solution: b.solution,
@@ -422,9 +422,9 @@ export async function postApproveKb(
   try {
     const me = await getUserId(req);
     if (!me) return reply.code(401).send({ success: false, error: "no_session" });
-    const a = await approveArticle(req.params.id, me);
+    const a = await approveArticle(req.tenantId, req.params.id, me);
     if (!a) return reply.code(404).send({ success: false, error: "no encontrado" });
-    await recordSupportAudit({
+    await recordSupportAudit(req.tenantId, {
       action: "KB_APPROVED",
       actor: me,
       details: { articleId: a.id },
@@ -446,7 +446,7 @@ export async function postArchiveKb(
   reply: FastifyReply
 ) {
   try {
-    const a = await archiveArticle(req.params.id);
+    const a = await archiveArticle(req.tenantId, req.params.id);
     if (!a) return reply.code(404).send({ success: false, error: "no encontrado" });
     return reply.send({ success: true, article: a });
   } catch (err) {
@@ -460,7 +460,7 @@ export async function deleteKb(
   reply: FastifyReply
 ) {
   try {
-    const ok = await deleteArticle(req.params.id);
+    const ok = await deleteArticle(req.tenantId, req.params.id);
     if (!ok) return reply.code(404).send({ success: false, error: "no encontrado" });
     return reply.send({ success: true });
   } catch (err) {
@@ -474,7 +474,7 @@ export async function postKbHelpful(
   reply: FastifyReply
 ) {
   try {
-    await markHelpful(req.params.id);
+    await markHelpful(req.tenantId, req.params.id);
     return reply.send({ success: true });
   } catch (err) {
     return reply.code(500).send({ success: false, error: "Error" });
@@ -484,17 +484,18 @@ export async function postKbHelpful(
 // =====================================================
 // Métricas
 // =====================================================
-export async function getMetrics(_req: FastifyRequest, reply: FastifyReply) {
+export async function getMetrics(req: FastifyRequest, reply: FastifyReply) {
   try {
+    const t = req.tenantId;
     const [convTotal, convByStatus, convByChannel, aiResolvedRate, tktByStatus, tktByPriority, slaBreaches, kbStats] = await Promise.all([
-      query<{ c: string }>("SELECT count(*)::text AS c FROM support_conversations"),
-      query<{ status: string; c: string }>("SELECT status, count(*)::text AS c FROM support_conversations GROUP BY status"),
-      query<{ channel: string; c: string }>("SELECT channel, count(*)::text AS c FROM support_conversations GROUP BY channel"),
-      query<{ c: string; r: string }>("SELECT count(*)::text AS c, sum(CASE WHEN ai_resolved THEN 1 ELSE 0 END)::text AS r FROM support_conversations WHERE status IN ('resolved','closed')"),
-      query<{ status: string; c: string }>("SELECT status, count(*)::text AS c FROM support_tickets GROUP BY status"),
-      query<{ priority: string; c: string }>("SELECT priority, count(*)::text AS c FROM support_tickets GROUP BY priority"),
-      query<{ c: string }>("SELECT count(*)::text AS c FROM support_tickets WHERE sla_due_at IS NOT NULL AND sla_due_at < now() AND status NOT IN ('resolved','closed')"),
-      query<{ status: string; c: string }>("SELECT status, count(*)::text AS c FROM kb_articles GROUP BY status"),
+      query<{ c: string }>("SELECT count(*)::text AS c FROM support_conversations WHERE tenant_id = $1", [t]),
+      query<{ status: string; c: string }>("SELECT status, count(*)::text AS c FROM support_conversations WHERE tenant_id = $1 GROUP BY status", [t]),
+      query<{ channel: string; c: string }>("SELECT channel, count(*)::text AS c FROM support_conversations WHERE tenant_id = $1 GROUP BY channel", [t]),
+      query<{ c: string; r: string }>("SELECT count(*)::text AS c, sum(CASE WHEN ai_resolved THEN 1 ELSE 0 END)::text AS r FROM support_conversations WHERE tenant_id = $1 AND status IN ('resolved','closed')", [t]),
+      query<{ status: string; c: string }>("SELECT status, count(*)::text AS c FROM support_tickets WHERE tenant_id = $1 GROUP BY status", [t]),
+      query<{ priority: string; c: string }>("SELECT priority, count(*)::text AS c FROM support_tickets WHERE tenant_id = $1 GROUP BY priority", [t]),
+      query<{ c: string }>("SELECT count(*)::text AS c FROM support_tickets WHERE tenant_id = $1 AND sla_due_at IS NOT NULL AND sla_due_at < now() AND status NOT IN ('resolved','closed')", [t]),
+      query<{ status: string; c: string }>("SELECT status, count(*)::text AS c FROM kb_articles WHERE tenant_id = $1 GROUP BY status", [t]),
     ]);
     const totalClosed = Number(aiResolvedRate.rows[0]?.c ?? 0);
     const resolved   = Number(aiResolvedRate.rows[0]?.r ?? 0);

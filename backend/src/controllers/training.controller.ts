@@ -30,9 +30,9 @@ const UUID_RX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // ============================================================
 // SNAPSHOT (hidratacion inicial del frontend)
 // ============================================================
-export async function getSnapshot(_req: FastifyRequest, reply: FastifyReply) {
+export async function getSnapshot(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const snap = await training.getSnapshot();
+    const snap = await training.getSnapshot(req.tenantId);
     return reply.send({ success: true, ...snap });
   } catch (err) {
     logger.error({ err }, "training.snapshot fail");
@@ -54,7 +54,7 @@ export async function listItems(
 ) {
   try {
     const q = req.query || {};
-    const items = await training.listItems({
+    const items = await training.listItems(req.tenantId, {
       status: q.status as KnowledgeStatus | undefined,
       module: q.module,
       type: q.type as KnowledgeType | undefined,
@@ -85,7 +85,7 @@ export async function createItem(
     return reply.code(400).send({ success: false, error: "title, content, module, process, type son obligatorios" });
   }
   try {
-    const row = await training.createItem({
+    const row = await training.createItem(req.tenantId, {
       title: b.title.trim(),
       content: b.content,
       summary: (b.summary ?? b.content).slice(0, 500),
@@ -126,7 +126,7 @@ export async function updateItem(
   if (!UUID_RX.test(id)) return reply.code(400).send({ success: false, error: "ID inválido" });
   try {
     const b = req.body || {};
-    const row = await training.updateItem(id, {
+    const row = await training.updateItem(req.tenantId, id, {
       ...b,
       type: b.type as KnowledgeType | undefined,
       priority: b.priority as Priority | undefined,
@@ -148,7 +148,7 @@ export async function deleteItem(
   const { id } = req.params;
   if (!UUID_RX.test(id)) return reply.code(400).send({ success: false, error: "ID inválido" });
   try {
-    const ok = await training.deleteItem(id);
+    const ok = await training.deleteItem(req.tenantId, id);
     if (!ok) return reply.code(404).send({ success: false, error: "Item no encontrado" });
     return reply.send({ success: true });
   } catch (err) {
@@ -175,7 +175,7 @@ export async function createQA(
     return reply.code(400).send({ success: false, error: "items vacío o invalido" });
   }
   try {
-    const created = await training.createQA(items);
+    const created = await training.createQA(req.tenantId, items);
     return reply.send({ success: true, qa: created });
   } catch (err) {
     logger.error({ err }, "training.createQA fail");
@@ -190,7 +190,7 @@ export async function updateQA(
   const { id } = req.params;
   if (!UUID_RX.test(id)) return reply.code(400).send({ success: false, error: "ID inválido" });
   try {
-    const row = await training.updateQA(id, req.body || {});
+    const row = await training.updateQA(req.tenantId, id, req.body || {});
     if (!row) return reply.code(404).send({ success: false, error: "Q&A no encontrada" });
     return reply.send({ success: true, qa: row });
   } catch (err) {
@@ -206,7 +206,7 @@ export async function deleteQA(
   const { id } = req.params;
   if (!UUID_RX.test(id)) return reply.code(400).send({ success: false, error: "ID inválido" });
   try {
-    const ok = await training.deleteQA(id);
+    const ok = await training.deleteQA(req.tenantId, id);
     if (!ok) return reply.code(404).send({ success: false, error: "Q&A no encontrada" });
     return reply.send({ success: true });
   } catch (err) {
@@ -231,7 +231,7 @@ export async function createVersion(
   const b = req.body || {};
   if (!b.version?.trim()) return reply.code(400).send({ success: false, error: "version es obligatorio" });
   try {
-    const row = await training.createVersion({
+    const row = await training.createVersion(req.tenantId, {
       version: b.version,
       description: b.description ?? "",
       createdBy: b.createdBy ?? "sistema",
@@ -258,7 +258,7 @@ export async function setVersionStatus(
     return reply.code(400).send({ success: false, error: "status inválido" });
   }
   try {
-    const row = await training.updateVersionStatus(id, s);
+    const row = await training.updateVersionStatus(req.tenantId, id, s);
     if (!row) return reply.code(404).send({ success: false, error: "Versión no encontrada" });
     return reply.send({ success: true, version: row });
   } catch (err) {
@@ -284,7 +284,7 @@ export async function createGap(
     return reply.code(400).send({ success: false, error: "title y suggestedAction son obligatorios" });
   }
   try {
-    const row = await training.createGap({
+    const row = await training.createGap(req.tenantId, {
       title: b.title,
       description: b.description ?? "",
       module: b.module ?? "AMS",
@@ -308,7 +308,7 @@ export async function updateGap(
   if (!UUID_RX.test(id)) return reply.code(400).send({ success: false, error: "ID inválido" });
   try {
     const b = req.body || {};
-    const row = await training.updateGap(id, {
+    const row = await training.updateGap(req.tenantId, id, {
       ...b,
       priority: b.priority as Priority | undefined,
       status: b.status as GapStatus | undefined,
@@ -328,7 +328,7 @@ export async function deleteGap(
   const { id } = req.params;
   if (!UUID_RX.test(id)) return reply.code(400).send({ success: false, error: "ID inválido" });
   try {
-    const ok = await training.deleteGap(id);
+    const ok = await training.deleteGap(req.tenantId, id);
     if (!ok) return reply.code(404).send({ success: false, error: "Brecha no encontrada" });
     return reply.send({ success: true });
   } catch (err) {
@@ -340,9 +340,9 @@ export async function deleteGap(
 // ============================================================
 // SETTINGS
 // ============================================================
-export async function getSettings(_req: FastifyRequest, reply: FastifyReply) {
+export async function getSettings(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const s = await training.getSettings();
+    const s = await training.getSettings(req.tenantId);
     return reply.send({ success: true, settings: s });
   } catch (err) {
     logger.error({ err }, "training.getSettings fail");
@@ -366,7 +366,7 @@ export async function updateSettings(
 ) {
   try {
     const b = req.body || {};
-    const s = await training.updateSettings({
+    const s = await training.updateSettings(req.tenantId, {
       ...b,
       mainLanguage: b.mainLanguage as "es" | "en" | undefined,
       responseFormat: b.responseFormat as "concise" | "structured" | "narrative" | undefined,
@@ -630,7 +630,7 @@ export async function postBackfillEmbeddings(
   reply: FastifyReply
 ) {
   try {
-    const report = await backfillTrainingEmbeddings({ limit: req.body?.limit });
+    const report = await backfillTrainingEmbeddings(req.tenantId, { limit: req.body?.limit });
     return reply.send({ success: true, report });
   } catch (err) {
     logger.error({ err }, "embeddings.backfill fail");
@@ -685,7 +685,7 @@ export async function getReasoningTraceRoute(
 ) {
   const { id } = req.params;
   try {
-    const trace = await getReasoningTrace(id);
+    const trace = await getReasoningTrace(req.tenantId, id);
     if (!trace) return reply.code(404).send({ success: false, error: "Trace no encontrado" });
     return reply.send({ success: true, trace });
   } catch (err) {

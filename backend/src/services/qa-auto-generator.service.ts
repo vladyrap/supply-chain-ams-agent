@@ -63,18 +63,21 @@ function buildQasForItem(item: ItemRow): { question: string; expectedAnswer: str
 }
 
 export async function autoGenerateQasForItems(opts: { limit?: number } = {}): Promise<AutoQaReport> {
-  await training.getSnapshot().catch(() => null);
+  // MT-2: cron sin contexto HTTP, usamos "default". TODO MT-6: parametrizar tenantId.
+  const tenantId = "default";
+  await training.getSnapshot(tenantId).catch(() => null);
   const limit = Math.max(1, Math.min(200, opts.limit ?? 100));
 
-  // Items PUBLISHED/VALIDATED que NO tengan Q&A asociadas
+  // Items PUBLISHED/VALIDATED que NO tengan Q&A asociadas (scoped al tenant)
   const { rows: items } = await query<ItemRow>(
     `SELECT i.id, i.title, i.summary, i.content, i.module, i.tags, i.type
        FROM kb_training_items i
       WHERE i.status IN ('PUBLISHED','VALIDATED')
-        AND NOT EXISTS (SELECT 1 FROM kb_training_qa q WHERE q.knowledge_item_id = i.id)
+        AND i.tenant_id = $2
+        AND NOT EXISTS (SELECT 1 FROM kb_training_qa q WHERE q.knowledge_item_id = i.id AND q.tenant_id = $2)
       ORDER BY i.updated_at DESC
       LIMIT $1`,
-    [limit]
+    [limit, tenantId]
   );
 
   const report: AutoQaReport = {
@@ -93,7 +96,7 @@ export async function autoGenerateQasForItems(opts: { limit?: number } = {}): Pr
       continue;
     }
     try {
-      const created = await training.createQA(qas.map((q) => ({
+      const created = await training.createQA(tenantId, qas.map((q) => ({
         knowledgeItemId: item.id,
         question: q.question,
         expectedAnswer: q.expectedAnswer,
@@ -101,7 +104,7 @@ export async function autoGenerateQasForItems(opts: { limit?: number } = {}): Pr
       report.qasCreated += created.length;
       // Aprobar todas
       for (const qa of created) {
-        await training.updateQA(qa.id, { approved: true });
+        await training.updateQA(tenantId, qa.id, { approved: true });
         report.qasApproved++;
       }
       const cur = moduleAcc.get(item.module) ?? { items: 0, qas: 0 };

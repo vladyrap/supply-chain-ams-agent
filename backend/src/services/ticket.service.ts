@@ -223,65 +223,68 @@ const MOCK_TICKETS: Ticket[] = [
 // ============================================================
 
 let ticketsDemoSchemaReady = false;
-let mocksSeedRan = false;
-let ticketCounterCache: number | null = null;
+const mocksSeedRanForTenant = new Set<string>();
+const ticketCounterCacheByTenant = new Map<string, number>();
 
-async function ensureTicketsDemoSchema(): Promise<void> {
-  if (ticketsDemoSchemaReady) return;
-  try {
-    await query(`
-      CREATE TABLE IF NOT EXISTS tickets_demo (
-        key                   TEXT PRIMARY KEY,
-        title                 TEXT NOT NULL,
-        description           TEXT NOT NULL,
-        status                TEXT NOT NULL DEFAULT 'Open',
-        priority              TEXT NOT NULL DEFAULT 'Medium',
-        reporter              TEXT,
-        assignee              TEXT,
-        sap_module            TEXT,
-        environment           TEXT,
-        estimated_resolution  JSONB,
-        created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
-        updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
-      );
-    `);
-    await query(`CREATE INDEX IF NOT EXISTS idx_tickets_demo_created ON tickets_demo (created_at DESC);`);
-    // Migración aditiva: columna nueva visual_evidence_notes para tickets ya existentes.
-    await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS visual_evidence_notes JSONB;`);
-    // AIE v0.10 — Auto Intelligence Enrichment columns
-    await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence JSONB;`);
-    await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence_status TEXT NOT NULL DEFAULT 'pending_enrichment';`);
-    await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence_input_hash TEXT;`);
-    await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence_updated_at TIMESTAMPTZ;`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_tickets_intel_status ON tickets_demo (intelligence_status);`);
-    // TCC v0.12 — versionamiento histórico del análisis (audit + comparativa)
-    await query(`
-      CREATE TABLE IF NOT EXISTS ticket_intelligence_history (
-        id                BIGSERIAL PRIMARY KEY,
-        ticket_key        TEXT NOT NULL,
-        version           INT NOT NULL,
-        intelligence      JSONB NOT NULL,
-        input_hash        TEXT,
-        snapshot_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-        snapshot_reason   TEXT
-      );
-    `);
-    await query(`CREATE INDEX IF NOT EXISTS idx_tih_ticket_key ON ticket_intelligence_history (ticket_key, snapshot_at DESC);`);
-    await query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_tih_ticket_version ON ticket_intelligence_history (ticket_key, version);`);
-    ticketsDemoSchemaReady = true;
-    await seedMockTicketsIfMissing();
-  } catch (err) {
-    logger.warn({ err }, "ensure tickets_demo schema failed");
+async function ensureTicketsDemoSchema(tenantId: string): Promise<void> {
+  if (!ticketsDemoSchemaReady) {
+    try {
+      await query(`
+        CREATE TABLE IF NOT EXISTS tickets_demo (
+          key                   TEXT PRIMARY KEY,
+          title                 TEXT NOT NULL,
+          description           TEXT NOT NULL,
+          status                TEXT NOT NULL DEFAULT 'Open',
+          priority              TEXT NOT NULL DEFAULT 'Medium',
+          reporter              TEXT,
+          assignee              TEXT,
+          sap_module            TEXT,
+          environment           TEXT,
+          estimated_resolution  JSONB,
+          created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+      `);
+      await query(`CREATE INDEX IF NOT EXISTS idx_tickets_demo_created ON tickets_demo (created_at DESC);`);
+      // Migración aditiva: columna nueva visual_evidence_notes para tickets ya existentes.
+      await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS visual_evidence_notes JSONB;`);
+      // AIE v0.10 — Auto Intelligence Enrichment columns
+      await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence JSONB;`);
+      await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence_status TEXT NOT NULL DEFAULT 'pending_enrichment';`);
+      await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence_input_hash TEXT;`);
+      await query(`ALTER TABLE tickets_demo ADD COLUMN IF NOT EXISTS intelligence_updated_at TIMESTAMPTZ;`);
+      await query(`CREATE INDEX IF NOT EXISTS idx_tickets_intel_status ON tickets_demo (intelligence_status);`);
+      // TCC v0.12 — versionamiento histórico del análisis (audit + comparativa)
+      await query(`
+        CREATE TABLE IF NOT EXISTS ticket_intelligence_history (
+          id                BIGSERIAL PRIMARY KEY,
+          ticket_key        TEXT NOT NULL,
+          version           INT NOT NULL,
+          intelligence      JSONB NOT NULL,
+          input_hash        TEXT,
+          snapshot_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+          snapshot_reason   TEXT
+        );
+      `);
+      await query(`CREATE INDEX IF NOT EXISTS idx_tih_ticket_key ON ticket_intelligence_history (ticket_key, snapshot_at DESC);`);
+      await query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_tih_ticket_version ON ticket_intelligence_history (ticket_key, version);`);
+      ticketsDemoSchemaReady = true;
+    } catch (err) {
+      logger.warn({ err }, "ensure tickets_demo schema failed");
+    }
   }
+  await seedMockTicketsIfMissing(tenantId);
 }
 
 /**
  * Inserta los mocks demo (AMS-101..105) en tickets_demo si no existen.
  * ON CONFLICT DO NOTHING — idempotente. Cada mock recibe su autoestimación
  * al insertarse para que tengan banda horas/días desde el primer GET.
+ *
+ * Se seedea POR TENANT (cada tenant nuevo obtiene su set de mocks).
  */
-async function seedMockTicketsIfMissing(): Promise<void> {
-  if (mocksSeedRan) return;
+async function seedMockTicketsIfMissing(tenantId: string): Promise<void> {
+  if (mocksSeedRanForTenant.has(tenantId)) return;
   try {
     for (const m of MOCK_TICKETS) {
       const env = (m.environment || "NO_INFORMADO").toUpperCase() as EnvironmentLevel;
@@ -299,16 +302,16 @@ async function seedMockTicketsIfMissing(): Promise<void> {
       });
       await query(
         `INSERT INTO tickets_demo
-           (key, title, description, status, priority, reporter, assignee,
+           (tenant_id, key, title, description, status, priority, reporter, assignee,
             sap_module, environment, estimated_resolution, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12)
-         ON CONFLICT (key) DO NOTHING`,
-        [m.key, m.title, m.description, m.status, m.priority,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13)
+         ON CONFLICT (tenant_id, key) DO NOTHING`,
+        [tenantId, m.key, m.title, m.description, m.status, m.priority,
          m.reporter, m.assignee, m.sapModule ?? null, m.environment ?? null,
          JSON.stringify(estimate), m.created, m.updated]
       );
     }
-    mocksSeedRan = true;
+    mocksSeedRanForTenant.add(tenantId);
   } catch (err) {
     logger.warn({ err }, "seed mock tickets failed");
   }
@@ -319,10 +322,10 @@ async function seedMockTicketsIfMissing(): Promise<void> {
  * Sirve para que las ediciones de estimación (recalc/ajuste manual) tengan
  * dónde persistirse aunque la fuente de verdad sea Jira. Idempotente.
  */
-async function ensureTicketMirror(key: string): Promise<Ticket | null> {
-  await ensureTicketsDemoSchema();
+async function ensureTicketMirror(tenantId: string, key: string): Promise<Ticket | null> {
+  await ensureTicketsDemoSchema(tenantId);
   // 1. Ya está en DB → devolverlo
-  const existing = await getUserTicketByKey(key);
+  const existing = await getUserTicketByKey(tenantId, key);
   if (existing) return existing;
   // 2. Buscar en Jira (los mocks ya están en DB tras el seed)
   const env = getJiraEnv();
@@ -352,15 +355,15 @@ async function ensureTicketMirror(key: string): Promise<Ticket | null> {
   });
   await query(
     `INSERT INTO tickets_demo
-       (key, title, description, status, priority, reporter, assignee,
+       (tenant_id, key, title, description, status, priority, reporter, assignee,
         sap_module, environment, estimated_resolution, created_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12)
-     ON CONFLICT (key) DO NOTHING`,
-    [source.key, source.title, source.description, source.status, source.priority,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13)
+     ON CONFLICT (tenant_id, key) DO NOTHING`,
+    [tenantId, source.key, source.title, source.description, source.status, source.priority,
      source.reporter, source.assignee, source.sapModule ?? null, source.environment ?? null,
      JSON.stringify(estimate), source.created, source.updated]
   );
-  return getUserTicketByKey(key);
+  return getUserTicketByKey(tenantId, key);
 }
 
 interface TicketRow {
@@ -436,9 +439,9 @@ export interface UpsertIntelligenceResult {
  * Nunca falla si la tabla no existe — devuelve null y deja seguir.
  */
 export async function upsertTicketIntelligence(
-  key: string, input: UpsertIntelligenceInput,
+  tenantId: string, key: string, input: UpsertIntelligenceInput,
 ): Promise<UpsertIntelligenceResult> {
-  await ensureTicketsDemoSchema();
+  await ensureTicketsDemoSchema(tenantId);
   const intel = input.intelligence;
   if (!intel) return { ticket: null };
 
@@ -452,8 +455,8 @@ export async function upsertTicketIntelligence(
       intelligence: TicketIntelligence | null;
     }>(
       `SELECT intelligence_status, intelligence_input_hash, intelligence
-         FROM tickets_demo WHERE key = $1`,
-      [key]
+         FROM tickets_demo WHERE key = $1 AND tenant_id = $2`,
+      [key, tenantId]
     );
     const cur = existing[0];
     if (cur) {
@@ -463,7 +466,7 @@ export async function upsertTicketIntelligence(
           && intel.inputHash
           && cur.intelligence_input_hash === intel.inputHash
           && intel.status === "enriched") {
-        const ticket = await getUserTicketByKey(key);
+        const ticket = await getUserTicketByKey(tenantId, key);
         return { ticket, conflict: { reason: "already_enriched_with_same_hash", serverHash: cur.intelligence_input_hash } };
       }
       // FIX A17: si server tiene versión mayor a la que el cliente intenta guardar,
@@ -471,7 +474,7 @@ export async function upsertTicketIntelligence(
       const serverVersion = (cur.intelligence as { analysisVersion?: number } | null)?.analysisVersion;
       const clientVersion = (intel as { analysisVersion?: number }).analysisVersion;
       if (typeof serverVersion === "number" && typeof clientVersion === "number" && clientVersion < serverVersion) {
-        const ticket = await getUserTicketByKey(key);
+        const ticket = await getUserTicketByKey(tenantId, key);
         return { ticket, conflict: { reason: "stale_analysis_version", serverHash: cur.intelligence_input_hash ?? undefined } };
       }
     }
@@ -484,11 +487,12 @@ export async function upsertTicketIntelligence(
     // Best-effort, no bloquea el upsert si falla.
     try {
       const { rows: prev } = await query<{ intelligence: TicketIntelligence | null; intelligence_input_hash: string | null }>(
-        `SELECT intelligence, intelligence_input_hash FROM tickets_demo WHERE key = $1`, [key]
+        `SELECT intelligence, intelligence_input_hash FROM tickets_demo WHERE key = $1 AND tenant_id = $2`,
+        [key, tenantId]
       );
       const prior = prev[0]?.intelligence;
       if (prior && prior.status === "enriched") {
-        await appendIntelligenceHistory(key, prior, prev[0].intelligence_input_hash ?? null, "pre_overwrite");
+        await appendIntelligenceHistory(tenantId, key, prior, prev[0].intelligence_input_hash ?? null, "pre_overwrite");
       }
     } catch (err) {
       logger.debug({ err, key }, "intelligence history snapshot skipped");
@@ -501,10 +505,11 @@ export async function upsertTicketIntelligence(
               intelligence_input_hash = $4,
               intelligence_updated_at = now(),
               updated_at              = now()
-        WHERE key = $1`,
-      [key, JSON.stringify(intel), intel.status, intel.inputHash ?? null]
+        WHERE key = $1
+          AND tenant_id = $5`,
+      [key, JSON.stringify(intel), intel.status, intel.inputHash ?? null, tenantId]
     );
-    const ticket = await getUserTicketByKey(key);
+    const ticket = await getUserTicketByKey(tenantId, key);
     return { ticket };
   } catch (err) {
     logger.error({ err, key }, "upsertTicketIntelligence failed");
@@ -528,37 +533,39 @@ export interface IntelligenceHistoryEntry {
 
 /** Append snapshot a la tabla history. Devuelve version asignada. */
 async function appendIntelligenceHistory(
-  key: string, intel: TicketIntelligence, inputHash: string | null, reason: string,
+  tenantId: string, key: string, intel: TicketIntelligence, inputHash: string | null, reason: string,
 ): Promise<number> {
   // Calcular próxima version
   const { rows: maxRows } = await query<{ next: number | null }>(
-    `SELECT COALESCE(MAX(version), 0) + 1 AS next FROM ticket_intelligence_history WHERE ticket_key = $1`,
-    [key]
+    `SELECT COALESCE(MAX(version), 0) + 1 AS next FROM ticket_intelligence_history WHERE ticket_key = $1 AND tenant_id = $2`,
+    [key, tenantId]
   );
   const nextVersion = maxRows[0]?.next ?? 1;
   await query(
-    `INSERT INTO ticket_intelligence_history (ticket_key, version, intelligence, input_hash, snapshot_reason)
-     VALUES ($1, $2, $3::jsonb, $4, $5)`,
-    [key, nextVersion, JSON.stringify(intel), inputHash, reason]
+    `INSERT INTO ticket_intelligence_history (tenant_id, ticket_key, version, intelligence, input_hash, snapshot_reason)
+     VALUES ($1, $2, $3, $4::jsonb, $5, $6)`,
+    [tenantId, key, nextVersion, JSON.stringify(intel), inputHash, reason]
   );
   // Cap a últimas 20 versiones por ticket (DELETE más viejas)
   await query(
     `DELETE FROM ticket_intelligence_history
        WHERE ticket_key = $1
+         AND tenant_id = $2
          AND id NOT IN (
            SELECT id FROM ticket_intelligence_history
             WHERE ticket_key = $1
+              AND tenant_id = $2
             ORDER BY snapshot_at DESC
             LIMIT 20
          )`,
-    [key]
+    [key, tenantId]
   );
   return nextVersion;
 }
 
 /** Lee el historial de un ticket (más reciente primero, max 20). */
-export async function listIntelligenceHistory(key: string): Promise<IntelligenceHistoryEntry[]> {
-  await ensureTicketsDemoSchema();
+export async function listIntelligenceHistory(tenantId: string, key: string): Promise<IntelligenceHistoryEntry[]> {
+  await ensureTicketsDemoSchema(tenantId);
   try {
     const { rows } = await query<{
       id: number; ticket_key: string; version: number;
@@ -568,9 +575,10 @@ export async function listIntelligenceHistory(key: string): Promise<Intelligence
       `SELECT id, ticket_key, version, intelligence, input_hash, snapshot_at, snapshot_reason
          FROM ticket_intelligence_history
         WHERE ticket_key = $1
+          AND tenant_id = $2
         ORDER BY snapshot_at DESC
         LIMIT 20`,
-      [key]
+      [key, tenantId]
     );
     return rows.map((r) => ({
       id: String(r.id),
@@ -588,8 +596,8 @@ export async function listIntelligenceHistory(key: string): Promise<Intelligence
 }
 
 /** Lee solo el intelligence de un ticket. Null si no existe el ticket. */
-export async function getTicketIntelligence(key: string): Promise<TicketIntelligence | null> {
-  await ensureTicketsDemoSchema();
+export async function getTicketIntelligence(tenantId: string, key: string): Promise<TicketIntelligence | null> {
+  await ensureTicketsDemoSchema(tenantId);
   try {
     const { rows } = await query<{
       intelligence: TicketIntelligence | null;
@@ -598,8 +606,8 @@ export async function getTicketIntelligence(key: string): Promise<TicketIntellig
       intelligence_updated_at: string | null;
     }>(
       `SELECT intelligence, intelligence_status, intelligence_input_hash, intelligence_updated_at
-         FROM tickets_demo WHERE key = $1`,
-      [key]
+         FROM tickets_demo WHERE key = $1 AND tenant_id = $2`,
+      [key, tenantId]
     );
     const r = rows[0];
     if (!r) return null;
@@ -619,21 +627,24 @@ export async function getTicketIntelligence(key: string): Promise<TicketIntellig
   }
 }
 
-async function nextTicketKey(): Promise<string> {
-  // Counter cacheado para evitar SELECT max() en cada create. Se inicializa
-  // al primer uso buscando el max key tipo AMS-NNN existente.
-  if (ticketCounterCache === null) {
+async function nextTicketKey(tenantId: string): Promise<string> {
+  // Counter cacheado por tenant para evitar SELECT max() en cada create. Se inicializa
+  // al primer uso buscando el max key tipo AMS-NNN existente PARA ESE TENANT.
+  let counter = ticketCounterCacheByTenant.get(tenantId) ?? null;
+  if (counter === null) {
     try {
       const { rows } = await query<{ max_n: number | null }>(
-        `SELECT MAX(CAST(SUBSTRING(key FROM 'AMS-(\\d+)') AS INTEGER)) AS max_n FROM tickets_demo`
+        `SELECT MAX(CAST(SUBSTRING(key FROM 'AMS-(\\d+)') AS INTEGER)) AS max_n FROM tickets_demo WHERE tenant_id = $1`,
+        [tenantId]
       );
-      ticketCounterCache = Math.max(200, rows[0]?.max_n ?? 0);
+      counter = Math.max(200, rows[0]?.max_n ?? 0);
     } catch {
-      ticketCounterCache = 200;
+      counter = 200;
     }
   }
-  ticketCounterCache += 1;
-  return `AMS-${ticketCounterCache}`;
+  counter += 1;
+  ticketCounterCacheByTenant.set(tenantId, counter);
+  return `AMS-${counter}`;
 }
 
 function priorityToSeverity(priority: string): SeverityLevel {
@@ -721,9 +732,9 @@ function buildEstimateForTicket(
   }
 }
 
-export async function createUserTicket(input: CreateTicketInput): Promise<Ticket> {
-  await ensureTicketsDemoSchema();
-  const key = await nextTicketKey();
+export async function createUserTicket(tenantId: string, input: CreateTicketInput): Promise<Ticket> {
+  await ensureTicketsDemoSchema(tenantId);
+  const key = await nextTicketKey(tenantId);
   const ticketShape = {
     title: input.title.trim(),
     description: input.description.trim(),
@@ -743,11 +754,11 @@ export async function createUserTicket(input: CreateTicketInput): Promise<Ticket
 
   const { rows } = await query<TicketRow>(
     `INSERT INTO tickets_demo
-       (key, title, description, status, priority, reporter, assignee,
+       (tenant_id, key, title, description, status, priority, reporter, assignee,
         sap_module, environment, estimated_resolution, visual_evidence_notes)
-     VALUES ($1,$2,$3,'Open',$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)
+     VALUES ($1,$2,$3,$4,'Open',$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb)
      RETURNING *`,
-    [key, ticketShape.title, ticketShape.description, ticketShape.priority,
+    [tenantId, key, ticketShape.title, ticketShape.description, ticketShape.priority,
      input.reporter ?? null, input.assignee ?? null,
      ticketShape.sapModule, ticketShape.environment,
      estimate ? JSON.stringify(estimate) : null,
@@ -756,11 +767,12 @@ export async function createUserTicket(input: CreateTicketInput): Promise<Ticket
   return rowToTicket(rows[0]!);
 }
 
-export async function listUserTickets(): Promise<Ticket[]> {
-  await ensureTicketsDemoSchema();
+export async function listUserTickets(tenantId: string): Promise<Ticket[]> {
+  await ensureTicketsDemoSchema(tenantId);
   try {
     const { rows } = await query<TicketRow>(
-      `SELECT * FROM tickets_demo ORDER BY created_at DESC LIMIT 500`
+      `SELECT * FROM tickets_demo WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 500`,
+      [tenantId]
     );
     return rows.map(rowToTicket);
   } catch (err) {
@@ -769,9 +781,12 @@ export async function listUserTickets(): Promise<Ticket[]> {
   }
 }
 
-export async function getUserTicketByKey(key: string): Promise<Ticket | null> {
-  await ensureTicketsDemoSchema();
-  const { rows } = await query<TicketRow>(`SELECT * FROM tickets_demo WHERE key = $1`, [key]);
+export async function getUserTicketByKey(tenantId: string, key: string): Promise<Ticket | null> {
+  await ensureTicketsDemoSchema(tenantId);
+  const { rows } = await query<TicketRow>(
+    `SELECT * FROM tickets_demo WHERE key = $1 AND tenant_id = $2`,
+    [key, tenantId]
+  );
   return rows[0] ? rowToTicket(rows[0]) : null;
 }
 
@@ -782,23 +797,24 @@ export async function getUserTicketByKey(key: string): Promise<Ticket | null> {
  * Preserva ajustes manuales salvo force=true.
  */
 export async function recalculateUserTicket(
+  tenantId: string,
   key: string,
   options: { force?: boolean; actor?: string } = {},
 ): Promise<Ticket | null> {
-  const ticket = await ensureTicketMirror(key);
+  const ticket = await ensureTicketMirror(tenantId, key);
   if (!ticket) return null;
   const current = ticket.estimatedResolution;
   if (current?.manuallyAdjusted && !options.force) {
     // Solo refrescar lastRecalculatedAt
     const next = { ...current, lastRecalculatedAt: new Date().toISOString() };
-    return persistEstimate(key, next);
+    return persistEstimate(tenantId, key, next);
   }
   const fresh = buildEstimateForTicket(key, {
     title: ticket.title, description: ticket.description, priority: ticket.priority,
     sapModule: ticket.sapModule ?? null, environment: ticket.environment ?? null,
   }, {});
   if (!fresh) return ticket;
-  return persistEstimate(key, fresh);
+  return persistEstimate(tenantId, key, fresh);
 }
 
 /**
@@ -811,13 +827,14 @@ export interface ManualEstimatePatch {
   complexity?: ComplexityLevel;
 }
 export async function applyManualEstimatePatch(
+  tenantId: string,
   key: string,
   patch: ManualEstimatePatch,
   actor: string,
   reason: string,
 ): Promise<Ticket | null> {
   // Espejo automático si el ticket es externo (Jira) y todavía no está en DB
-  const ticket = await ensureTicketMirror(key);
+  const ticket = await ensureTicketMirror(tenantId, key);
   if (!ticket || !ticket.estimatedResolution) return null;
   const cur = ticket.estimatedResolution;
   const next: TicketEstimatedResolution = {
@@ -832,16 +849,17 @@ export async function applyManualEstimatePatch(
     adjustmentReason: reason,
     lastRecalculatedAt: new Date().toISOString(),
   };
-  return persistEstimate(key, next);
+  return persistEstimate(tenantId, key, next);
 }
 
-async function persistEstimate(key: string, est: TicketEstimatedResolution): Promise<Ticket | null> {
+async function persistEstimate(tenantId: string, key: string, est: TicketEstimatedResolution): Promise<Ticket | null> {
   const { rows } = await query<TicketRow>(
     `UPDATE tickets_demo
        SET estimated_resolution = $1::jsonb, updated_at = now()
      WHERE key = $2
+       AND tenant_id = $3
      RETURNING *`,
-    [JSON.stringify(est), key]
+    [JSON.stringify(est), key, tenantId]
   );
   return rows[0] ? rowToTicket(rows[0]) : null;
 }
@@ -853,14 +871,15 @@ async function persistEstimate(key: string, est: TicketEstimatedResolution): Pro
  * 4 campos. Preserva metadatos del nuevo objeto pasado.
  */
 export async function replaceTicketEstimate(
+  tenantId: string,
   key: string,
   newEstimate: TicketEstimatedResolution,
 ): Promise<Ticket | null> {
-  const ticket = await ensureTicketMirror(key);
+  const ticket = await ensureTicketMirror(tenantId, key);
   if (!ticket) return null;
   // newEstimate viene del cliente — asegurar que ticketId coincida.
   const safe: TicketEstimatedResolution = { ...newEstimate, ticketId: ticket.key };
-  return persistEstimate(key, safe);
+  return persistEstimate(tenantId, key, safe);
 }
 
 /**
@@ -885,10 +904,11 @@ export interface CloseTicketInput {
 }
 
 export async function closeTicketWithActualHours(
+  tenantId: string,
   key: string,
   input: CloseTicketInput,
 ): Promise<Ticket | null> {
-  const ticket = await ensureTicketMirror(key);
+  const ticket = await ensureTicketMirror(tenantId, key);
   if (!ticket) return null;
 
   const actualHours = Math.max(0, Number(input.actualHours) || 0);
@@ -935,10 +955,12 @@ export async function closeTicketWithActualHours(
            estimated_resolution = $1::jsonb,
            updated_at = now()
      WHERE key = $2
+       AND tenant_id = $3
      RETURNING *`,
     [
       nextEstimate ? JSON.stringify(nextEstimate) : null,
       key,
+      tenantId,
     ],
   );
 
@@ -951,11 +973,11 @@ export async function closeTicketWithActualHours(
   return rows[0] ? rowToTicket(rows[0]) : null;
 }
 
-export async function listTickets(): Promise<{ source: TicketSource; tickets: Ticket[] }> {
+export async function listTickets(tenantId: string): Promise<{ source: TicketSource; tickets: Ticket[] }> {
   // userTickets incluye TODO lo persistido: mocks seedeados (AMS-101..105) +
   // tickets creados desde la UI (AMS-201++) + cualquier espejo de Jira que
   // se haya editado alguna vez.
-  const userTickets = await listUserTickets();
+  const userTickets = await listUserTickets(tenantId);
   const env = getJiraEnv();
   if (env) {
     const jiraTickets = await fetchFromJira();
@@ -971,11 +993,11 @@ export async function listTickets(): Promise<{ source: TicketSource; tickets: Ti
   return { source: "mock", tickets: userTickets };
 }
 
-export async function getTicketByKey(key: string): Promise<Ticket | null> {
-  const user = await getUserTicketByKey(key);
+export async function getTicketByKey(tenantId: string, key: string): Promise<Ticket | null> {
+  const user = await getUserTicketByKey(tenantId, key);
   if (user) return user;
   // Fallback al listado completo (mocks o Jira)
-  const { tickets } = await listTickets();
+  const { tickets } = await listTickets(tenantId);
   return tickets.find((t) => t.key === key) ?? null;
 }
 
@@ -1026,9 +1048,9 @@ export interface UpdateTicketGeneralInput {
  * no pueda escribir columnas sensibles (intelligence, estimated_resolution).
  */
 export async function updateTicketGeneral(
-  key: string, patch: UpdateTicketGeneralInput,
+  tenantId: string, key: string, patch: UpdateTicketGeneralInput,
 ): Promise<Ticket | null> {
-  await ensureTicketsDemoSchema();
+  await ensureTicketsDemoSchema(tenantId);
 
   // Construir SET dinámico solo con campos definidos
   const sets: string[] = [];
@@ -1069,14 +1091,18 @@ export async function updateTicketGeneral(
   }
 
   if (sets.length === 0) {
-    return getUserTicketByKey(key);
+    return getUserTicketByKey(tenantId, key);
   }
 
   sets.push(`updated_at = now()`);
 
+  // tenant_id va al final como filtro adicional (prevenir cross-tenant updates)
+  const tenantIdx = idx;
+  params.push(tenantId);
+
   try {
     const { rows } = await query<TicketRow>(
-      `UPDATE tickets_demo SET ${sets.join(", ")} WHERE key = $1 RETURNING *`,
+      `UPDATE tickets_demo SET ${sets.join(", ")} WHERE key = $1 AND tenant_id = $${tenantIdx} RETURNING *`,
       params,
     );
     if (rows.length === 0) return null;

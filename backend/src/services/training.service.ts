@@ -3,6 +3,11 @@
 // Reemplaza el localStorage del frontend cuando este endpoint está disponible.
 //
 // Patrón: ensureSchema() idempotente, mismo que feedback.service.ts.
+//
+// MT-2 (multi-tenant): TODAS las funciones reciben tenantId como primer
+// parámetro y filtran por tenant_id en cada query. Aislamiento total entre
+// clientes — un tenant NO puede ver/modificar items, Q&A, versiones, gaps
+// ni settings de otro tenant.
 
 import { query } from "../database/db";
 import { logger } from "../utils/logger";
@@ -138,10 +143,10 @@ export interface ListItemsFilters {
   limit?: number;
 }
 
-export async function listItems(filters: ListItemsFilters = {}): Promise<KnowledgeItemRow[]> {
+export async function listItems(tenantId: string, filters: ListItemsFilters = {}): Promise<KnowledgeItemRow[]> {
   await ensureSchema();
-  const conds: string[] = [];
-  const params: unknown[] = [];
+  const conds: string[] = ["tenant_id = $1"];
+  const params: unknown[] = [tenantId];
   if (filters.status)   { params.push(filters.status);  conds.push(`status = $${params.length}`); }
   if (filters.module)   { params.push(filters.module);  conds.push(`module = $${params.length}`); }
   if (filters.type)     { params.push(filters.type);    conds.push(`type = $${params.length}`); }
@@ -153,7 +158,7 @@ export async function listItems(filters: ListItemsFilters = {}): Promise<Knowled
     params.push(`%${filters.search}%`);
     conds.push(`(title ILIKE $${params.length} OR summary ILIKE $${params.length} OR author ILIKE $${params.length})`);
   }
-  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const where = `WHERE ${conds.join(" AND ")}`;
   const limit = Math.max(1, Math.min(500, filters.limit ?? 200));
   const { rows } = await query<KnowledgeItemRow>(
     `SELECT * FROM kb_training_items ${where} ORDER BY updated_at DESC LIMIT ${limit}`,
@@ -176,14 +181,15 @@ export interface CreateItemInput {
   author?: string;
 }
 
-export async function createItem(input: CreateItemInput): Promise<KnowledgeItemRow> {
+export async function createItem(tenantId: string, input: CreateItemInput): Promise<KnowledgeItemRow> {
   await ensureSchema();
   const { rows } = await query<KnowledgeItemRow>(
     `INSERT INTO kb_training_items
-       (title, content, summary, module, process, type, source, tags, priority, status, author)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       (tenant_id, title, content, summary, module, process, type, source, tags, priority, status, author)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
      RETURNING *`,
     [
+      tenantId,
       input.title.slice(0, 200),
       input.content,
       input.summary.slice(0, 500),
@@ -200,10 +206,10 @@ export async function createItem(input: CreateItemInput): Promise<KnowledgeItemR
   return rows[0]!;
 }
 
-export async function getItem(id: string): Promise<KnowledgeItemRow | null> {
+export async function getItem(tenantId: string, id: string): Promise<KnowledgeItemRow | null> {
   await ensureSchema();
   const { rows } = await query<KnowledgeItemRow>(
-    `SELECT * FROM kb_training_items WHERE id = $1`, [id]
+    `SELECT * FROM kb_training_items WHERE id = $1 AND tenant_id = $2`, [id, tenantId]
   );
   return rows[0] ?? null;
 }
@@ -229,7 +235,7 @@ export interface UpdateItemInput {
   rejectionReason?: string | null;
 }
 
-export async function updateItem(id: string, patch: UpdateItemInput): Promise<KnowledgeItemRow | null> {
+export async function updateItem(tenantId: string, id: string, patch: UpdateItemInput): Promise<KnowledgeItemRow | null> {
   await ensureSchema();
   const sets: string[] = [];
   const params: unknown[] = [];
@@ -255,11 +261,14 @@ export async function updateItem(id: string, patch: UpdateItemInput): Promise<Kn
   if (patch.rejectionReason !== undefined)         push("rejection_reason", patch.rejectionReason);
 
   sets.push(`updated_at = now()`);
-  if (sets.length === 1) return getItem(id);
+  if (sets.length === 1) return getItem(tenantId, id);
 
   params.push(id);
+  const idIdx = params.length;
+  params.push(tenantId);
+  const tIdx = params.length;
   const { rows } = await query<KnowledgeItemRow>(
-    `UPDATE kb_training_items SET ${sets.join(", ")} WHERE id = $${params.length} RETURNING *`,
+    `UPDATE kb_training_items SET ${sets.join(", ")} WHERE id = $${idIdx} AND tenant_id = $${tIdx} RETURNING *`,
     params
   );
   // Si el item cambió a PUBLISHED o de PUBLISHED, invalidar few-shot cache
@@ -275,7 +284,7 @@ export async function updateItem(id: string, patch: UpdateItemInput): Promise<Kn
     (async () => {
       try {
         const { upsertItemEmbedding } = await import("./training-embeddings.service");
-        await upsertItemEmbedding(it.id, `${it.title}\n\n${it.summary}\n\n${it.content.slice(0, 4000)}`);
+        await upsertItemEmbedding(tenantId, it.id, `${it.title}\n\n${it.summary}\n\n${it.content.slice(0, 4000)}`);
       } catch (err) {
         logger.debug({ err }, "auto-embed item on publish fail");
       }
@@ -284,47 +293,58 @@ export async function updateItem(id: string, patch: UpdateItemInput): Promise<Kn
   return rows[0] ?? null;
 }
 
-export async function deleteItem(id: string): Promise<boolean> {
+export async function deleteItem(tenantId: string, id: string): Promise<boolean> {
   await ensureSchema();
-  const { rowCount } = await query(`DELETE FROM kb_training_items WHERE id = $1`, [id]);
+  const { rowCount } = await query(
+    `DELETE FROM kb_training_items WHERE id = $1 AND tenant_id = $2`, [id, tenantId]
+  );
   return (rowCount ?? 0) > 0;
 }
 
 // ============================================================================
 // Q&A
 // ============================================================================
-export async function listQA(itemId?: string): Promise<TrainingQARow[]> {
+export async function listQA(tenantId: string, itemId?: string): Promise<TrainingQARow[]> {
   await ensureSchema();
   if (itemId) {
     const { rows } = await query<TrainingQARow>(
-      `SELECT * FROM kb_training_qa WHERE knowledge_item_id = $1 ORDER BY created_at DESC`, [itemId]
+      `SELECT * FROM kb_training_qa WHERE knowledge_item_id = $1 AND tenant_id = $2 ORDER BY created_at DESC`,
+      [itemId, tenantId]
     );
     return rows;
   }
   const { rows } = await query<TrainingQARow>(
-    `SELECT * FROM kb_training_qa ORDER BY created_at DESC LIMIT 500`
+    `SELECT * FROM kb_training_qa WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 500`,
+    [tenantId]
   );
   return rows;
 }
 
-export async function createQA(items: { knowledgeItemId: string; question: string; expectedAnswer: string }[]): Promise<TrainingQARow[]> {
+export async function createQA(
+  tenantId: string,
+  items: { knowledgeItemId: string; question: string; expectedAnswer: string }[]
+): Promise<TrainingQARow[]> {
   await ensureSchema();
   if (items.length === 0) return [];
   const values: string[] = [];
   const params: unknown[] = [];
   items.forEach((it) => {
-    params.push(it.knowledgeItemId, it.question, it.expectedAnswer);
+    params.push(tenantId, it.knowledgeItemId, it.question, it.expectedAnswer);
     const p = params.length;
-    values.push(`($${p - 2}, $${p - 1}, $${p})`);
+    values.push(`($${p - 3}, $${p - 2}, $${p - 1}, $${p})`);
   });
   const { rows } = await query<TrainingQARow>(
-    `INSERT INTO kb_training_qa (knowledge_item_id, question, expected_answer) VALUES ${values.join(", ")} RETURNING *`,
+    `INSERT INTO kb_training_qa (tenant_id, knowledge_item_id, question, expected_answer) VALUES ${values.join(", ")} RETURNING *`,
     params
   );
   return rows;
 }
 
-export async function updateQA(id: string, patch: { question?: string; expectedAnswer?: string; approved?: boolean; turns?: { user: string; expectedAgent: string }[] | null }): Promise<TrainingQARow | null> {
+export async function updateQA(
+  tenantId: string,
+  id: string,
+  patch: { question?: string; expectedAnswer?: string; approved?: boolean; turns?: { user: string; expectedAgent: string }[] | null }
+): Promise<TrainingQARow | null> {
   await ensureSchema();
   const sets: string[] = [];
   const params: unknown[] = [];
@@ -333,12 +353,17 @@ export async function updateQA(id: string, patch: { question?: string; expectedA
   if (patch.approved !== undefined)       { params.push(patch.approved); sets.push(`approved = $${params.length}`); }
   if (patch.turns !== undefined)          { params.push(patch.turns === null ? null : JSON.stringify(patch.turns)); sets.push(`turns = $${params.length}::jsonb`); }
   if (sets.length === 0) {
-    const { rows } = await query<TrainingQARow>(`SELECT * FROM kb_training_qa WHERE id = $1`, [id]);
+    const { rows } = await query<TrainingQARow>(
+      `SELECT * FROM kb_training_qa WHERE id = $1 AND tenant_id = $2`, [id, tenantId]
+    );
     return rows[0] ?? null;
   }
   params.push(id);
+  const idIdx = params.length;
+  params.push(tenantId);
+  const tIdx = params.length;
   const { rows } = await query<TrainingQARow>(
-    `UPDATE kb_training_qa SET ${sets.join(", ")} WHERE id = $${params.length} RETURNING *`,
+    `UPDATE kb_training_qa SET ${sets.join(", ")} WHERE id = $${idIdx} AND tenant_id = $${tIdx} RETURNING *`,
     params
   );
   // Si se aprobó una Q&A, invalidar few-shot cache + generar embedding semántico
@@ -353,7 +378,7 @@ export async function updateQA(id: string, patch: { question?: string; expectedA
       (async () => {
         try {
           const { upsertQaEmbedding } = await import("./training-embeddings.service");
-          await upsertQaEmbedding(qa.id, `${qa.question}\n\n${qa.expected_answer}`);
+          await upsertQaEmbedding(tenantId, qa.id, `${qa.question}\n\n${qa.expected_answer}`);
         } catch (err) {
           logger.debug({ err }, "auto-embed qa on approve fail");
         }
@@ -363,24 +388,27 @@ export async function updateQA(id: string, patch: { question?: string; expectedA
   return rows[0] ?? null;
 }
 
-export async function deleteQA(id: string): Promise<boolean> {
+export async function deleteQA(tenantId: string, id: string): Promise<boolean> {
   await ensureSchema();
-  const { rowCount } = await query(`DELETE FROM kb_training_qa WHERE id = $1`, [id]);
+  const { rowCount } = await query(
+    `DELETE FROM kb_training_qa WHERE id = $1 AND tenant_id = $2`, [id, tenantId]
+  );
   return (rowCount ?? 0) > 0;
 }
 
 // ============================================================================
 // VERSIONS
 // ============================================================================
-export async function listVersions(): Promise<TrainingVersionRow[]> {
+export async function listVersions(tenantId: string): Promise<TrainingVersionRow[]> {
   await ensureSchema();
   const { rows } = await query<TrainingVersionRow>(
-    `SELECT * FROM kb_training_versions ORDER BY created_at DESC LIMIT 100`
+    `SELECT * FROM kb_training_versions WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 100`,
+    [tenantId]
   );
   return rows;
 }
 
-export async function createVersion(input: {
+export async function createVersion(tenantId: string, input: {
   version: string; description: string; createdBy: string;
   itemCount: number; validatedCount: number; publishedCount: number;
   changelog?: string[];
@@ -388,9 +416,10 @@ export async function createVersion(input: {
   await ensureSchema();
   const { rows } = await query<TrainingVersionRow>(
     `INSERT INTO kb_training_versions
-       (version, description, status, item_count, validated_count, published_count, created_by, changelog)
-     VALUES ($1, $2, 'DRAFT', $3, $4, $5, $6, $7) RETURNING *`,
+       (tenant_id, version, description, status, item_count, validated_count, published_count, created_by, changelog)
+     VALUES ($1, $2, $3, 'DRAFT', $4, $5, $6, $7, $8) RETURNING *`,
     [
+      tenantId,
       input.version,
       input.description,
       input.itemCount,
@@ -403,19 +432,29 @@ export async function createVersion(input: {
   return rows[0]!;
 }
 
-export async function updateVersionStatus(id: string, status: TrainingVersionStatus): Promise<TrainingVersionRow | null> {
+export async function updateVersionStatus(
+  tenantId: string,
+  id: string,
+  status: TrainingVersionStatus
+): Promise<TrainingVersionRow | null> {
   await ensureSchema();
-  // si pasamos a PUBLISHED, archivar previas
+  // si pasamos a PUBLISHED, archivar previas (solo dentro del tenant)
   if (status === "PUBLISHED") {
-    await query(`UPDATE kb_training_versions SET status = 'ARCHIVED' WHERE status = 'PUBLISHED' AND id <> $1`, [id]);
+    await query(
+      `UPDATE kb_training_versions SET status = 'ARCHIVED'
+        WHERE status = 'PUBLISHED' AND id <> $1 AND tenant_id = $2`,
+      [id, tenantId]
+    );
     const { rows } = await query<TrainingVersionRow>(
-      `UPDATE kb_training_versions SET status = 'PUBLISHED', published_at = now() WHERE id = $1 RETURNING *`,
-      [id]
+      `UPDATE kb_training_versions SET status = 'PUBLISHED', published_at = now()
+        WHERE id = $1 AND tenant_id = $2 RETURNING *`,
+      [id, tenantId]
     );
     return rows[0] ?? null;
   }
   const { rows } = await query<TrainingVersionRow>(
-    `UPDATE kb_training_versions SET status = $1 WHERE id = $2 RETURNING *`, [status, id]
+    `UPDATE kb_training_versions SET status = $1 WHERE id = $2 AND tenant_id = $3 RETURNING *`,
+    [status, id, tenantId]
   );
   return rows[0] ?? null;
 }
@@ -423,29 +462,30 @@ export async function updateVersionStatus(id: string, status: TrainingVersionSta
 // ============================================================================
 // GAPS
 // ============================================================================
-export async function listGaps(): Promise<KnowledgeGapRow[]> {
+export async function listGaps(tenantId: string): Promise<KnowledgeGapRow[]> {
   await ensureSchema();
   const { rows } = await query<KnowledgeGapRow>(
-    `SELECT * FROM kb_training_gaps ORDER BY created_at DESC LIMIT 500`
+    `SELECT * FROM kb_training_gaps WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 500`,
+    [tenantId]
   );
   return rows;
 }
 
-export async function createGap(input: {
+export async function createGap(tenantId: string, input: {
   title: string; description: string; module: string; process: string;
   priority: Priority; suggestedAction: string; status?: GapStatus;
 }): Promise<KnowledgeGapRow> {
   await ensureSchema();
   const { rows } = await query<KnowledgeGapRow>(
     `INSERT INTO kb_training_gaps
-       (title, description, module, process, priority, suggested_action, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-    [input.title, input.description, input.module, input.process, input.priority, input.suggestedAction, input.status ?? "OPEN"]
+       (tenant_id, title, description, module, process, priority, suggested_action, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+    [tenantId, input.title, input.description, input.module, input.process, input.priority, input.suggestedAction, input.status ?? "OPEN"]
   );
   return rows[0]!;
 }
 
-export async function updateGap(id: string, patch: {
+export async function updateGap(tenantId: string, id: string, patch: {
   title?: string; description?: string; module?: string; process?: string;
   priority?: Priority; suggestedAction?: string; status?: GapStatus;
 }): Promise<KnowledgeGapRow | null> {
@@ -464,32 +504,60 @@ export async function updateGap(id: string, patch: {
     if (patch.status === "RESOLVED") sets.push(`resolved_at = now()`);
   }
   if (sets.length === 0) {
-    const { rows } = await query<KnowledgeGapRow>(`SELECT * FROM kb_training_gaps WHERE id = $1`, [id]);
+    const { rows } = await query<KnowledgeGapRow>(
+      `SELECT * FROM kb_training_gaps WHERE id = $1 AND tenant_id = $2`, [id, tenantId]
+    );
     return rows[0] ?? null;
   }
   params.push(id);
+  const idIdx = params.length;
+  params.push(tenantId);
+  const tIdx = params.length;
   const { rows } = await query<KnowledgeGapRow>(
-    `UPDATE kb_training_gaps SET ${sets.join(", ")} WHERE id = $${params.length} RETURNING *`, params
+    `UPDATE kb_training_gaps SET ${sets.join(", ")} WHERE id = $${idIdx} AND tenant_id = $${tIdx} RETURNING *`,
+    params
   );
   return rows[0] ?? null;
 }
 
-export async function deleteGap(id: string): Promise<boolean> {
+export async function deleteGap(tenantId: string, id: string): Promise<boolean> {
   await ensureSchema();
-  const { rowCount } = await query(`DELETE FROM kb_training_gaps WHERE id = $1`, [id]);
+  const { rowCount } = await query(
+    `DELETE FROM kb_training_gaps WHERE id = $1 AND tenant_id = $2`, [id, tenantId]
+  );
   return (rowCount ?? 0) > 0;
 }
 
-// ============================================================================
-// SETTINGS (singleton)
-// ============================================================================
-export async function getSettings(): Promise<TrainingSettingsRow> {
+export async function getGap(tenantId: string, id: string): Promise<KnowledgeGapRow | null> {
   await ensureSchema();
-  const { rows } = await query<TrainingSettingsRow>(`SELECT * FROM kb_training_settings ORDER BY updated_at DESC LIMIT 1`);
+  const { rows } = await query<KnowledgeGapRow>(
+    `SELECT * FROM kb_training_gaps WHERE id = $1 AND tenant_id = $2`, [id, tenantId]
+  );
+  return rows[0] ?? null;
+}
+
+export async function getQA(tenantId: string, id: string): Promise<TrainingQARow | null> {
+  await ensureSchema();
+  const { rows } = await query<TrainingQARow>(
+    `SELECT * FROM kb_training_qa WHERE id = $1 AND tenant_id = $2`, [id, tenantId]
+  );
+  return rows[0] ?? null;
+}
+
+// ============================================================================
+// SETTINGS (singleton por tenant)
+// ============================================================================
+export async function getSettings(tenantId: string): Promise<TrainingSettingsRow> {
+  await ensureSchema();
+  const { rows } = await query<TrainingSettingsRow>(
+    `SELECT * FROM kb_training_settings WHERE tenant_id = $1 ORDER BY updated_at DESC LIMIT 1`,
+    [tenantId]
+  );
   if (rows[0]) return rows[0];
-  // Crear settings default si no existen
+  // Crear settings default si no existen para este tenant
   const { rows: created } = await query<TrainingSettingsRow>(
-    `INSERT INTO kb_training_settings DEFAULT VALUES RETURNING *`
+    `INSERT INTO kb_training_settings (tenant_id) VALUES ($1) RETURNING *`,
+    [tenantId]
   );
   return created[0]!;
 }
@@ -506,8 +574,8 @@ export interface UpdateSettingsInput {
   strictMode?: boolean;
 }
 
-export async function updateSettings(patch: UpdateSettingsInput): Promise<TrainingSettingsRow> {
-  const current = await getSettings();
+export async function updateSettings(tenantId: string, patch: UpdateSettingsInput): Promise<TrainingSettingsRow> {
+  const current = await getSettings(tenantId);
   const sets: string[] = [];
   const params: unknown[] = [];
   const push = (col: string, val: unknown) => { params.push(val); sets.push(`${col} = $${params.length}`); };
@@ -523,8 +591,12 @@ export async function updateSettings(patch: UpdateSettingsInput): Promise<Traini
   sets.push("updated_at = now()");
   if (sets.length === 1) return current;
   params.push(current.id);
+  const idIdx = params.length;
+  params.push(tenantId);
+  const tIdx = params.length;
   const { rows } = await query<TrainingSettingsRow>(
-    `UPDATE kb_training_settings SET ${sets.join(", ")} WHERE id = $${params.length} RETURNING *`, params
+    `UPDATE kb_training_settings SET ${sets.join(", ")} WHERE id = $${idIdx} AND tenant_id = $${tIdx} RETURNING *`,
+    params
   );
   return rows[0]!;
 }
@@ -540,14 +612,14 @@ export interface TrainingSnapshot {
   settings: TrainingSettingsRow;
 }
 
-export async function getSnapshot(): Promise<TrainingSnapshot> {
+export async function getSnapshot(tenantId: string): Promise<TrainingSnapshot> {
   await ensureSchema();
   const [knowledge, qa, versions, gaps, settings] = await Promise.all([
-    listItems({ limit: 500 }),
-    listQA(),
-    listVersions(),
-    listGaps(),
-    getSettings(),
+    listItems(tenantId, { limit: 500 }),
+    listQA(tenantId),
+    listVersions(tenantId),
+    listGaps(tenantId),
+    getSettings(tenantId),
   ]);
   return { knowledge, qa, versions, gaps, settings };
 }

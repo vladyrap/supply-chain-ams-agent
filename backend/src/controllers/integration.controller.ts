@@ -24,7 +24,7 @@ async function getUserId(req: FastifyRequest): Promise<string | null> {
   const cookies = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies;
   const token = cookies?.[COOKIE];
   if (!token) return null;
-  const u = await getUserBySession(token);
+  const u = await getUserBySession(req.tenantId, token);
   return u?.id ?? null;
 }
 

@@ -51,7 +51,7 @@ function uid() { return Math.random().toString(36).slice(2, 8); }
 
 async function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 
-export async function* runDemoScenario(): AsyncGenerator<DemoStep, void, unknown> {
+export async function* runDemoScenario(tenantId: string): AsyncGenerator<DemoStep, void, unknown> {
   const sc = SCENARIOS[Math.floor(Math.random() * SCENARIOS.length)];
   const code = `DEMO-${uid()}`;
   let step = 0;
@@ -64,7 +64,7 @@ export async function* runDemoScenario(): AsyncGenerator<DemoStep, void, unknown
     await sleep(400);
 
     // 1. Conversación
-    const conv = await createConversation({
+    const conv = await createConversation(tenantId, {
       channel: "chat",
       user_name: sc.user,
       client: sc.client,
@@ -73,7 +73,7 @@ export async function* runDemoScenario(): AsyncGenerator<DemoStep, void, unknown
     await sleep(600);
 
     // 2. Mensaje del usuario
-    await appendMessage(conv.id, "user", sc.problem);
+    await appendMessage(tenantId, conv.id, "user", sc.problem);
     yield next("user_message", `👤 Usuario: "${sc.problem.slice(0, 90)}…"`);
     await sleep(900);
 
@@ -89,7 +89,7 @@ export async function* runDemoScenario(): AsyncGenerator<DemoStep, void, unknown
       confidence: "alta" as const,
       needs_escalation: false,
     };
-    await updateConversation(conv.id, {
+    await updateConversation(tenantId, conv.id, {
       intent: triage.intent,
       sap_module: triage.sap_module,
       urgency: triage.urgency,
@@ -102,12 +102,12 @@ export async function* runDemoScenario(): AsyncGenerator<DemoStep, void, unknown
 
     // 4. Intento de respuesta IA
     const aiText = `Entiendo tu problema con ${triage.sap_module}. Necesito acceso al sistema para diagnosticarlo bien. Voy a escalar a Nivel 2 con todo el contexto.`;
-    await appendMessage(conv.id, "ai", aiText, { demo: true });
+    await appendMessage(tenantId, conv.id, "ai", aiText, { demo: true });
     yield next("ai_message", `🤖 AMS-Bot: "${aiText}"`);
     await sleep(800);
 
     // 5. Escalación
-    const ticket = await createTicket({
+    const ticket = await createTicket(tenantId, {
       conversationId: conv.id,
       title: triage.title,
       summary: triage.summary,
@@ -121,35 +121,36 @@ export async function* runDemoScenario(): AsyncGenerator<DemoStep, void, unknown
         { type: "triage", label: "Triage", value: JSON.stringify(triage, null, 2) },
       ],
     });
-    await updateConversation(conv.id, { status: "escalated", escalated_to_ticket: ticket.id });
-    await appendMessage(conv.id, "system", `📤 Caso escalado a Nivel 2 con el ticket ${ticket.code}.`, { escalatedTicketId: ticket.id });
+    await updateConversation(tenantId, conv.id, { status: "escalated", escalated_to_ticket: ticket.id });
+    await appendMessage(tenantId, conv.id, "system", `📤 Caso escalado a Nivel 2 con el ticket ${ticket.code}.`, { escalatedTicketId: ticket.id });
     yield next("ticket_created", `🎫 Ticket creado: ${ticket.code} — prioridad ${ticket.priority}, SLA ${ticket.sla_minutes}min`, {
       ticketId: ticket.id, code: ticket.code, priority: ticket.priority,
     });
     await sleep(1000);
 
-    // 6. Asignar a un agente (tomar el primer admin/consultor con users.role)
+    // 6. Asignar a un agente (tomar el primer admin/consultor con users.role del tenant)
     const { rows: agents } = await query<{ id: string; name: string | null }>(
-      `SELECT id, name FROM users WHERE role IN ('admin','consultor','aprobador') ORDER BY created_at LIMIT 1`
+      `SELECT id, name FROM users WHERE role IN ('admin','consultor','aprobador') AND tenant_id = $1 ORDER BY created_at LIMIT 1`,
+      [tenantId]
     );
     if (agents[0]) {
-      const t = await setTicketStatus(ticket.id, "in_progress");
+      const t = await setTicketStatus(tenantId, ticket.id, "in_progress");
       yield next("ticket_assigned", `👨‍💻 Ticket asignado a ${agents[0].name ?? agents[0].id.slice(0,8)} (in_progress)`, {
         agentName: agents[0].name, status: t?.status,
       });
     } else {
-      const t = await setTicketStatus(ticket.id, "in_progress");
+      const t = await setTicketStatus(tenantId, ticket.id, "in_progress");
       yield next("ticket_assigned", `👨‍💻 Ticket movido a in_progress`, { status: t?.status });
     }
     await sleep(900);
 
     // 7. Resolución
-    const resolved = await resolveTicket(ticket.id, sc.solution);
+    const resolved = await resolveTicket(tenantId, ticket.id, sc.solution);
     yield next("ticket_resolved", `✅ Ticket ${resolved?.code ?? ticket.code} resuelto`, { resolution: sc.solution.slice(0, 200) });
     await sleep(800);
 
     // 8. KB article (draft)
-    const kb = await createArticle({
+    const kb = await createArticle(tenantId, {
       title: `Solución: ${triage.title}`,
       problem: sc.problem,
       solution: sc.solution,

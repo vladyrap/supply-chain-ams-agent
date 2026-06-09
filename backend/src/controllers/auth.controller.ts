@@ -3,7 +3,6 @@ import {
   createUser,
   findUserByEmail,
   verifyPassword,
-  createSession,
   createSessionWithRefresh,
   rotateRefreshToken,
   revokeAllSessions,
@@ -74,7 +73,7 @@ export async function postSignup(
     return reply.code(400).send({ success: false, error: "email y password son obligatorios" });
   }
   try {
-    const existing = await findUserByEmail(b.email);
+    const existing = await findUserByEmail(req.tenantId, b.email);
     if (existing) {
       return reply.code(409).send({ success: false, error: "Ya existe un usuario con ese email" });
     }
@@ -84,16 +83,16 @@ export async function postSignup(
     // el script database/seeds/bootstrap-admin.ts.
     // Todo signup nuevo arranca como "consultor".
     const safeRole: Role = "consultor";
-    const user = await createUser({
+    const user = await createUser(req.tenantId, {
       email: b.email,
       password: b.password,
       name: b.name,
       role: safeRole,
     });
-    const { sessionToken, refreshToken } = await createSessionWithRefresh(user.id, meta(req));
+    const { sessionToken, refreshToken } = await createSessionWithRefresh(req.tenantId, user.id, meta(req));
     setSessionCookie(reply, sessionToken);
     setRefreshCookie(reply, refreshToken);
-    await recordAuthEvent("SIGNUP", user.id, meta(req));
+    await recordAuthEvent(req.tenantId, "SIGNUP", user.id, meta(req));
     return reply.send({ success: true, user });
   } catch (err) {
     logger.error({ err }, "Fallo en /api/auth/signup");
@@ -114,20 +113,20 @@ export async function postLogin(
     return reply.code(400).send({ success: false, error: "email y password son obligatorios" });
   }
   try {
-    const user = await findUserByEmail(b.email);
+    const user = await findUserByEmail(req.tenantId, b.email);
     if (!user || !user.active) {
-      await recordAuthEvent("LOGIN_FAIL", user?.id || null, { ...meta(req), details: { reason: !user ? "no_user" : "inactive", email: b.email } });
+      await recordAuthEvent(req.tenantId, "LOGIN_FAIL", user?.id || null, { ...meta(req), details: { reason: !user ? "no_user" : "inactive", email: b.email } });
       return reply.code(401).send({ success: false, error: "Credenciales inválidas" });
     }
     const ok = await verifyPassword(b.password, user.password_hash);
     if (!ok) {
-      await recordAuthEvent("LOGIN_FAIL", user.id, { ...meta(req), details: { reason: "bad_password" } });
+      await recordAuthEvent(req.tenantId, "LOGIN_FAIL", user.id, { ...meta(req), details: { reason: "bad_password" } });
       return reply.code(401).send({ success: false, error: "Credenciales inválidas" });
     }
-    const { sessionToken, refreshToken } = await createSessionWithRefresh(user.id, meta(req));
+    const { sessionToken, refreshToken } = await createSessionWithRefresh(req.tenantId, user.id, meta(req));
     setSessionCookie(reply, sessionToken);
     setRefreshCookie(reply, refreshToken);
-    await recordAuthEvent("LOGIN_SUCCESS", user.id, meta(req));
+    await recordAuthEvent(req.tenantId, "LOGIN_SUCCESS", user.id, meta(req));
     // No devolver password_hash
     const { password_hash: _ph, ...safe } = user;
     return reply.send({ success: true, user: safe });
@@ -141,12 +140,12 @@ export async function postLogout(req: FastifyRequest, reply: FastifyReply) {
   const token = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies?.[COOKIE_NAME];
   let userId: string | null = null;
   if (token) {
-    const u = await getUserBySession(token).catch(() => null);
+    const u = await getUserBySession(req.tenantId, token).catch(() => null);
     userId = u?.id || null;
-    await deleteSession(token);
+    await deleteSession(req.tenantId, token);
   }
   clearSessionCookie(reply);
-  if (userId) await recordAuthEvent("LOGOUT", userId, meta(req));
+  if (userId) await recordAuthEvent(req.tenantId, "LOGOUT", userId, meta(req));
   return reply.send({ success: true });
 }
 
@@ -154,7 +153,7 @@ export async function postLogout(req: FastifyRequest, reply: FastifyReply) {
 export async function postRefresh(req: FastifyRequest, reply: FastifyReply) {
   const refresh = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies?.[REFRESH_COOKIE_NAME];
   if (!refresh) return reply.code(401).send({ success: false, error: "no_refresh_token" });
-  const result = await rotateRefreshToken(refresh, meta(req));
+  const result = await rotateRefreshToken(req.tenantId, refresh, meta(req));
   if (!result) {
     clearSessionCookie(reply);
     return reply.code(401).send({ success: false, error: "refresh_invalid" });
@@ -168,9 +167,9 @@ export async function postRefresh(req: FastifyRequest, reply: FastifyReply) {
 export async function getSessions(req: FastifyRequest, reply: FastifyReply) {
   const token = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies?.[COOKIE_NAME];
   if (!token) return reply.code(401).send({ success: false, error: "no_session" });
-  const user = await getUserBySession(token);
+  const user = await getUserBySession(req.tenantId, token);
   if (!user) return reply.code(401).send({ success: false, error: "no_session" });
-  const sessions = await listUserSessions(user.id);
+  const sessions = await listUserSessions(req.tenantId, user.id);
   // Marcar cuál es la sesión actual
   const annotated = sessions.map((s) => ({ ...s, current: s.id === token }));
   return reply.send({ success: true, sessions: annotated });
@@ -180,9 +179,9 @@ export async function getSessions(req: FastifyRequest, reply: FastifyReply) {
 export async function postLogoutAll(req: FastifyRequest, reply: FastifyReply) {
   const token = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies?.[COOKIE_NAME];
   if (!token) return reply.code(401).send({ success: false, error: "no_session" });
-  const user = await getUserBySession(token);
+  const user = await getUserBySession(req.tenantId, token);
   if (!user) return reply.code(401).send({ success: false, error: "no_session" });
-  await revokeAllSessions(user.id, "user_initiated");
+  await revokeAllSessions(req.tenantId, user.id, "user_initiated");
   clearSessionCookie(reply);
   return reply.send({ success: true });
 }
@@ -192,7 +191,7 @@ export async function getMe(req: FastifyRequest, reply: FastifyReply) {
   if (!token) {
     return reply.code(401).send({ success: false, error: "no_session" });
   }
-  const user = await getUserBySession(token);
+  const user = await getUserBySession(req.tenantId, token);
   if (!user) {
     clearSessionCookie(reply);
     return reply.code(401).send({ success: false, error: "invalid_session" });
@@ -207,7 +206,7 @@ async function requireAdmin(req: FastifyRequest, reply: FastifyReply) {
     reply.code(401).send({ success: false, error: "no_session" });
     return null;
   }
-  const user = await getUserBySession(token);
+  const user = await getUserBySession(req.tenantId, token);
   if (!user) {
     reply.code(401).send({ success: false, error: "invalid_session" });
     return null;
@@ -222,7 +221,7 @@ async function requireAdmin(req: FastifyRequest, reply: FastifyReply) {
 export async function getUsers(req: FastifyRequest, reply: FastifyReply) {
   const me = await requireAdmin(req, reply);
   if (!me) return;
-  const users = await listUsers();
+  const users = await listUsers(req.tenantId);
   return reply.send({ success: true, count: users.length, users });
 }
 
@@ -237,7 +236,7 @@ export async function patchUserRole(
     return reply.code(400).send({ success: false, error: "role es obligatorio" });
   }
   try {
-    const updated = await updateUserRole(req.params.id, newRole);
+    const updated = await updateUserRole(req.tenantId, req.params.id, newRole);
     if (!updated) return reply.code(404).send({ success: false, error: "usuario no encontrado" });
     return reply.send({ success: true, user: updated });
   } catch (err) {

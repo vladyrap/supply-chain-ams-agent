@@ -21,7 +21,7 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply): Pro
     reply.code(401).send({ success: false, error: "Sesión requerida" });
     return;
   }
-  const user = await getUserBySession(token);
+  const user = await getUserBySession(req.tenantId, token);
   if (!user) {
     reply.code(401).send({ success: false, error: "Sesión inválida o expirada" });
     return;

@@ -64,6 +64,7 @@ async function ensureHardenedSchema(): Promise<void> {
 }
 
 export async function recordAuthEvent(
+  tenantId: string,
   event: "LOGIN_SUCCESS" | "LOGIN_FAIL" | "LOGOUT" | "REFRESH" | "REVOKE_ALL" | "SIGNUP",
   userId: string | null,
   meta: { ip?: string; userAgent?: string; details?: Record<string, unknown> } = {}
@@ -71,9 +72,9 @@ export async function recordAuthEvent(
   try {
     await ensureHardenedSchema();
     await query(
-      `INSERT INTO auth_events (user_id, event, ip_address, user_agent, details)
-       VALUES ($1, $2, $3, $4, $5::jsonb)`,
-      [userId, event, meta.ip || null, meta.userAgent || null,
+      `INSERT INTO auth_events (tenant_id, user_id, event, ip_address, user_agent, details)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+      [tenantId, userId, event, meta.ip || null, meta.userAgent || null,
        meta.details ? JSON.stringify(meta.details) : null]
     );
   } catch (err) {
@@ -88,7 +89,7 @@ export interface SignupInput {
   role?: Role;
 }
 
-export async function createUser(input: SignupInput): Promise<User> {
+export async function createUser(tenantId: string, input: SignupInput): Promise<User> {
   const email = input.email.trim().toLowerCase();
   if (!email || !email.includes("@")) {
     throw new Error("Email inválido");
@@ -100,29 +101,30 @@ export async function createUser(input: SignupInput): Promise<User> {
   const hash = await bcrypt.hash(input.password, BCRYPT_ROUNDS);
 
   const { rows } = await query<User>(
-    `INSERT INTO users (email, password_hash, name, role)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO users (tenant_id, email, password_hash, name, role)
+     VALUES ($1, $2, $3, $4, $5)
      RETURNING id, email, name, role, active, created_at`,
-    [email, hash, input.name ?? null, role]
+    [tenantId, email, hash, input.name ?? null, role]
   );
   return rows[0]!;
 }
 
-export async function findUserByEmail(email: string): Promise<UserWithPasswordHash | null> {
+export async function findUserByEmail(tenantId: string, email: string): Promise<UserWithPasswordHash | null> {
   const { rows } = await query<UserWithPasswordHash>(
     `SELECT id, email, name, role, active, created_at, password_hash
        FROM users
-      WHERE LOWER(email) = LOWER($1)`,
-    [email]
+      WHERE LOWER(email) = LOWER($1)
+        AND tenant_id = $2`,
+    [email, tenantId]
   );
   return rows[0] ?? null;
 }
 
-export async function findUserById(id: string): Promise<User | null> {
+export async function findUserById(tenantId: string, id: string): Promise<User | null> {
   const { rows } = await query<User>(
     `SELECT id, email, name, role, active, created_at
-       FROM users WHERE id = $1`,
-    [id]
+       FROM users WHERE id = $1 AND tenant_id = $2`,
+    [id, tenantId]
   );
   return rows[0] ?? null;
 }
@@ -131,14 +133,14 @@ export async function verifyPassword(plain: string, hash: string): Promise<boole
   return bcrypt.compare(plain, hash);
 }
 
-export async function createSession(userId: string, userAgent?: string, ip?: string): Promise<string> {
+export async function createSession(tenantId: string, userId: string, userAgent?: string, ip?: string): Promise<string> {
   await ensureHardenedSchema();
   const token = generateSessionToken();
   const expiresAt = new Date(Date.now() + SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
   await query(
-    `INSERT INTO sessions (id, user_id, expires_at, user_agent, ip_address, last_used_at)
-     VALUES ($1, $2, $3, $4, $5, now())`,
-    [token, userId, expiresAt.toISOString(), userAgent ?? null, ip ?? null]
+    `INSERT INTO sessions (id, tenant_id, user_id, expires_at, user_agent, ip_address, last_used_at)
+     VALUES ($1, $2, $3, $4, $5, $6, now())`,
+    [token, tenantId, userId, expiresAt.toISOString(), userAgent ?? null, ip ?? null]
   );
   return token;
 }
@@ -150,30 +152,30 @@ export interface SessionWithRefresh {
 }
 
 /** Crea sesión + refresh token. Pensado para login. */
-export async function createSessionWithRefresh(userId: string, meta: { userAgent?: string; ip?: string } = {}): Promise<SessionWithRefresh> {
+export async function createSessionWithRefresh(tenantId: string, userId: string, meta: { userAgent?: string; ip?: string } = {}): Promise<SessionWithRefresh> {
   await ensureHardenedSchema();
-  const sessionToken = await createSession(userId, meta.userAgent, meta.ip);
+  const sessionToken = await createSession(tenantId, userId, meta.userAgent, meta.ip);
   const refreshToken = crypto.randomBytes(48).toString("hex");
   const refreshExpiresAt = new Date(Date.now() + REFRESH_TTL_DAYS * 24 * 60 * 60 * 1000);
   await query(
-    `INSERT INTO refresh_tokens (id, user_id, session_id, expires_at, user_agent, ip_address)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [refreshToken, userId, sessionToken, refreshExpiresAt.toISOString(),
+    `INSERT INTO refresh_tokens (id, tenant_id, user_id, session_id, expires_at, user_agent, ip_address)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [refreshToken, tenantId, userId, sessionToken, refreshExpiresAt.toISOString(),
      meta.userAgent || null, meta.ip || null]
   );
   return { sessionToken, refreshToken, refreshExpiresAt: refreshExpiresAt.toISOString() };
 }
 
 /** Rotación: marca el viejo como usado, crea uno nuevo. Si ya fue usado → es ataque, revocamos todo. */
-export async function rotateRefreshToken(oldRefresh: string, meta: { userAgent?: string; ip?: string } = {}): Promise<SessionWithRefresh | null> {
+export async function rotateRefreshToken(tenantId: string, oldRefresh: string, meta: { userAgent?: string; ip?: string } = {}): Promise<SessionWithRefresh | null> {
   await ensureHardenedSchema();
   const { rows } = await query<{
     id: string; user_id: string; session_id: string | null;
     expires_at: string; used_at: string | null; revoked_at: string | null;
   }>(
     `SELECT id, user_id, session_id, expires_at, used_at, revoked_at
-       FROM refresh_tokens WHERE id = $1`,
-    [oldRefresh]
+       FROM refresh_tokens WHERE id = $1 AND tenant_id = $2`,
+    [oldRefresh, tenantId]
   );
   const t = rows[0];
   if (!t) return null;
@@ -181,26 +183,26 @@ export async function rotateRefreshToken(oldRefresh: string, meta: { userAgent?:
   if (t.used_at) {
     // Reuso detectado → revocamos toda la familia de refresh tokens del usuario por seguridad.
     logger.warn({ userId: t.user_id, oldRefresh: oldRefresh.slice(0, 8) }, "refresh token reuse detected, revoking all");
-    await query(`UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, [t.user_id]);
-    await query(`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, [t.user_id]);
-    await recordAuthEvent("REVOKE_ALL", t.user_id, { ip: meta.ip, userAgent: meta.userAgent, details: { reason: "refresh_reuse" } });
+    await query(`UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL AND tenant_id = $2`, [t.user_id, tenantId]);
+    await query(`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL AND tenant_id = $2`, [t.user_id, tenantId]);
+    await recordAuthEvent(tenantId, "REVOKE_ALL", t.user_id, { ip: meta.ip, userAgent: meta.userAgent, details: { reason: "refresh_reuse" } });
     return null;
   }
-  const fresh = await createSessionWithRefresh(t.user_id, meta);
+  const fresh = await createSessionWithRefresh(tenantId, t.user_id, meta);
   await query(
-    `UPDATE refresh_tokens SET used_at = now(), replaced_by = $1 WHERE id = $2`,
-    [fresh.refreshToken, t.id]
+    `UPDATE refresh_tokens SET used_at = now(), replaced_by = $1 WHERE id = $2 AND tenant_id = $3`,
+    [fresh.refreshToken, t.id, tenantId]
   );
-  await recordAuthEvent("REFRESH", t.user_id, { ip: meta.ip, userAgent: meta.userAgent });
+  await recordAuthEvent(tenantId, "REFRESH", t.user_id, { ip: meta.ip, userAgent: meta.userAgent });
   return fresh;
 }
 
 /** Logout en TODOS los dispositivos del usuario. */
-export async function revokeAllSessions(userId: string, reason = "manual"): Promise<void> {
+export async function revokeAllSessions(tenantId: string, userId: string, reason = "manual"): Promise<void> {
   await ensureHardenedSchema();
-  await query(`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, [userId]);
-  await query(`UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`, [userId]);
-  await recordAuthEvent("REVOKE_ALL", userId, { details: { reason } });
+  await query(`UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL AND tenant_id = $2`, [userId, tenantId]);
+  await query(`UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL AND tenant_id = $2`, [userId, tenantId]);
+  await recordAuthEvent(tenantId, "REVOKE_ALL", userId, { details: { reason } });
 }
 
 export interface SessionRow {
@@ -215,15 +217,15 @@ export interface SessionRow {
 }
 
 /** Lista sesiones activas del usuario (para UI "tus dispositivos"). */
-export async function listUserSessions(userId: string): Promise<SessionRow[]> {
+export async function listUserSessions(tenantId: string, userId: string): Promise<SessionRow[]> {
   await ensureHardenedSchema();
   const { rows } = await query<{
     id: string; user_id: string; user_agent: string | null; ip_address: string | null;
     created_at: string; last_used_at: string | null; expires_at: string; revoked_at: string | null;
   }>(
     `SELECT id, user_id, user_agent, ip_address, created_at, last_used_at, expires_at, revoked_at
-       FROM sessions WHERE user_id = $1 ORDER BY last_used_at DESC NULLS LAST, created_at DESC LIMIT 50`,
-    [userId]
+       FROM sessions WHERE user_id = $1 AND tenant_id = $2 ORDER BY last_used_at DESC NULLS LAST, created_at DESC LIMIT 50`,
+    [userId, tenantId]
   );
   return rows.map((r) => ({
     id: r.id, userId: r.user_id, userAgent: r.user_agent, ipAddress: r.ip_address,
@@ -232,7 +234,7 @@ export async function listUserSessions(userId: string): Promise<SessionRow[]> {
   }));
 }
 
-export async function getUserBySession(sessionId: string): Promise<User | null> {
+export async function getUserBySession(tenantId: string, sessionId: string): Promise<User | null> {
   await ensureHardenedSchema();
   const { rows } = await query<User>(
     `SELECT u.id, u.email, u.name, u.role, u.active, u.created_at
@@ -241,62 +243,71 @@ export async function getUserBySession(sessionId: string): Promise<User | null> 
       WHERE s.id = $1
         AND s.expires_at > now()
         AND s.revoked_at IS NULL
-        AND u.active = true`,
-    [sessionId]
+        AND u.active = true
+        AND s.tenant_id = $2
+        AND u.tenant_id = $2`,
+    [sessionId, tenantId]
   );
   if (rows[0]) {
     // touch last_used_at en background (no esperamos)
-    query(`UPDATE sessions SET last_used_at = now() WHERE id = $1`, [sessionId]).catch(() => null);
+    query(`UPDATE sessions SET last_used_at = now() WHERE id = $1 AND tenant_id = $2`, [sessionId, tenantId]).catch(() => null);
   }
   return rows[0] ?? null;
 }
 
-export async function deleteSession(sessionId: string): Promise<void> {
+export async function deleteSession(tenantId: string, sessionId: string): Promise<void> {
   // Soft-delete: marcar como revocada (auditable). El TTL hace el cleanup eventual.
   await ensureHardenedSchema().catch(() => null);
-  await query(`UPDATE sessions SET revoked_at = now() WHERE id = $1`, [sessionId]).catch(async () => {
+  await query(`UPDATE sessions SET revoked_at = now() WHERE id = $1 AND tenant_id = $2`, [sessionId, tenantId]).catch(async () => {
     // Fallback si la columna no existe aún
-    await query(`DELETE FROM sessions WHERE id = $1`, [sessionId]);
+    await query(`DELETE FROM sessions WHERE id = $1 AND tenant_id = $2`, [sessionId, tenantId]);
   });
   // Revocar refresh tokens asociados
-  await query(`UPDATE refresh_tokens SET revoked_at = now() WHERE session_id = $1 AND revoked_at IS NULL`, [sessionId])
+  await query(`UPDATE refresh_tokens SET revoked_at = now() WHERE session_id = $1 AND revoked_at IS NULL AND tenant_id = $2`, [sessionId, tenantId])
     .catch(() => null);
 }
 
-export async function listUsers(): Promise<User[]> {
+export async function listUsers(tenantId: string): Promise<User[]> {
   const { rows } = await query<User>(
     `SELECT id, email, name, role, active, created_at
-       FROM users ORDER BY created_at DESC LIMIT 200`
+       FROM users
+      WHERE tenant_id = $1
+      ORDER BY created_at DESC LIMIT 200`,
+    [tenantId]
   );
   return rows;
 }
 
-export async function updateUserRole(userId: string, role: Role): Promise<User | null> {
+export async function updateUserRole(tenantId: string, userId: string, role: Role): Promise<User | null> {
   if (!VALID_ROLES.has(role)) throw new Error("Rol inválido");
   const { rows } = await query<User>(
     `UPDATE users SET role = $1, updated_at = now()
-      WHERE id = $2
+      WHERE id = $2 AND tenant_id = $3
       RETURNING id, email, name, role, active, created_at`,
-    [role, userId]
+    [role, userId, tenantId]
   );
   return rows[0] ?? null;
 }
 
 // Bootstrap: si no hay usuarios, crear admin por defecto desde env vars.
-export async function bootstrapAdminIfNeeded(): Promise<void> {
+// Acepta tenantId opcional; si no se pasa, usa 'default' (bootstrap inicial single-tenant).
+export async function bootstrapAdminIfNeeded(tenantId: string = "default"): Promise<void> {
   const adminEmail = process.env.AMS_BOOTSTRAP_ADMIN_EMAIL;
   const adminPass = process.env.AMS_BOOTSTRAP_ADMIN_PASSWORD;
   if (!adminEmail || !adminPass) return;
   try {
-    const { rows } = await query<{ c: string }>("SELECT count(*)::text AS c FROM users");
+    const { rows } = await query<{ c: string }>(
+      "SELECT count(*)::text AS c FROM users WHERE tenant_id = $1",
+      [tenantId]
+    );
     if (Number(rows[0]?.c ?? 0) > 0) return;
-    await createUser({
+    await createUser(tenantId, {
       email: adminEmail,
       password: adminPass,
       name: "Administrador",
       role: "admin",
     });
-    logger.info({ email: adminEmail }, "Bootstrap admin creado");
+    logger.info({ email: adminEmail, tenantId }, "Bootstrap admin creado");
   } catch (err) {
     logger.warn({ err }, "bootstrap admin falló (no es crítico)");
   }

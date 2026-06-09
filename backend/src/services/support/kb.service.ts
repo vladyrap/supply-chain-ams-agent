@@ -16,13 +16,14 @@ export interface CreateKbInput {
   created_by?: string;
 }
 
-export async function createArticle(input: CreateKbInput): Promise<KbArticle> {
+export async function createArticle(tenantId: string, input: CreateKbInput): Promise<KbArticle> {
   const { rows } = await query<KbArticle>(
     `INSERT INTO kb_articles
-       (title, problem, solution, system, category, tags, source, source_ticket_id, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       (tenant_id, title, problem, solution, system, category, tags, source, source_ticket_id, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      RETURNING *`,
     [
+      tenantId,
       input.title,
       input.problem,
       input.solution,
@@ -37,17 +38,17 @@ export async function createArticle(input: CreateKbInput): Promise<KbArticle> {
   return rows[0]!;
 }
 
-export async function listArticles(filters: {
+export async function listArticles(tenantId: string, filters: {
   status?: KbStatus;
   system?: string;
   category?: string;
 } = {}): Promise<KbArticle[]> {
-  const conds: string[] = [];
-  const params: unknown[] = [];
+  const conds: string[] = ["tenant_id = $1"];
+  const params: unknown[] = [tenantId];
   if (filters.status)   { params.push(filters.status); conds.push(`status = $${params.length}`); }
   if (filters.system)   { params.push(filters.system); conds.push(`system = $${params.length}`); }
   if (filters.category) { params.push(filters.category); conds.push(`category = $${params.length}`); }
-  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const where = `WHERE ${conds.join(" AND ")}`;
   const { rows } = await query<KbArticle>(
     `SELECT * FROM kb_articles ${where} ORDER BY status, helpful_count DESC, created_at DESC LIMIT 200`,
     params
@@ -55,61 +56,70 @@ export async function listArticles(filters: {
   return rows;
 }
 
-export async function getArticleById(id: string): Promise<KbArticle | null> {
-  const { rows } = await query<KbArticle>(`SELECT * FROM kb_articles WHERE id = $1`, [id]);
+export async function getArticleById(tenantId: string, id: string): Promise<KbArticle | null> {
+  const { rows } = await query<KbArticle>(
+    `SELECT * FROM kb_articles WHERE id = $1 AND tenant_id = $2`,
+    [id, tenantId]
+  );
   return rows[0] ?? null;
 }
 
-export async function approveArticle(id: string, approvedBy: string): Promise<KbArticle | null> {
+export async function approveArticle(tenantId: string, id: string, approvedBy: string): Promise<KbArticle | null> {
   const { rows } = await query<KbArticle>(
     `UPDATE kb_articles
         SET status = 'approved', approved_by = $1, approved_at = now()
-      WHERE id = $2
+      WHERE id = $2 AND tenant_id = $3
       RETURNING *`,
-    [approvedBy, id]
+    [approvedBy, id, tenantId]
   );
   return rows[0] ?? null;
 }
 
-export async function archiveArticle(id: string): Promise<KbArticle | null> {
+export async function archiveArticle(tenantId: string, id: string): Promise<KbArticle | null> {
   const { rows } = await query<KbArticle>(
-    `UPDATE kb_articles SET status = 'archived' WHERE id = $1 RETURNING *`,
-    [id]
+    `UPDATE kb_articles SET status = 'archived' WHERE id = $1 AND tenant_id = $2 RETURNING *`,
+    [id, tenantId]
   );
   return rows[0] ?? null;
 }
 
-export async function deleteArticle(id: string): Promise<boolean> {
-  const res = await query(`DELETE FROM kb_articles WHERE id = $1`, [id]);
+export async function deleteArticle(tenantId: string, id: string): Promise<boolean> {
+  const res = await query(`DELETE FROM kb_articles WHERE id = $1 AND tenant_id = $2`, [id, tenantId]);
   return res.rowCount > 0;
 }
 
-export async function incUseCount(id: string): Promise<void> {
+export async function incUseCount(tenantId: string, id: string): Promise<void> {
   try {
-    await query(`UPDATE kb_articles SET use_count = use_count + 1 WHERE id = $1`, [id]);
+    await query(
+      `UPDATE kb_articles SET use_count = use_count + 1 WHERE id = $1 AND tenant_id = $2`,
+      [id, tenantId]
+    );
   } catch (err) {
-    logger.warn({ err, id }, "kb.incUseCount fail");
+    logger.warn({ err, id, tenantId }, "kb.incUseCount fail");
   }
 }
 
-export async function markHelpful(id: string): Promise<void> {
+export async function markHelpful(tenantId: string, id: string): Promise<void> {
   try {
-    await query(`UPDATE kb_articles SET helpful_count = helpful_count + 1 WHERE id = $1`, [id]);
+    await query(
+      `UPDATE kb_articles SET helpful_count = helpful_count + 1 WHERE id = $1 AND tenant_id = $2`,
+      [id, tenantId]
+    );
   } catch (err) {
-    logger.warn({ err, id }, "kb.markHelpful fail");
+    logger.warn({ err, id, tenantId }, "kb.markHelpful fail");
   }
 }
 
 // Búsqueda simple: por sistema + ILIKE en title/problem/solution.
 // Para escalas grandes, esto debería usar pgvector o full-text search.
 // En MVP usamos ILIKE — suficiente para hasta unos miles de articles.
-export async function searchArticles(opts: {
+export async function searchArticles(tenantId: string, opts: {
   text: string;
   system?: string;
   limit?: number;
 }): Promise<KbArticle[]> {
-  const conds: string[] = ["status = 'approved'"];
-  const params: unknown[] = [];
+  const conds: string[] = ["status = 'approved'", "tenant_id = $1"];
+  const params: unknown[] = [tenantId];
   if (opts.system && opts.system !== "NO_INFORMADO") {
     params.push(opts.system);
     conds.push(`(system IS NULL OR system = $${params.length})`);

@@ -56,7 +56,7 @@ export async function postIngest(
   }
 
   try {
-    const doc = await createDocumentAndQueue({
+    const doc = await createDocumentAndQueue(req.tenantId, {
       title: b.title,
       fileName: b.fileName,
       mimeType: b.mimeType,
@@ -84,7 +84,7 @@ export async function getDocuments(
 ) {
   try {
     const q = req.query || {};
-    const documents = await listDocuments({
+    const documents = await listDocuments(req.tenantId, {
       module: q.module || undefined,
       client: q.client || undefined,
       status: q.status || undefined,
@@ -105,7 +105,7 @@ export async function delDocument(
     return reply.code(400).send({ success: false, error: "ID inválido" });
   }
   try {
-    const ok = await deleteDocument(id);
+    const ok = await deleteDocument(req.tenantId, id);
     if (!ok) return reply.code(404).send({ success: false, error: "Documento no encontrado" });
     return reply.send({ success: true });
   } catch (err) {
@@ -114,9 +114,9 @@ export async function delDocument(
   }
 }
 
-export async function getKnowledgeOverview(_req: FastifyRequest, reply: FastifyReply) {
+export async function getKnowledgeOverview(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const stats = await getKnowledgeStats();
+    const stats = await getKnowledgeStats(req.tenantId);
     return reply.send({ success: true, stats });
   } catch (err) {
     logger.error({ err }, "Fallo en knowledge stats");
@@ -148,7 +148,7 @@ export async function postIngestText(
   }
   const title = (b.title || `Texto pegado ${new Date().toISOString().slice(0, 16)}`).trim().slice(0, 200);
   try {
-    const doc = await ingestTextDirect({
+    const doc = await ingestTextDirect(req.tenantId, {
       title,
       content: b.content,
       module: b.module || undefined,
@@ -181,7 +181,7 @@ export async function postIngestUrl(
     return reply.code(400).send({ success: false, error: "url es obligatorio" });
   }
   try {
-    const doc = await ingestFromUrl({
+    const doc = await ingestFromUrl(req.tenantId, {
       url: b.url.trim(),
       title: b.title?.trim(),
       module: b.module || undefined,
@@ -209,7 +209,7 @@ export async function getDocumentChunks(
   }
   const limit = req.query?.limit ? Math.max(1, Math.min(500, parseInt(req.query.limit, 10) || 200)) : 200;
   try {
-    const chunks = await listChunksByDocument(id, limit);
+    const chunks = await listChunksByDocument(req.tenantId, id, limit);
     return reply.send({ success: true, count: chunks.length, chunks });
   } catch (err) {
     logger.error({ err, id }, "Fallo listando chunks");

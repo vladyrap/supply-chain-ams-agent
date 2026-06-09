@@ -21,7 +21,7 @@ export async function streamDemoRun(req: FastifyRequest, reply: FastifyReply) {
 
   try {
     write("start", { ts: Date.now() });
-    for await (const step of runDemoScenario()) {
+    for await (const step of runDemoScenario(req.tenantId)) {
       write("step", step);
       if (step.kind === "done" || step.kind === "error") break;
     }

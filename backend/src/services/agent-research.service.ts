@@ -77,6 +77,7 @@ export interface ResearchInput {
   module: string;
   client: string;
   environment: string;
+  tenantId: string;
   attachments?: Attachment[];
   conversationId?: string;
   // Callback opcional para emitir eventos en vivo (usado por SSE visualizer).
@@ -222,7 +223,7 @@ export async function researchWithAgent(input: ResearchInput): Promise<ResearchR
       const result = await executeTool(
         fc.functionCall.name,
         args,
-        { module: input.module, client: input.client, conversationId: input.conversationId }
+        { tenantId: input.tenantId, module: input.module, client: input.client, conversationId: input.conversationId }
       );
       const durationMs = Date.now() - callStart;
       toolCalls.push({

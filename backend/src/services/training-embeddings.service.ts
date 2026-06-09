@@ -13,6 +13,10 @@
 //   2) buildSemanticFewShot(query) → embebe la query, hace cosine
 //      contra ambas tablas, devuelve top-K.
 //   3) Endpoint backfill para rellenar lo que ya existe.
+//
+// MT-2 (multi-tenant): CRÍTICO. La búsqueda semántica filtra SIEMPRE por
+// tenant_id antes del ORDER BY <=> para que NINGÚN tenant pueda ver
+// embeddings de otro cliente, ni siquiera por similitud.
 
 import { GoogleGenAI } from "@google/genai";
 import { query } from "../database/db";
@@ -89,54 +93,58 @@ async function ensureSchema(): Promise<void> {
 }
 
 // ========================= UPSERTS =========================
-export async function upsertQaEmbedding(qaId: string, text: string): Promise<void> {
+export async function upsertQaEmbedding(tenantId: string, qaId: string, text: string): Promise<void> {
   await ensureSchema();
   const hash = simpleHash(text);
-  // Skip si ya está embeddeado con el mismo hash
+  // Skip si ya está embeddeado con el mismo hash (mismo tenant)
   try {
     const { rows } = await query<{ text_hash: string }>(
-      `SELECT text_hash FROM kb_training_qa_embeddings WHERE qa_id = $1`, [qaId]
+      `SELECT text_hash FROM kb_training_qa_embeddings WHERE qa_id = $1 AND tenant_id = $2`,
+      [qaId, tenantId]
     );
     if (rows[0]?.text_hash === hash) return;
   } catch { /* tabla no existe aún */ }
   try {
     const vec = await embed(text);
     await query(
-      `INSERT INTO kb_training_qa_embeddings (qa_id, embedding, text_hash, updated_at)
-       VALUES ($1, $2::vector, $3, now())
+      `INSERT INTO kb_training_qa_embeddings (tenant_id, qa_id, embedding, text_hash, updated_at)
+       VALUES ($1, $2, $3::vector, $4, now())
        ON CONFLICT (qa_id) DO UPDATE
          SET embedding = EXCLUDED.embedding,
              text_hash = EXCLUDED.text_hash,
+             tenant_id = EXCLUDED.tenant_id,
              updated_at = now()`,
-      [qaId, toPgVector(vec), hash]
+      [tenantId, qaId, toPgVector(vec), hash]
     );
   } catch (err) {
-    logger.warn({ err, qaId }, "upsertQaEmbedding fail");
+    logger.warn({ err, qaId, tenantId }, "upsertQaEmbedding fail");
   }
 }
 
-export async function upsertItemEmbedding(itemId: string, text: string): Promise<void> {
+export async function upsertItemEmbedding(tenantId: string, itemId: string, text: string): Promise<void> {
   await ensureSchema();
   const hash = simpleHash(text);
   try {
     const { rows } = await query<{ text_hash: string }>(
-      `SELECT text_hash FROM kb_training_item_embeddings WHERE item_id = $1`, [itemId]
+      `SELECT text_hash FROM kb_training_item_embeddings WHERE item_id = $1 AND tenant_id = $2`,
+      [itemId, tenantId]
     );
     if (rows[0]?.text_hash === hash) return;
   } catch { /* */ }
   try {
     const vec = await embed(text);
     await query(
-      `INSERT INTO kb_training_item_embeddings (item_id, embedding, text_hash, updated_at)
-       VALUES ($1, $2::vector, $3, now())
+      `INSERT INTO kb_training_item_embeddings (tenant_id, item_id, embedding, text_hash, updated_at)
+       VALUES ($1, $2, $3::vector, $4, now())
        ON CONFLICT (item_id) DO UPDATE
          SET embedding = EXCLUDED.embedding,
              text_hash = EXCLUDED.text_hash,
+             tenant_id = EXCLUDED.tenant_id,
              updated_at = now()`,
-      [itemId, toPgVector(vec), hash]
+      [tenantId, itemId, toPgVector(vec), hash]
     );
   } catch (err) {
-    logger.warn({ err, itemId }, "upsertItemEmbedding fail");
+    logger.warn({ err, itemId, tenantId }, "upsertItemEmbedding fail");
   }
 }
 
@@ -149,58 +157,63 @@ export interface BackfillReport {
   skippedSameHash: number;
 }
 
-export async function backfillTrainingEmbeddings(opts: { limit?: number } = {}): Promise<BackfillReport> {
+export async function backfillTrainingEmbeddings(
+  tenantId: string,
+  opts: { limit?: number } = {}
+): Promise<BackfillReport> {
   await ensureSchema();
   const report: BackfillReport = {
     qasScanned: 0, qasEmbedded: 0, itemsScanned: 0, itemsEmbedded: 0, skippedSameHash: 0,
   };
   const limit = Math.max(1, Math.min(500, opts.limit ?? 200));
 
-  // Q&A aprobadas sin embedding o con hash distinto
+  // Q&A aprobadas sin embedding (scoped al tenant)
   try {
     const { rows: qas } = await query<{ id: string; question: string; expected_answer: string }>(
       `SELECT q.id, q.question, q.expected_answer
          FROM kb_training_qa q
          LEFT JOIN kb_training_qa_embeddings e ON e.qa_id = q.id
         WHERE q.approved = true
+          AND q.tenant_id = $1
           AND (e.qa_id IS NULL)
         ORDER BY q.created_at DESC
-        LIMIT $1`,
-      [limit]
+        LIMIT $2`,
+      [tenantId, limit]
     );
     report.qasScanned = qas.length;
     for (const q of qas) {
       const text = `${q.question}\n\n${q.expected_answer}`;
-      await upsertQaEmbedding(q.id, text);
+      await upsertQaEmbedding(tenantId, q.id, text);
       report.qasEmbedded++;
     }
   } catch (err) {
     logger.warn({ err }, "backfill qa fail");
   }
 
-  // Items PUBLISHED sin embedding
+  // Items PUBLISHED sin embedding (scoped al tenant)
   try {
     const { rows: items } = await query<{ id: string; title: string; summary: string; content: string }>(
       `SELECT i.id, i.title, i.summary, i.content
          FROM kb_training_items i
          LEFT JOIN kb_training_item_embeddings e ON e.item_id = i.id
         WHERE i.status = 'PUBLISHED'
+          AND i.tenant_id = $1
           AND (e.item_id IS NULL)
         ORDER BY i.updated_at DESC
-        LIMIT $1`,
-      [limit]
+        LIMIT $2`,
+      [tenantId, limit]
     );
     report.itemsScanned = items.length;
     for (const it of items) {
       const text = `${it.title}\n\n${it.summary}\n\n${it.content.slice(0, 4000)}`;
-      await upsertItemEmbedding(it.id, text);
+      await upsertItemEmbedding(tenantId, it.id, text);
       report.itemsEmbedded++;
     }
   } catch (err) {
     logger.warn({ err }, "backfill items fail");
   }
 
-  logger.info(report, "backfill training embeddings completed");
+  logger.info({ tenantId, report }, "backfill training embeddings completed");
   return report;
 }
 
@@ -212,7 +225,11 @@ export interface SemanticFewShotResult {
   items: { id: string; title: string; summary: string; module: string; similarity: number }[];
 }
 
-export async function buildSemanticFewShot(userQuery: string, module?: string): Promise<SemanticFewShotResult> {
+export async function buildSemanticFewShot(
+  tenantId: string,
+  userQuery: string,
+  module?: string
+): Promise<SemanticFewShotResult> {
   const empty: SemanticFewShotResult = { qaIds: [], itemIds: [], qas: [], items: [] };
   if (!userQuery || userQuery.trim().length < 3) return empty;
   await ensureSchema();
@@ -226,7 +243,8 @@ export async function buildSemanticFewShot(userQuery: string, module?: string): 
   }
   const qVecLit = toPgVector(qVec);
 
-  // Q&A top
+  // Q&A top — CRÍTICO: filtrar por tenant_id ANTES del ORDER BY <=> para que
+  // un cliente NUNCA vea embeddings de otro tenant, ni siquiera por similitud.
   let qaRows: { id: string; question: string; expected_answer: string; module: string | null; similarity: string }[] = [];
   try {
     const { rows } = await query<{ id: string; question: string; expected_answer: string; module: string | null; similarity: string }>(
@@ -236,16 +254,18 @@ export async function buildSemanticFewShot(userQuery: string, module?: string): 
          JOIN kb_training_qa q ON q.id = e.qa_id
          LEFT JOIN kb_training_items i ON i.id = q.knowledge_item_id
         WHERE q.approved = true
+          AND e.tenant_id = $3
+          AND q.tenant_id = $3
         ORDER BY e.embedding <=> $1::vector
         LIMIT $2`,
-      [qVecLit, TOP_QAS * 2]
+      [qVecLit, TOP_QAS * 2, tenantId]
     );
     qaRows = rows;
   } catch (err) {
     logger.debug({ err }, "semantic few-shot qa search fail");
   }
 
-  // Items top
+  // Items top — mismo aislamiento por tenant_id.
   let itemRows: { id: string; title: string; summary: string; module: string; similarity: string }[] = [];
   try {
     const { rows } = await query<{ id: string; title: string; summary: string; module: string; similarity: string }>(
@@ -254,9 +274,11 @@ export async function buildSemanticFewShot(userQuery: string, module?: string): 
          FROM kb_training_item_embeddings e
          JOIN kb_training_items i ON i.id = e.item_id
         WHERE i.status = 'PUBLISHED'
+          AND e.tenant_id = $3
+          AND i.tenant_id = $3
         ORDER BY e.embedding <=> $1::vector
         LIMIT $2`,
-      [qVecLit, TOP_ITEMS * 2]
+      [qVecLit, TOP_ITEMS * 2, tenantId]
     );
     itemRows = rows;
   } catch (err) {

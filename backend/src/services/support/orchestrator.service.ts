@@ -45,37 +45,40 @@ const GREETING = `¡Hola! 👋 Soy AMS-Bot, tu primera línea de soporte AMS Sup
 Cuéntame brevemente qué pasa y te ayudo. Si veo que el caso necesita un especialista, lo escalo a Nivel 2 con todo el contexto.`;
 
 export async function handleFirstMessage(
+  tenantId: string,
   conversationId: string,
   userText: string
 ): Promise<HandleUserMessageResult> {
   // Append user message
-  await appendMessage(conversationId, "user", userText);
+  await appendMessage(tenantId, conversationId, "user", userText);
   // Mandar saludo + procesar el primer mensaje (igual que un message normal)
   // El saludo lo añadimos como mensaje "system" para que el usuario lo vea pero
   // que el modelo no se confunda con conversación. En la UI se muestra arriba.
-  await appendMessage(conversationId, "system", GREETING, { greeting: true });
-  return handleUserMessageInternal(conversationId, userText);
+  await appendMessage(tenantId, conversationId, "system", GREETING, { greeting: true });
+  return handleUserMessageInternal(tenantId, conversationId, userText);
 }
 
 export async function handleUserMessage(
+  tenantId: string,
   conversationId: string,
   userText: string
 ): Promise<HandleUserMessageResult> {
-  await appendMessage(conversationId, "user", userText);
-  return handleUserMessageInternal(conversationId, userText);
+  await appendMessage(tenantId, conversationId, "user", userText);
+  return handleUserMessageInternal(tenantId, conversationId, userText);
 }
 
 async function handleUserMessageInternal(
+  tenantId: string,
   conversationId: string,
   userText: string
 ): Promise<HandleUserMessageResult> {
-  const conv = await getConversationById(conversationId);
+  const conv = await getConversationById(tenantId, conversationId);
   if (!conv) throw new Error("Conversación no encontrada");
 
   // 1. TRIAGE
   let triage;
   try {
-    const history = await listMessages(conversationId);
+    const history = await listMessages(tenantId, conversationId);
     const recentText = history.slice(-6)
       .filter((m) => m.role === "user" || m.role === "ai")
       .map((m) => `${m.role === "user" ? "U" : "AI"}: ${m.text}`)
@@ -96,7 +99,7 @@ async function handleUserMessageInternal(
     };
   }
 
-  await recordSupportAudit({
+  await recordSupportAudit(tenantId, {
     conversationId,
     action: "TRIAGE_DONE",
     actor: "ai",
@@ -104,14 +107,14 @@ async function handleUserMessageInternal(
   });
 
   // 2. RESOLVER
-  const history = await listMessages(conversationId);
+  const history = await listMessages(tenantId, conversationId);
   const transcript = history
     .filter((m) => m.role === "user" || m.role === "ai")
     .map((m) => ({ role: m.role, text: m.text ?? "" }));
 
   let result;
   try {
-    result = await resolveWithAi({
+    result = await resolveWithAi(tenantId, {
       conversationHistory: transcript,
       triage,
       userClient: conv.client ?? undefined,
@@ -146,7 +149,7 @@ async function handleUserMessageInternal(
     }
   }
 
-  await recordSupportAudit({
+  await recordSupportAudit(tenantId, {
     conversationId,
     action: result.kbHits.length > 0 ? "KB_HIT" : "AI_ANSWER",
     actor: "ai",
@@ -158,7 +161,7 @@ async function handleUserMessageInternal(
   });
 
   // 3. Append AI message
-  const aiMessage = await appendMessage(conversationId, "ai", result.responseText, {
+  const aiMessage = await appendMessage(tenantId, conversationId, "ai", result.responseText, {
     model: result.model,
     decision: result.decision,
     kbHits: result.kbHits.map((a) => ({ id: a.id, title: a.title })),
@@ -166,7 +169,7 @@ async function handleUserMessageInternal(
   });
 
   // 4. Actualizar triage en la conversación
-  await updateConversation(conversationId, {
+  await updateConversation(tenantId, conversationId, {
     intent: triage.intent,
     sap_module: triage.sap_module,
     urgency: triage.urgency,
@@ -182,29 +185,30 @@ async function handleUserMessageInternal(
   let escalatedTicket: SupportTicket | undefined;
 
   if (shouldEscalate) {
-    escalatedTicket = await escalateConversation(conversationId, triage, transcript);
+    escalatedTicket = await escalateConversation(tenantId, conversationId, triage, transcript);
     await appendMessage(
+      tenantId,
       conversationId,
       "system",
       `📤 Caso escalado a Nivel 2 con el ticket ${escalatedTicket.code}. Un especialista te contactará dentro de la SLA (${escalatedTicket.sla_minutes} min).`,
       { escalatedTicketId: escalatedTicket.id, ticketCode: escalatedTicket.code }
     );
   } else if (result.decision.resolved) {
-    await updateConversation(conversationId, {
+    await updateConversation(tenantId, conversationId, {
       status: "resolved",
       ai_resolved: true,
       closed_at: new Date().toISOString(),
     });
-    await recordSupportAudit({
+    await recordSupportAudit(tenantId, {
       conversationId,
       action: "CONV_RESOLVED_BY_AI",
       actor: "ai",
     });
   } else if (result.decision.needs_more_info) {
-    await updateConversation(conversationId, { status: "waiting_user" });
+    await updateConversation(tenantId, conversationId, { status: "waiting_user" });
   }
 
-  const updated = await getConversationById(conversationId);
+  const updated = await getConversationById(tenantId, conversationId);
   return {
     conversation: updated!,
     aiMessage,
@@ -224,11 +228,12 @@ async function handleUserMessageInternal(
 }
 
 async function escalateConversation(
+  tenantId: string,
   conversationId: string,
   triage: Awaited<ReturnType<typeof triageMessage>>,
   transcript: { role: string; text: string }[]
 ): Promise<SupportTicket> {
-  const conv = await getConversationById(conversationId);
+  const conv = await getConversationById(tenantId, conversationId);
   if (!conv) throw new Error("conv no encontrada");
 
   // Construir resumen + evidencias desde la conversación
@@ -251,7 +256,7 @@ async function escalateConversation(
   if (conv.client) evidences.push({ type: "client", label: "Cliente", value: conv.client });
   evidences.push({ type: "channel", label: "Canal", value: conv.channel });
 
-  const ticket = await createTicket({
+  const ticket = await createTicket(tenantId, {
     conversationId,
     title: triage.title,
     summary: triage.summary,
@@ -263,12 +268,12 @@ async function escalateConversation(
     evidences,
   });
 
-  await updateConversation(conversationId, {
+  await updateConversation(tenantId, conversationId, {
     status: "escalated",
     escalated_to_ticket: ticket.id,
   });
 
-  await recordSupportAudit({
+  await recordSupportAudit(tenantId, {
     conversationId,
     ticketId: ticket.id,
     action: "TICKET_CREATED",
@@ -314,10 +319,11 @@ export function welcomeText(): string {
 // y permite pasar una razon libre.
 // ============================================================
 export async function manualEscalate(
+  tenantId: string,
   conversationId: string,
   opts: { reason?: string; actor?: string } = {}
 ): Promise<SupportTicket> {
-  const conv = await getConversationById(conversationId);
+  const conv = await getConversationById(tenantId, conversationId);
   if (!conv) throw new Error("conv no encontrada");
   if (conv.status === "escalated" && conv.escalated_to_ticket) {
     throw new Error("La conversacion ya fue escalada");
@@ -327,7 +333,7 @@ export async function manualEscalate(
   }
 
   // Reconstruir transcript desde la BD
-  const messages = await listMessages(conversationId);
+  const messages = await listMessages(tenantId, conversationId);
   const transcript = messages.map((m) => ({
     role: m.role === "user" ? "user" : (m.role === "system" ? "system" : "ai"),
     text: m.text ?? "",
@@ -371,7 +377,7 @@ export async function manualEscalate(
   if (conv.client) evidences.push({ type: "client", label: "Cliente", value: conv.client });
   evidences.push({ type: "channel", label: "Canal", value: conv.channel });
 
-  const ticket = await createTicket({
+  const ticket = await createTicket(tenantId, {
     conversationId,
     title: triage.title,
     summary: triage.summary,
@@ -383,19 +389,20 @@ export async function manualEscalate(
     evidences,
   });
 
-  await updateConversation(conversationId, {
+  await updateConversation(tenantId, conversationId, {
     status: "escalated",
     escalated_to_ticket: ticket.id,
   });
 
   await appendMessage(
+    tenantId,
     conversationId,
     "system",
     `📤 Caso escalado manualmente a Nivel 2 con el ticket ${ticket.code}.${opts.reason ? ` Razon: ${opts.reason}` : ""} Un especialista te contactara dentro de la SLA (${ticket.sla_minutes} min).`,
     { escalatedTicketId: ticket.id, ticketCode: ticket.code, manual: true, reason: opts.reason ?? null }
   );
 
-  await recordSupportAudit({
+  await recordSupportAudit(tenantId, {
     conversationId,
     ticketId: ticket.id,
     action: "TICKET_CREATED",

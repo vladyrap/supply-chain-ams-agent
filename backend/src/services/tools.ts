@@ -30,6 +30,8 @@ export interface ToolDeclaration {
 }
 
 export interface ToolExecuteContext {
+  /** Tenant scoping — obligatorio para queries multi-tenant */
+  tenantId: string;
   /** Para filtros y auditoría */
   module?: string;
   client?: string;
@@ -197,7 +199,7 @@ const TOOLS: Record<string, ToolDefinition> = {
     async execute(args, ctx) {
       const q = String(args.query || "").trim();
       const sys = (args.system as string | undefined) ?? ctx.module;
-      const arts = await searchArticles({ text: q, system: sys, limit: 5 });
+      const arts = await searchArticles(ctx.tenantId, { text: q, system: sys, limit: 5 });
       return {
         count: arts.length,
         articles: arts.map((a) => ({

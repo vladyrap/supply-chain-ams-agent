@@ -95,29 +95,34 @@ export function maskPhone(phone: string | null | undefined): string {
 // =====================================================
 
 /** Crea o devuelve la fila de call_logs para un callSid (upsert by call_sid). */
-export async function startCallLog(params: {
-  callSid: string;
-  fromNumber?: string | null;
-  toNumber?: string | null;
-  callStatus?: string | null;
-}): Promise<CallLogRow> {
+export async function startCallLog(
+  tenantId: string,
+  params: {
+    callSid: string;
+    fromNumber?: string | null;
+    toNumber?: string | null;
+    callStatus?: string | null;
+  },
+): Promise<CallLogRow> {
   const { rows } = await query<CallLogRow>(
     `
-    INSERT INTO call_logs (call_sid, from_number, to_number, call_status)
-    VALUES ($1, $2, $3, $4)
+    INSERT INTO call_logs (tenant_id, call_sid, from_number, to_number, call_status)
+    VALUES ($1, $2, $3, $4, $5)
     ON CONFLICT (call_sid) DO UPDATE SET
       from_number = COALESCE(EXCLUDED.from_number, call_logs.from_number),
       to_number   = COALESCE(EXCLUDED.to_number,   call_logs.to_number),
       call_status = COALESCE(EXCLUDED.call_status, call_logs.call_status)
+    WHERE call_logs.tenant_id = $1
     RETURNING *;
     `,
-    [params.callSid, params.fromNumber ?? null, params.toNumber ?? null, params.callStatus ?? "in-progress"]
+    [tenantId, params.callSid, params.fromNumber ?? null, params.toNumber ?? null, params.callStatus ?? "in-progress"]
   );
   return rows[0];
 }
 
 /** Update con campos opcionales: status, ended_at, duration, transcript append, ai_responses append. */
 export async function updateCallLog(
+  tenantId: string,
   callSid: string,
   patch: {
     callStatus?: string | null;
@@ -155,10 +160,17 @@ export async function updateCallLog(
   if (sets.length === 0) return;
 
   params.push(callSid);
-  await query(`UPDATE call_logs SET ${sets.join(", ")} WHERE call_sid = $${idx}`, params);
+  const callSidIdx = idx++;
+  params.push(tenantId);
+  const tenantIdx = idx;
+  await query(
+    `UPDATE call_logs SET ${sets.join(", ")} WHERE call_sid = $${callSidIdx} AND tenant_id = $${tenantIdx}`,
+    params,
+  );
 }
 
 export async function appendCallTurn(
+  tenantId: string,
   callSid: string,
   speaker: CallSpeaker,
   message: string
@@ -166,30 +178,33 @@ export async function appendCallTurn(
   const text = (message ?? "").trim();
   if (!text) return;
   await query(
-    `INSERT INTO call_turns (call_sid, speaker, message) VALUES ($1, $2, $3)`,
-    [callSid, speaker, text]
+    `INSERT INTO call_turns (tenant_id, call_sid, speaker, message) VALUES ($1, $2, $3, $4)`,
+    [tenantId, callSid, speaker, text]
   );
 }
 
-export async function listCalls(limit = 50): Promise<CallLogRow[]> {
+export async function listCalls(tenantId: string, limit = 50): Promise<CallLogRow[]> {
   const safe = Math.max(1, Math.min(500, Math.floor(limit)));
   const { rows } = await query<CallLogRow>(
-    `SELECT * FROM call_logs ORDER BY started_at DESC LIMIT $1`,
-    [safe]
+    `SELECT * FROM call_logs WHERE tenant_id = $1 ORDER BY started_at DESC LIMIT $2`,
+    [tenantId, safe]
   );
   return rows;
 }
 
-export async function getCallBySid(callSid: string): Promise<{ call: CallLogRow | null; turns: CallTurnRow[] }> {
+export async function getCallBySid(
+  tenantId: string,
+  callSid: string,
+): Promise<{ call: CallLogRow | null; turns: CallTurnRow[] }> {
   const { rows: callRows } = await query<CallLogRow>(
-    `SELECT * FROM call_logs WHERE call_sid = $1 LIMIT 1`,
-    [callSid]
+    `SELECT * FROM call_logs WHERE tenant_id = $1 AND call_sid = $2 LIMIT 1`,
+    [tenantId, callSid]
   );
   const call = callRows[0] ?? null;
   if (!call) return { call: null, turns: [] };
   const { rows: turns } = await query<CallTurnRow>(
-    `SELECT * FROM call_turns WHERE call_sid = $1 ORDER BY created_at ASC`,
-    [callSid]
+    `SELECT * FROM call_turns WHERE tenant_id = $1 AND call_sid = $2 ORDER BY created_at ASC`,
+    [tenantId, callSid]
   );
   return { call, turns };
 }

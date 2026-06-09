@@ -330,12 +330,15 @@ export async function loadExpandedCorpus(): Promise<{
   qasCreated: number;
   publishedCount: number;
 }> {
+  // MT-2: seed/demo runner sin contexto HTTP, usamos "default". TODO MT-6: parametrizar.
+  const tenantId = "default";
   // Asegurar schema
-  await training.getSnapshot().catch(() => null);
+  await training.getSnapshot(tenantId).catch(() => null);
 
-  // Existing titles para deduplicar
+  // Existing titles para deduplicar (scoped al tenant)
   const { rows: existing } = await query<{ title: string }>(
-    `SELECT title FROM kb_training_items`
+    `SELECT title FROM kb_training_items WHERE tenant_id = $1`,
+    [tenantId]
   );
   const existingTitles = new Set(existing.map((r) => r.title));
 
@@ -350,7 +353,7 @@ export async function loadExpandedCorpus(): Promise<{
       continue;
     }
     try {
-      const row = await training.createItem({
+      const row = await training.createItem(tenantId, {
         title: item.title, content: item.content, summary: item.summary,
         module: item.module, process: item.process, type: item.type,
         source: item.source, tags: item.tags, priority: item.priority,
@@ -360,7 +363,7 @@ export async function loadExpandedCorpus(): Promise<{
       if (item.status === "PUBLISHED") publishedCount++;
       // Si era PUBLISHED, marcar validación completa + score curado
       if (item.status === "PUBLISHED" || item.status === "VALIDATED") {
-        await training.updateItem(row.id, {
+        await training.updateItem(tenantId, row.id, {
           validationStage: "FULLY_VALIDATED",
           functionalValidatedBy: "Consultor AMS",
           technicalValidatedBy: "Líder Servicio",
@@ -371,13 +374,13 @@ export async function loadExpandedCorpus(): Promise<{
       }
       // Q&A aprobadas listas para few-shot
       if (item.qas && item.qas.length > 0) {
-        const created = await training.createQA(item.qas.map((q) => ({
+        const created = await training.createQA(tenantId, item.qas.map((q) => ({
           knowledgeItemId: row.id,
           question: q.question, expectedAnswer: q.expectedAnswer,
         })));
         // marcar todas como aprobadas
         for (const qa of created) {
-          await training.updateQA(qa.id, { approved: true });
+          await training.updateQA(tenantId, qa.id, { approved: true });
         }
         qasCreated += created.length;
       }

@@ -10,6 +10,9 @@
 // Tabla: agent_response_provenance (response_id ↔ item_ids / qa_ids).
 // El response_id se materializa en el frontend al recibir el chat,
 // y se pasa de vuelta cuando manda el feedback.
+//
+// Multi-tenant: todas las queries filtran por tenant_id. El tenantId se
+// propaga desde el caller (claude.service via ClaudeChatInput, o controllers).
 
 import { query } from "../database/db";
 import { logger } from "../utils/logger";
@@ -46,7 +49,10 @@ export interface RecordProvenanceInput {
   module?: string;
 }
 
-export async function recordProvenance(input: RecordProvenanceInput): Promise<void> {
+export async function recordProvenance(
+  tenantId: string,
+  input: RecordProvenanceInput,
+): Promise<void> {
   if (!input.responseId) return;
   // Solo guardar si hubo algo (sino es ruido)
   if (input.qaIds.length === 0 && input.itemIds.length === 0 && (input.ragDocIds ?? []).length === 0) return;
@@ -54,10 +60,11 @@ export async function recordProvenance(input: RecordProvenanceInput): Promise<vo
   try {
     await query(
       `INSERT INTO agent_response_provenance
-         (response_id, qa_ids, item_ids, rag_doc_ids, user_query, module)
-       VALUES ($1, $2, $3, $4, $5, $6)
+         (tenant_id, response_id, qa_ids, item_ids, rag_doc_ids, user_query, module)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (response_id) DO NOTHING`,
       [
+        tenantId,
         input.responseId,
         input.qaIds,
         input.itemIds,
@@ -88,7 +95,10 @@ export interface ReasoningTrace {
   hallucination: { suspicious: string[]; custom_z_y: string[]; risk_score: number } | null;
 }
 
-export async function getReasoningTrace(responseId: string): Promise<ReasoningTrace | null> {
+export async function getReasoningTrace(
+  tenantId: string,
+  responseId: string,
+): Promise<ReasoningTrace | null> {
   if (!responseId) return null;
   await ensureSchema();
   let prov: { qa_ids: string[]; item_ids: string[]; rag_doc_ids: string[]; user_query: string | null; module: string | null; created_at: string } | null = null;
@@ -99,8 +109,8 @@ export async function getReasoningTrace(responseId: string): Promise<ReasoningTr
     }>(
       `SELECT qa_ids, item_ids, rag_doc_ids, user_query, module, created_at
          FROM agent_response_provenance
-        WHERE response_id = $1`,
-      [responseId]
+        WHERE tenant_id = $1 AND response_id = $2`,
+      [tenantId, responseId]
     );
     prov = rows[0] ?? null;
   } catch (err) {
@@ -108,7 +118,7 @@ export async function getReasoningTrace(responseId: string): Promise<ReasoningTr
   }
   if (!prov) return null;
 
-  // Q&A details
+  // Q&A details (scoped al mismo tenant)
   let fewShotQas: ReasoningTrace["fewShotQas"] = [];
   if (prov.qa_ids.length > 0) {
     try {
@@ -116,8 +126,8 @@ export async function getReasoningTrace(responseId: string): Promise<ReasoningTr
         `SELECT q.id, q.question, q.expected_answer, i.module
            FROM kb_training_qa q
            LEFT JOIN kb_training_items i ON i.id = q.knowledge_item_id
-          WHERE q.id = ANY($1::uuid[])`,
-        [prov.qa_ids]
+          WHERE q.id = ANY($1::uuid[]) AND q.tenant_id = $2`,
+        [prov.qa_ids, tenantId]
       );
       fewShotQas = rows;
     } catch { /* */ }
@@ -127,8 +137,9 @@ export async function getReasoningTrace(responseId: string): Promise<ReasoningTr
   if (prov.item_ids.length > 0) {
     try {
       const { rows } = await query<{ id: string; title: string; module: string; status: string; score: number }>(
-        `SELECT id, title, module, status, score FROM kb_training_items WHERE id = ANY($1::uuid[])`,
-        [prov.item_ids]
+        `SELECT id, title, module, status, score FROM kb_training_items
+          WHERE id = ANY($1::uuid[]) AND tenant_id = $2`,
+        [prov.item_ids, tenantId]
       );
       fewShotItems = rows;
     } catch { /* */ }
@@ -138,37 +149,38 @@ export async function getReasoningTrace(responseId: string): Promise<ReasoningTr
   if (prov.rag_doc_ids.length > 0) {
     try {
       const { rows } = await query<{ id: string; title: string | null; source_file: string | null }>(
-        `SELECT id, title, source_file FROM knowledge_documents WHERE id = ANY($1::uuid[])`,
-        [prov.rag_doc_ids]
+        `SELECT id, title, source_file FROM knowledge_documents
+          WHERE id = ANY($1::uuid[]) AND tenant_id = $2`,
+        [prov.rag_doc_ids, tenantId]
       );
       ragDocs = rows;
     } catch { /* */ }
   }
 
-  // Feedback asociado
+  // Feedback asociado (scoped al mismo tenant)
   let feedback: ReasoningTrace["feedback"] = [];
   try {
     const { rows } = await query<{ kind: string; reason: string | null; created_at: string }>(
       `SELECT kind, reason, created_at
          FROM ai_response_feedback
-        WHERE metadata->>'responseId' = $1
+        WHERE tenant_id = $1 AND metadata->>'responseId' = $2
         ORDER BY created_at DESC
         LIMIT 5`,
-      [responseId]
+      [tenantId, responseId]
     );
     feedback = rows;
   } catch { /* */ }
 
-  // Hallucination
+  // Hallucination (scoped al mismo tenant)
   let hallucination: ReasoningTrace["hallucination"] = null;
   try {
     const { rows } = await query<{ suspicious: string[]; custom_z_y: string[]; risk_score: number }>(
       `SELECT suspicious, custom_z_y, risk_score
          FROM agent_hallucinations
-        WHERE response_id = $1
+        WHERE tenant_id = $1 AND response_id = $2
         ORDER BY created_at DESC
         LIMIT 1`,
-      [responseId]
+      [tenantId, responseId]
     );
     if (rows[0]) hallucination = rows[0];
   } catch { /* */ }
@@ -182,13 +194,17 @@ export async function getReasoningTrace(responseId: string): Promise<ReasoningTr
   };
 }
 
-export async function getProvenance(responseId: string): Promise<ProvenanceRow | null> {
+export async function getProvenance(
+  tenantId: string,
+  responseId: string,
+): Promise<ProvenanceRow | null> {
   if (!responseId) return null;
   await ensureSchema();
   try {
     const { rows } = await query<ProvenanceRow>(
-      `SELECT qa_ids, item_ids FROM agent_response_provenance WHERE response_id = $1`,
-      [responseId]
+      `SELECT qa_ids, item_ids FROM agent_response_provenance
+        WHERE tenant_id = $1 AND response_id = $2`,
+      [tenantId, responseId]
     );
     return rows[0] ?? null;
   } catch (err) {
@@ -204,11 +220,12 @@ export async function getProvenance(responseId: string): Promise<ProvenanceRow |
  * para que dejen de ser usadas en few-shot.
  */
 export async function adjustScoreFromFeedback(
+  tenantId: string,
   responseId: string,
   kind: "positive" | "negative",
 ): Promise<{ itemsTouched: number; qasTouched: number }> {
   if (!responseId) return { itemsTouched: 0, qasTouched: 0 };
-  const prov = await getProvenance(responseId);
+  const prov = await getProvenance(tenantId, responseId);
   if (!prov) return { itemsTouched: 0, qasTouched: 0 };
 
   const delta = kind === "positive" ? 1 : -1;
@@ -221,8 +238,8 @@ export async function adjustScoreFromFeedback(
         `UPDATE kb_training_items
             SET score = GREATEST(0, LEAST(100, score + $1)),
                 updated_at = now()
-          WHERE id = ANY($2::uuid[])`,
-        [delta, prov.item_ids]
+          WHERE id = ANY($2::uuid[]) AND tenant_id = $3`,
+        [delta, prov.item_ids, tenantId]
       );
       itemsTouched = rowCount ?? 0;
     } catch (err) {
@@ -236,8 +253,8 @@ export async function adjustScoreFromFeedback(
       const { rowCount } = await query(
         `UPDATE kb_training_qa
             SET approved = false
-          WHERE id = ANY($1::uuid[]) AND approved = true`,
-        [prov.qa_ids]
+          WHERE id = ANY($1::uuid[]) AND tenant_id = $2 AND approved = true`,
+        [prov.qa_ids, tenantId]
       );
       qasTouched = rowCount ?? 0;
     } catch (err) {
@@ -254,7 +271,7 @@ export async function adjustScoreFromFeedback(
   }
 
   logger.info(
-    { responseId, kind, itemsTouched, qasTouched },
+    { tenantId, responseId, kind, itemsTouched, qasTouched },
     "score ajustado por feedback humano"
   );
   return { itemsTouched, qasTouched };

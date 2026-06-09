@@ -17,7 +17,7 @@ export async function postSaveResponse(
       return reply.code(400).send({ success: false, error: "responseId, responseType, subject, body requeridos" });
     }
     // Forzar ticketKey del path
-    const row = await saveCustomerResponse({ ...body, ticketKey: req.params.key });
+    const row = await saveCustomerResponse(req.tenantId, { ...body, ticketKey: req.params.key });
     return reply.send({ success: true, response: row });
   } catch (err) {
     logger.error({ err }, "save customer response fail");
@@ -30,7 +30,7 @@ export async function getListByTicket(
   reply: FastifyReply,
 ) {
   try {
-    const rows = await listCustomerResponsesByTicket(req.params.key);
+    const rows = await listCustomerResponsesByTicket(req.tenantId, req.params.key);
     return reply.send({ success: true, count: rows.length, responses: rows });
   } catch (err) {
     logger.error({ err }, "list responses fail");
@@ -43,7 +43,7 @@ export async function getOne(
   reply: FastifyReply,
 ) {
   try {
-    const row = await getCustomerResponse(req.params.responseId);
+    const row = await getCustomerResponse(req.tenantId, req.params.responseId);
     if (!row) return reply.code(404).send({ success: false, error: "not found" });
     return reply.send({ success: true, response: row });
   } catch (err) {
@@ -59,7 +59,7 @@ export async function patchStatus(
   try {
     const status = req.body?.status;
     if (!status) return reply.code(400).send({ success: false, error: "status requerido" });
-    const row = await updateCustomerResponseStatus(req.params.responseId, status);
+    const row = await updateCustomerResponseStatus(req.tenantId, req.params.responseId, status);
     if (!row) return reply.code(404).send({ success: false, error: "not found" });
     return reply.send({ success: true, response: row });
   } catch (err) {
@@ -73,7 +73,7 @@ export async function deleteOne(
   reply: FastifyReply,
 ) {
   try {
-    const ok = await deleteCustomerResponse(req.params.responseId);
+    const ok = await deleteCustomerResponse(req.tenantId, req.params.responseId);
     if (!ok) return reply.code(404).send({ success: false, error: "not found" });
     return reply.send({ success: true });
   } catch (err) {

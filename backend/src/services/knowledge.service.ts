@@ -50,12 +50,12 @@ export interface IngestTextInput {
   client?: string;
 }
 
-export async function ingestTextDirect(input: IngestTextInput): Promise<KnowledgeDocument> {
+export async function ingestTextDirect(tenantId: string, input: IngestTextInput): Promise<KnowledgeDocument> {
   // Sintetizamos un "documento" tipo md con el texto pegado, igual va al worker
   // como mime text/markdown para reusar el path de ingesta normal.
   const fileName = `${input.title.replace(/[^a-zA-Z0-9_\-]+/g, "_").slice(0, 60) || "pasted"}.md`;
   const dataBase64 = Buffer.from(input.content, "utf-8").toString("base64");
-  return createDocumentAndQueue({
+  return createDocumentAndQueue(tenantId, {
     title: input.title,
     fileName,
     mimeType: "text/markdown",
@@ -99,7 +99,7 @@ function htmlToText(html: string): string {
     .trim();
 }
 
-export async function ingestFromUrl(input: IngestUrlInput): Promise<KnowledgeDocument> {
+export async function ingestFromUrl(tenantId: string, input: IngestUrlInput): Promise<KnowledgeDocument> {
   let url: URL;
   try {
     url = new URL(input.url);
@@ -160,7 +160,7 @@ export async function ingestFromUrl(input: IngestUrlInput): Promise<KnowledgeDoc
       title = decodeURIComponent(last).replace(/\.pdf$/i, "").slice(0, 160) || url.hostname;
     }
     const dataBase64 = Buffer.from(buf).toString("base64");
-    return createDocumentAndQueue({
+    return createDocumentAndQueue(tenantId, {
       title,
       fileName: title.replace(/[^a-zA-Z0-9_\-]+/g, "_").slice(0, 60) + ".pdf",
       mimeType: "application/pdf",
@@ -194,7 +194,7 @@ export async function ingestFromUrl(input: IngestUrlInput): Promise<KnowledgeDoc
 
   // Reusa el path de ingestText (encolado al worker)
   const header = `# ${title}\n\n_Fuente: ${url.toString()}_\n\n`;
-  return ingestTextDirect({
+  return ingestTextDirect(tenantId, {
     title,
     content: header + text.slice(0, 200_000),
     module: input.module,
@@ -217,21 +217,21 @@ export interface DocumentChunk {
   estimated_tokens: number;
 }
 
-export async function listChunksByDocument(documentId: string, limit = 200): Promise<DocumentChunk[]> {
+export async function listChunksByDocument(tenantId: string, documentId: string, limit = 200): Promise<DocumentChunk[]> {
   const safe = Math.max(1, Math.min(500, limit));
   const { rows } = await query<DocumentChunk>(
     `SELECT id, document_id, chunk_index, content, module, client, source_file, source_type,
             COALESCE(estimated_tokens, 0)::int AS estimated_tokens
        FROM knowledge_items
-       WHERE document_id = $1 AND status = 'indexed'
+       WHERE document_id = $1 AND status = 'indexed' AND tenant_id = $2
        ORDER BY chunk_index ASC
-       LIMIT $2`,
-    [documentId, safe]
+       LIMIT $3`,
+    [documentId, tenantId, safe]
   );
   return rows;
 }
 
-export async function createDocumentAndQueue(input: CreateDocumentInput): Promise<KnowledgeDocument> {
+export async function createDocumentAndQueue(tenantId: string, input: CreateDocumentInput): Promise<KnowledgeDocument> {
   // Source type tentativo desde el mime
   let sourceType = "unknown";
   if (input.mimeType === "application/pdf") sourceType = "pdf";
@@ -242,10 +242,11 @@ export async function createDocumentAndQueue(input: CreateDocumentInput): Promis
 
   const { rows } = await query<KnowledgeDocument>(
     `INSERT INTO knowledge_documents
-       (title, source_file, source_type, mime_type, size_bytes, module, process, client, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+       (tenant_id, title, source_file, source_type, mime_type, size_bytes, module, process, client, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
      RETURNING *`,
     [
+      tenantId,
       input.title ?? input.fileName,
       input.fileName,
       sourceType,
@@ -260,6 +261,7 @@ export async function createDocumentAndQueue(input: CreateDocumentInput): Promis
   await ingestQueue.add(
     "ingest",
     {
+      tenantId,
       documentId: doc.id,
       fileName: input.fileName,
       mimeType: input.mimeType,
@@ -274,13 +276,13 @@ export async function createDocumentAndQueue(input: CreateDocumentInput): Promis
   return doc;
 }
 
-export async function listDocuments(filters: { module?: string; client?: string; status?: string } = {}): Promise<KnowledgeDocument[]> {
-  const conds: string[] = [];
-  const params: unknown[] = [];
+export async function listDocuments(tenantId: string, filters: { module?: string; client?: string; status?: string } = {}): Promise<KnowledgeDocument[]> {
+  const conds: string[] = ["tenant_id = $1"];
+  const params: unknown[] = [tenantId];
   if (filters.module) { params.push(filters.module); conds.push(`module = $${params.length}`); }
   if (filters.client) { params.push(filters.client); conds.push(`client = $${params.length}`); }
   if (filters.status) { params.push(filters.status); conds.push(`status = $${params.length}`); }
-  const whereSql = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const whereSql = `WHERE ${conds.join(" AND ")}`;
   const { rows } = await query<KnowledgeDocument>(
     `SELECT * FROM knowledge_documents ${whereSql} ORDER BY created_at DESC LIMIT 200`,
     params
@@ -288,9 +290,12 @@ export async function listDocuments(filters: { module?: string; client?: string;
   return rows;
 }
 
-export async function deleteDocument(id: string): Promise<boolean> {
+export async function deleteDocument(tenantId: string, id: string): Promise<boolean> {
   // CASCADE en knowledge_items por FK
-  const res = await query(`DELETE FROM knowledge_documents WHERE id = $1`, [id]);
+  const res = await query(
+    `DELETE FROM knowledge_documents WHERE id = $1 AND tenant_id = $2`,
+    [id, tenantId]
+  );
   return res.rowCount > 0;
 }
 
@@ -303,13 +308,17 @@ export interface KnowledgeStats {
   totalTokens: number;
 }
 
-export async function getKnowledgeStats(): Promise<KnowledgeStats> {
+export async function getKnowledgeStats(tenantId: string): Promise<KnowledgeStats> {
   const [docs, chunks] = await Promise.all([
     query<{ status: string; c: string; tk: string }>(
       `SELECT status, count(*)::text AS c, COALESCE(sum(total_tokens),0)::text AS tk
-         FROM knowledge_documents GROUP BY status`
+         FROM knowledge_documents WHERE tenant_id = $1 GROUP BY status`,
+      [tenantId]
     ),
-    query<{ c: string }>(`SELECT count(*)::text AS c FROM knowledge_items`),
+    query<{ c: string }>(
+      `SELECT count(*)::text AS c FROM knowledge_items WHERE tenant_id = $1`,
+      [tenantId]
+    ),
   ]);
   let total = 0, indexed = 0, pending = 0, error = 0, tokens = 0;
   for (const r of docs.rows) {

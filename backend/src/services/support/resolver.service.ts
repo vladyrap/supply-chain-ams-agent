@@ -124,19 +124,19 @@ export class QuotaExhaustedError extends Error {
   constructor() { super("quota_exhausted"); }
 }
 
-export async function resolveWithAi(input: ResolverContextInput): Promise<ResolverResult> {
+export async function resolveWithAi(tenantId: string, input: ResolverContextInput): Promise<ResolverResult> {
   const { triage } = input;
   const lastUserMsg = [...input.conversationHistory].reverse().find((m) => m.role === "user")?.text ?? "";
 
   // 1. KB curada: buscar por sistema + texto
   let kbHits: KbArticle[] = [];
   try {
-    kbHits = await searchArticles({ text: lastUserMsg, system: triage.sap_module, limit: 4 });
+    kbHits = await searchArticles(tenantId, { text: lastUserMsg, system: triage.sap_module, limit: 4 });
   } catch (err) {
     logger.warn({ err }, "resolver: kb search fail, sigo sin KB");
   }
   // Marcar uso
-  for (const a of kbHits) { incUseCount(a.id).catch(() => undefined); }
+  for (const a of kbHits) { incUseCount(tenantId, a.id).catch(() => undefined); }
 
   // 2. RAG documental — solo si KB no aportó mucho
   let ragHits = 0;

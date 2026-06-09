@@ -116,6 +116,12 @@ export interface ClaudeChatInput {
   client: string;
   environment: string;
   attachments?: Attachment[];
+  /**
+   * Multi-tenant scope. Si el caller no lo provee, se usa "default" — esto
+   * solo debería pasar en path de tests o callers internos sin contexto HTTP.
+   * Los controllers HTTP deberían pasar req.tenantId siempre.
+   */
+  tenantId?: string;
 }
 
 // Tipos Part compatibles con @google/genai
@@ -141,7 +147,13 @@ async function prepareRequest(input: ClaudeChatInput): Promise<PreparedRequest> 
   // léxicamente la query del usuario. Se concatena al system prompt si hay
   // resultados, sino no afecta nada.
   const { buildFewShotBlock } = await import("./few-shot.service");
-  const fewShot = await buildFewShotBlock(input.userMessage, input.module).catch((err) => {
+  // MT-2: tenantId obligatorio en buildFewShotBlock para aislar conocimiento
+  // por cliente. Si el caller no lo provee usamos "default" — esto pasa solo
+  // en paths sin contexto HTTP (tests, eval interno). TODO MT-6: hacer
+  // tenantId required en ClaudeChatInput una vez todos los callers (eval,
+  // testing, etc.) pasen el suyo desde su contexto.
+  const fewShotTenantId = input.tenantId ?? "default";
+  const fewShot = await buildFewShotBlock(fewShotTenantId, input.userMessage, input.module).catch((err) => {
     logger.debug({ err }, "few-shot fail (continuo sin)");
     return { block: "", qaIds: [] as string[], itemIds: [] as string[] };
   });
@@ -250,7 +262,7 @@ export async function chatWithAgent(input: ClaudeChatInput): Promise<ClaudeChatR
     const ragDocIds = Array.from(new Set(ragChunks.map((c) => c.documentId)));
     try {
       const { recordProvenance } = await import("./provenance.service");
-      await recordProvenance({
+      await recordProvenance(input.tenantId ?? "default", {
         responseId,
         qaIds: fewShotQaIds,
         itemIds: fewShotItemIds,
@@ -382,7 +394,7 @@ export async function* chatWithAgentStream(input: ClaudeChatInput): AsyncGenerat
   const ragDocIds = Array.from(new Set(ragChunks.map((c) => c.documentId)));
   try {
     const { recordProvenance } = await import("./provenance.service");
-    await recordProvenance({
+    await recordProvenance(input.tenantId ?? "default", {
       responseId,
       qaIds: fewShotQaIds,
       itemIds: fewShotItemIds,

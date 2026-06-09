@@ -27,7 +27,7 @@ async function getUserId(req: FastifyRequest): Promise<string | null> {
   const cookies = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies;
   const token = cookies?.["ams_session"];
   if (!token) return null;
-  const user = await getUserBySession(token);
+  const user = await getUserBySession(req.tenantId, token);
   return user?.id ?? null;
 }
 
@@ -55,7 +55,7 @@ export async function postUpload(
 
   try {
     const userId = await getUserId(req);
-    const meeting = await createMeetingAndQueue({
+    const meeting = await createMeetingAndQueue(req.tenantId, {
       title: b.title.trim(),
       client: b.client?.trim() || undefined,
       fileName: b.fileName,
@@ -72,9 +72,9 @@ export async function postUpload(
   }
 }
 
-export async function getMeetings(_req: FastifyRequest, reply: FastifyReply) {
+export async function getMeetings(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const meetings = await listMeetings();
+    const meetings = await listMeetings(req.tenantId);
     return reply.send({ success: true, count: meetings.length, meetings });
   } catch (err) {
     logger.error({ err }, "Fallo listando meetings");
@@ -91,7 +91,7 @@ export async function getMeeting(
     return reply.code(400).send({ success: false, error: "ID inválido" });
   }
   try {
-    const row = await getMeetingById(id);
+    const row = await getMeetingById(req.tenantId, id);
     if (!row) return reply.code(404).send({ success: false, error: "Reunión no encontrada" });
     return reply.send({ success: true, meeting: row });
   } catch (err) {
@@ -109,7 +109,7 @@ export async function delMeeting(
     return reply.code(400).send({ success: false, error: "ID inválido" });
   }
   try {
-    const ok = await deleteMeeting(id);
+    const ok = await deleteMeeting(req.tenantId, id);
     if (!ok) return reply.code(404).send({ success: false, error: "no encontrada" });
     return reply.send({ success: true });
   } catch (err) {

@@ -22,9 +22,9 @@ export async function getProviderStatus(_req: FastifyRequest, reply: FastifyRepl
   }
 }
 
-export async function getTickets(_req: FastifyRequest, reply: FastifyReply) {
+export async function getTickets(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const { source, tickets } = await listTickets();
+    const { source, tickets } = await listTickets(req.tenantId);
     return reply.send({ success: true, source, count: tickets.length, tickets });
   } catch (err) {
     logger.error({ err }, "tickets list fail");
@@ -37,7 +37,7 @@ export async function getTicket(
   reply: FastifyReply
 ) {
   try {
-    const ticket = await getTicketByKey(req.params.key);
+    const ticket = await getTicketByKey(req.tenantId, req.params.key);
     if (!ticket) return reply.code(404).send({ success: false, error: "ticket no encontrado" });
     return reply.send({ success: true, ticket });
   } catch (err) {
@@ -58,7 +58,7 @@ export async function postCreateTicket(
     if (!body.description || !body.description.trim()) {
       return reply.code(400).send({ success: false, error: "description es requerida" });
     }
-    const ticket = await createUserTicket(body);
+    const ticket = await createUserTicket(req.tenantId, body);
     return reply.code(201).send({ success: true, ticket });
   } catch (err) {
     logger.error({ err }, "ticket create fail");
@@ -72,7 +72,7 @@ export async function postRecalculateEstimate(
 ) {
   try {
     const { force, actor } = req.body || {};
-    const ticket = await recalculateUserTicket(req.params.key, { force, actor });
+    const ticket = await recalculateUserTicket(req.tenantId, req.params.key, { force, actor });
     if (!ticket) return reply.code(404).send({ success: false, error: "ticket no encontrado (solo se pueden recalcular tickets creados desde la UI)" });
     return reply.send({ success: true, ticket });
   } catch (err) {
@@ -96,7 +96,7 @@ export async function patchManualEstimate(
       return reply.code(400).send({ success: false, error: "reason es requerido para auditoría" });
     }
     const { actor, reason, ...patch } = body;
-    const ticket = await applyManualEstimatePatch(req.params.key, patch, actor, reason);
+    const ticket = await applyManualEstimatePatch(req.tenantId, req.params.key, patch, actor, reason);
     if (!ticket) return reply.code(404).send({ success: false, error: "ticket no encontrado" });
     return reply.send({ success: true, ticket });
   } catch (err) {
@@ -110,7 +110,7 @@ export async function postClassifyTicket(
   reply: FastifyReply
 ) {
   try {
-    const ticket = await getTicketByKey(req.params.key);
+    const ticket = await getTicketByKey(req.tenantId, req.params.key);
     if (!ticket) return reply.code(404).send({ success: false, error: "ticket no encontrado" });
 
     const message = `Ticket ${ticket.key}: ${ticket.title}\n\nDescripción del ticket:\n${ticket.description}\n\nEstado: ${ticket.status} · Prioridad: ${ticket.priority} · Reporter: ${ticket.reporter ?? "—"}`;
@@ -166,7 +166,7 @@ export async function postReplaceEstimate(
     if (typeof body.estimate.totalMinHours !== "number" || typeof body.estimate.totalMaxHours !== "number") {
       return reply.code(400).send({ success: false, error: "totalMinHours y totalMaxHours requeridos" });
     }
-    const ticket = await replaceTicketEstimate(req.params.key, body.estimate);
+    const ticket = await replaceTicketEstimate(req.tenantId, req.params.key, body.estimate);
     if (!ticket) return reply.code(404).send({ success: false, error: "ticket no encontrado" });
     return reply.send({ success: true, ticket });
   } catch (err) {
@@ -193,7 +193,7 @@ export async function postCloseTicket(
     if (!body.closedBy || !body.closedBy.trim()) {
       return reply.code(400).send({ success: false, error: "closedBy requerido" });
     }
-    const ticket = await closeTicketWithActualHours(req.params.key, {
+    const ticket = await closeTicketWithActualHours(req.tenantId, req.params.key, {
       actualHours,
       closedBy: body.closedBy.trim(),
       closeNote: body.closeNote?.trim() || undefined,
@@ -227,7 +227,7 @@ export async function putTicketIntelligence(
     if (!body?.intelligence || !body.intelligence.status) {
       return reply.code(400).send({ success: false, error: "intelligence.status es requerido" });
     }
-    const result = await upsertTicketIntelligence(req.params.key, { intelligence: body.intelligence });
+    const result = await upsertTicketIntelligence(req.tenantId, req.params.key, { intelligence: body.intelligence });
     if (!result.ticket) {
       return reply.code(404).send({ success: false, error: "ticket no encontrado" });
     }
@@ -251,7 +251,7 @@ export async function getTicketIntelligenceHandler(
   reply: FastifyReply
 ) {
   try {
-    const intel = await getTicketIntelligence(req.params.key);
+    const intel = await getTicketIntelligence(req.tenantId, req.params.key);
     return reply.send({ success: true, intelligence: intel });
   } catch (err) {
     logger.error({ err }, "getTicketIntelligence fail");
@@ -268,7 +268,7 @@ export async function getTicketIntelligenceHistory(
   reply: FastifyReply
 ) {
   try {
-    const entries = await listIntelligenceHistory(req.params.key);
+    const entries = await listIntelligenceHistory(req.tenantId, req.params.key);
     return reply.send({ success: true, entries });
   } catch (err) {
     logger.error({ err }, "getTicketIntelligenceHistory fail");
@@ -287,7 +287,7 @@ export async function patchTicketGeneral(
 ) {
   try {
     const body = req.body ?? {};
-    const ticket = await updateTicketGeneral(req.params.key, body);
+    const ticket = await updateTicketGeneral(req.tenantId, req.params.key, body);
     if (!ticket) {
       return reply.code(404).send({ success: false, error: "ticket no encontrado" });
     }

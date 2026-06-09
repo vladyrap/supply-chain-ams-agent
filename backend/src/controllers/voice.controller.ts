@@ -5,6 +5,11 @@
 //   POST /api/voice/status           <- Twilio status callback
 //   GET  /api/voice/calls            <- listado para UI/admin
 //   GET  /api/voice/calls/:callSid   <- detalle con turnos
+//
+// Multi-tenant: los webhooks de Twilio no traen tenant en el body. Usamos
+// req.tenantId que es seteado por tenantPlugin (resolveTenantId fallback al
+// DEFAULT_TENANT_ID). Para mapear nº Twilio → tenant en setups multi-cliente,
+// se puede mirar req.headers.host o mapear b.To con una tabla.
 
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { logger } from "../utils/logger";
@@ -62,19 +67,19 @@ export async function postIncomingCall(
   }
 
   logger.info(
-    { callSid, from: maskPhone(b.From), to: maskPhone(b.To), status: b.CallStatus },
+    { callSid, from: maskPhone(b.From), to: maskPhone(b.To), status: b.CallStatus, tenantId: req.tenantId },
     "voice.incoming"
   );
 
   // Persistencia (best-effort, no rompe la respuesta TwiML si falla)
   try {
-    await startCallLog({
+    await startCallLog(req.tenantId, {
       callSid,
       fromNumber: b.From ?? null,
       toNumber:   b.To   ?? null,
       callStatus: b.CallStatus ?? "ringing",
     });
-    await appendCallTurn(callSid, "SYSTEM", "Llamada entrante recibida");
+    await appendCallTurn(req.tenantId, callSid, "SYSTEM", "Llamada entrante recibida");
   } catch (err) {
     logger.warn({ err, callSid }, "voice.incoming: persistencia fallo, sigo");
   }
@@ -98,7 +103,7 @@ export async function postProcessSpeech(
   const confidence  = b.Confidence ?? null;
 
   logger.info(
-    { callSid, from: maskPhone(fromNumber), confidence, speechLen: speech.length },
+    { callSid, from: maskPhone(fromNumber), confidence, speechLen: speech.length, tenantId: req.tenantId },
     "voice.process-speech"
   );
 
@@ -110,7 +115,7 @@ export async function postProcessSpeech(
   // sin que incoming haya pasado por nuestro endpoint si el webhook se
   // configuró distinto; lo creamos idempotente para no perder el turn).
   try {
-    await startCallLog({
+    await startCallLog(req.tenantId, {
       callSid,
       fromNumber: b.From ?? null,
       toNumber:   b.To   ?? null,
@@ -123,8 +128,8 @@ export async function postProcessSpeech(
   // Si no hay speech (timeout sin habla), nos despedimos.
   if (!speech) {
     try {
-      await appendCallTurn(callSid, "SYSTEM", "Sin entrada del usuario en el turno");
-      await updateCallLog(callSid, { mergeMetadata: { lastNoInputAt: new Date().toISOString() } });
+      await appendCallTurn(req.tenantId, callSid, "SYSTEM", "Sin entrada del usuario en el turno");
+      await updateCallLog(req.tenantId, callSid, { mergeMetadata: { lastNoInputAt: new Date().toISOString() } });
     } catch { /* no bloquear */ }
     return xmlReply(reply, TwilioVoiceProvider.buildGoodbyeTwiML());
   }
@@ -144,9 +149,9 @@ export async function postProcessSpeech(
 
   // 2) Persistencia best-effort
   try {
-    await appendCallTurn(callSid, "USER", speech);
-    await appendCallTurn(callSid, "AI", aiText);
-    await updateCallLog(callSid, {
+    await appendCallTurn(req.tenantId, callSid, "USER", speech);
+    await appendCallTurn(req.tenantId, callSid, "AI", aiText);
+    await updateCallLog(req.tenantId, callSid, {
       appendTranscript: `[USER] ${speech}`,
       appendAiResponse: `[AI] ${aiText}`,
     });
@@ -174,21 +179,21 @@ export async function postCallStatus(
   if (!callSid) return reply.code(200).send("ok"); // siempre 200 a Twilio
 
   logger.info(
-    { callSid, status, duration, from: maskPhone(b.From), to: maskPhone(b.To) },
+    { callSid, status, duration, from: maskPhone(b.From), to: maskPhone(b.To), tenantId: req.tenantId },
     "voice.status"
   );
 
   try {
     const ended = status === "completed" || status === "busy" || status === "failed" ||
                   status === "no-answer" || status === "canceled";
-    await updateCallLog(callSid, {
+    await updateCallLog(req.tenantId, callSid, {
       callStatus: status,
       endedAt: ended ? new Date() : undefined,
       durationSeconds: duration ?? undefined,
       mergeMetadata: { lastStatusAt: new Date().toISOString() },
     });
     if (ended) {
-      await appendCallTurn(callSid, "SYSTEM", `Llamada finalizada (status=${status})`);
+      await appendCallTurn(req.tenantId, callSid, "SYSTEM", `Llamada finalizada (status=${status})`);
       clearCallMemory(callSid);
     }
   } catch (err) {
@@ -207,7 +212,7 @@ export async function getCallsList(
 ) {
   try {
     const limit = req.query?.limit ? Math.max(1, Math.min(500, parseInt(req.query.limit, 10) || 50)) : 50;
-    const calls = await listCalls(limit);
+    const calls = await listCalls(req.tenantId, limit);
     return reply.send({
       success: true,
       count: calls.length,
@@ -233,7 +238,7 @@ export async function getCallDetail(
   try {
     const callSid = req.params.callSid;
     if (!callSid) return reply.code(400).send({ success: false, error: "callSid requerido" });
-    const { call, turns } = await getCallBySid(callSid);
+    const { call, turns } = await getCallBySid(req.tenantId, callSid);
     if (!call) return reply.code(404).send({ success: false, error: "No encontrada" });
     return reply.send({
       success: true,

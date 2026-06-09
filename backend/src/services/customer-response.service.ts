@@ -90,14 +90,19 @@ export interface SaveCustomerResponseInput {
 
 /**
  * Upsert: si existe el responseId actualiza, si no inserta.
+ * Multi-tenant: el ON CONFLICT incluye AND tenant_id = $X para evitar que un
+ * tenant pise una fila de otro con el mismo responseId.
  */
-export async function saveCustomerResponse(input: SaveCustomerResponseInput): Promise<CustomerResponseRow | null> {
+export async function saveCustomerResponse(
+  tenantId: string,
+  input: SaveCustomerResponseInput,
+): Promise<CustomerResponseRow | null> {
   await ensureSchema();
   const { rows } = await query<CustomerResponseRow>(
     `INSERT INTO customer_responses (
-      response_id, ticket_key, response_type, audience, tone, confidence,
+      tenant_id, response_id, ticket_key, response_type, audience, tone, confidence,
       subject, body, summary, status, can_send, quality_score, generated_by, full_payload
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)
     ON CONFLICT (response_id) DO UPDATE SET
       response_type   = EXCLUDED.response_type,
       audience        = EXCLUDED.audience,
@@ -111,8 +116,10 @@ export async function saveCustomerResponse(input: SaveCustomerResponseInput): Pr
       quality_score   = EXCLUDED.quality_score,
       full_payload    = EXCLUDED.full_payload,
       updated_at      = now()
+    WHERE customer_responses.tenant_id = $1
     RETURNING *`,
     [
+      tenantId,
       input.responseId, input.ticketKey, input.responseType, input.audience,
       input.tone, input.confidence, input.subject, input.body,
       input.summary ?? "", input.status, input.canSend, input.qualityScore,
@@ -122,44 +129,55 @@ export async function saveCustomerResponse(input: SaveCustomerResponseInput): Pr
   return rows[0] ?? null;
 }
 
-export async function listCustomerResponsesByTicket(ticketKey: string): Promise<CustomerResponseRow[]> {
+export async function listCustomerResponsesByTicket(
+  tenantId: string,
+  ticketKey: string,
+): Promise<CustomerResponseRow[]> {
   await ensureSchema();
   const { rows } = await query<CustomerResponseRow>(
     `SELECT * FROM customer_responses
-       WHERE ticket_key = $1
+       WHERE tenant_id = $1 AND ticket_key = $2
        ORDER BY created_at DESC
        LIMIT 50`,
-    [ticketKey],
+    [tenantId, ticketKey],
   );
   return rows;
 }
 
-export async function getCustomerResponse(responseId: string): Promise<CustomerResponseRow | null> {
+export async function getCustomerResponse(
+  tenantId: string,
+  responseId: string,
+): Promise<CustomerResponseRow | null> {
   await ensureSchema();
   const { rows } = await query<CustomerResponseRow>(
-    `SELECT * FROM customer_responses WHERE response_id = $1 LIMIT 1`,
-    [responseId],
+    `SELECT * FROM customer_responses WHERE tenant_id = $1 AND response_id = $2 LIMIT 1`,
+    [tenantId, responseId],
   );
   return rows[0] ?? null;
 }
 
 export async function updateCustomerResponseStatus(
-  responseId: string, status: string,
+  tenantId: string,
+  responseId: string,
+  status: string,
 ): Promise<CustomerResponseRow | null> {
   await ensureSchema();
   const { rows } = await query<CustomerResponseRow>(
     `UPDATE customer_responses SET status = $1, updated_at = now()
-       WHERE response_id = $2 RETURNING *`,
-    [status, responseId],
+       WHERE response_id = $2 AND tenant_id = $3 RETURNING *`,
+    [status, responseId, tenantId],
   );
   return rows[0] ?? null;
 }
 
-export async function deleteCustomerResponse(responseId: string): Promise<boolean> {
+export async function deleteCustomerResponse(
+  tenantId: string,
+  responseId: string,
+): Promise<boolean> {
   await ensureSchema();
   const { rowCount } = await query(
-    `DELETE FROM customer_responses WHERE response_id = $1`,
-    [responseId],
+    `DELETE FROM customer_responses WHERE response_id = $1 AND tenant_id = $2`,
+    [responseId, tenantId],
   );
   return (rowCount ?? 0) > 0;
 }

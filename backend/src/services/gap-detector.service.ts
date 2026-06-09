@@ -191,8 +191,10 @@ async function getExistingSignatures(): Promise<Set<string>> {
 }
 
 export async function runGapDetection(daysBack = 14): Promise<GapDetectorReport> {
+  // MT-2: cron sin contexto HTTP, usamos "default". TODO MT-6: parametrizar tenantId.
+  const tenantId = "default";
   // Asegurar schema lazy de kb_training_*
-  await training.getSnapshot().catch(() => null);
+  await training.getSnapshot(tenantId).catch(() => null);
 
   const [ticketsGaps, feedbackGaps, coverageGaps] = await Promise.all([
     detectTicketsWithoutKB(daysBack),
@@ -211,7 +213,7 @@ export async function runGapDetection(daysBack = 14): Promise<GapDetectorReport>
     }
     try {
       // Prefijar el title con [sig:xxx] para idempotencia futura
-      await training.createGap({
+      await training.createGap(tenantId, {
         title: `[sig:${c.signature}] ${c.title}`,
         description: c.description,
         module: c.module,

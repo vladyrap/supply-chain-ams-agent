@@ -154,6 +154,7 @@ export async function postChat(req: FastifyRequest, reply: FastifyReply) {
       client: normalized.client,
       environment: normalized.environment,
       attachments: normalized.attachments,
+      tenantId: req.tenantId,
     });
 
     await recordAudit("CLAUDE_RESPONSE_RECEIVED", {
@@ -162,7 +163,7 @@ export async function postChat(req: FastifyRequest, reply: FastifyReply) {
       length: result.text.length,
     });
 
-    const incident = await saveIncident({
+    const incident = await saveIncident(req.tenantId, {
       input: normalized,
       response: result.text,
       confidence: result.confidence,
@@ -281,6 +282,7 @@ export async function postResearch(req: FastifyRequest, reply: FastifyReply) {
       module: normalized.module,
       client: normalized.client,
       environment: normalized.environment,
+      tenantId: req.tenantId,
       attachments: normalized.attachments,
     });
 
@@ -293,7 +295,7 @@ export async function postResearch(req: FastifyRequest, reply: FastifyReply) {
       toolCalls: result.toolCalls.length,
     });
 
-    const incident = await saveIncident({
+    const incident = await saveIncident(req.tenantId, {
       input: normalized,
       response: result.text,
       confidence: result.confidence,
@@ -423,6 +425,7 @@ export async function streamResearch(req: FastifyRequest, reply: FastifyReply) {
       module: normalized.module,
       client: normalized.client,
       environment: normalized.environment,
+      tenantId: req.tenantId,
       attachments: normalized.attachments,
       onEvent: (ev) => {
         if (!clientClosed) queue.push(ev);
@@ -523,6 +526,7 @@ export async function postChatStream(req: FastifyRequest, reply: FastifyReply) {
       client: normalized.client,
       environment: normalized.environment,
       attachments: normalized.attachments,
+      tenantId: req.tenantId,
     })) {
       if (ev.type === "delta") {
         send({ type: "delta", text: ev.text });
@@ -540,7 +544,7 @@ export async function postChatStream(req: FastifyRequest, reply: FastifyReply) {
       streaming: true,
     });
 
-    const incident = await saveIncident({
+    const incident = await saveIncident(req.tenantId, {
       input: normalized,
       response: fullText,
       confidence,
@@ -587,7 +591,7 @@ export async function getIncidents(
 ) {
   try {
     const q = req.query;
-    const rows = await listIncidents({
+    const rows = await listIncidents(req.tenantId, {
       module:         q.module || undefined,
       client:         q.client || undefined,
       environment:    q.environment || undefined,
@@ -613,7 +617,7 @@ export async function getIncident(
     return reply.code(400).send({ success: false, error: "ID inválido" });
   }
   try {
-    const row = await getIncidentById(id);
+    const row = await getIncidentById(req.tenantId, id);
     if (!row) return reply.code(404).send({ success: false, error: "Incidente no encontrado" });
     return reply.send({ success: true, incident: row });
   } catch (err) {
