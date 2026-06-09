@@ -32,7 +32,11 @@ export async function getEvents(
       fromDate: q.fromDate || undefined,
       toDate: q.toDate || undefined,
     };
-    const events = await listAuditEvents(filters);
+    // FIX A1+A2: pasar tenantId. super_admin con ?allTenants=true ve "*".
+    const isSuperAdmin = (req.user?.role as string) === "admin";
+    const allTenants = (q as { allTenants?: string }).allTenants === "true";
+    const scope = isSuperAdmin && allTenants ? "*" : req.tenantId;
+    const events = await listAuditEvents(scope, filters);
     reply.send({ success: true, events, count: events.length });
   } catch (err) {
     logger.error({ err }, "audit-events.getEvents fail");
@@ -49,7 +53,8 @@ export async function getByTicket(
   reply: FastifyReply,
 ): Promise<void> {
   try {
-    const events = await getAuditByTicket(req.params.ticketKey);
+    // FIX A2: scope al tenant del request.
+    const events = await getAuditByTicket(req.tenantId, req.params.ticketKey);
     reply.send({ success: true, events, count: events.length });
   } catch (err) {
     logger.error({ err }, "audit-events.getByTicket fail");
@@ -71,12 +76,14 @@ export async function postEvent(
       reply.code(400).send({ success: false, error: "eventType es requerido" });
       return;
     }
-    // Auto-fill actor desde request.user si está disponible y no se pasó
+    // FIX A1: completar tenantId desde request.
+    // FIX B10 (bajo): no usar email como actorName si nombre disponible.
     const user = req.user;
     const enriched: AuditEventInput = {
       ...body,
+      tenantId: body.tenantId ?? req.tenantId ?? null,
       actorUserId: body.actorUserId ?? user?.id ?? null,
-      actorName: body.actorName ?? user?.name ?? user?.email ?? null,
+      actorName: body.actorName ?? user?.name ?? null, // sin fallback email
       actorRole: body.actorRole ?? user?.role ?? null,
     };
     const event = await recordAuditEvent(enriched);
@@ -91,13 +98,17 @@ export async function postEvent(
   }
 }
 
-/** GET /api/audit/summary — KPIs agregados. */
+/** GET /api/audit/summary — KPIs agregados, tenant scoped. */
 export async function getSummary(
-  _req: FastifyRequest,
+  req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<void> {
   try {
-    const summary = await getAuditSummary();
+    // FIX A2: super_admin con ?allTenants=true ve global; resto tenant scoped.
+    const isSuperAdmin = (req.user?.role as string) === "admin";
+    const allTenants = (req.query as { allTenants?: string } | undefined)?.allTenants === "true";
+    const scope = isSuperAdmin && allTenants ? "*" : req.tenantId;
+    const summary = await getAuditSummary(scope);
     reply.send({ success: true, summary });
   } catch (err) {
     logger.error({ err }, "audit-events.getSummary fail");

@@ -1,91 +1,80 @@
 import type { FastifyInstance } from "fastify";
 import * as ctrl from "../controllers/training.controller";
+import { requirePermission } from "../middleware/requirePermission";
+import { requireAuth } from "../middleware/requireAuth";
+
+// FIX C7 (audit v1.1.0): TODA ruta mutante requiere requirePermission.
+// PlatformScreen mapping:
+//   training → "entrenamiento_ia"
+// Actions: edit (write), configure (manage/admin), delete (destructive).
+const READ = { preHandler: requireAuth };
+const WRITE = { preHandler: requirePermission("entrenamiento_ia", "edit") };
+const CONFIGURE = { preHandler: requirePermission("entrenamiento_ia", "configure") };
+const DELETE = { preHandler: requirePermission("entrenamiento_ia", "delete") };
 
 export async function trainingRoutes(app: FastifyInstance) {
-  // Snapshot completo
-  app.get("/api/training/snapshot", ctrl.getSnapshot);
+  app.get("/api/training/snapshot", READ, ctrl.getSnapshot);
 
-  // Knowledge items
-  app.get("/api/training/items", ctrl.listItems);
-  app.post("/api/training/items", ctrl.createItem);
+  app.get("/api/training/items", READ, ctrl.listItems as never);
+  app.post("/api/training/items", WRITE, ctrl.createItem as never);
   app.patch<{ Params: { id: string }; Body: any }>(
-    "/api/training/items/:id", ctrl.updateItem
+    "/api/training/items/:id", WRITE, ctrl.updateItem
   );
-  app.delete<{ Params: { id: string } }>("/api/training/items/:id", ctrl.deleteItem);
+  app.delete<{ Params: { id: string } }>("/api/training/items/:id", DELETE, ctrl.deleteItem);
 
-  // Q&A
-  app.post("/api/training/qa", ctrl.createQA);
+  app.post("/api/training/qa", WRITE, ctrl.createQA as never);
   app.patch<{ Params: { id: string }; Body: any }>(
-    "/api/training/qa/:id", ctrl.updateQA
+    "/api/training/qa/:id", WRITE, ctrl.updateQA
   );
-  app.delete<{ Params: { id: string } }>("/api/training/qa/:id", ctrl.deleteQA);
+  app.delete<{ Params: { id: string } }>("/api/training/qa/:id", DELETE, ctrl.deleteQA);
 
-  // Versions
-  app.post("/api/training/versions", ctrl.createVersion);
+  app.post("/api/training/versions", CONFIGURE, ctrl.createVersion as never);
   app.patch<{ Params: { id: string }; Body: any }>(
-    "/api/training/versions/:id/status", ctrl.setVersionStatus
+    "/api/training/versions/:id/status", CONFIGURE, ctrl.setVersionStatus
   );
 
-  // Gaps
-  app.post("/api/training/gaps", ctrl.createGap);
+  app.post("/api/training/gaps", WRITE, ctrl.createGap as never);
   app.patch<{ Params: { id: string }; Body: any }>(
-    "/api/training/gaps/:id", ctrl.updateGap
+    "/api/training/gaps/:id", WRITE, ctrl.updateGap
   );
-  app.delete<{ Params: { id: string } }>("/api/training/gaps/:id", ctrl.deleteGap);
+  app.delete<{ Params: { id: string } }>("/api/training/gaps/:id", DELETE, ctrl.deleteGap);
 
-  // Settings (singleton)
-  app.get("/api/training/settings", ctrl.getSettings);
-  app.patch("/api/training/settings", ctrl.updateSettings);
+  app.get("/api/training/settings", READ, ctrl.getSettings);
+  app.patch("/api/training/settings", CONFIGURE, ctrl.updateSettings as never);
 
-  // Auto-detección de brechas
-  app.post("/api/training/gaps/detect", ctrl.postRunGapDetection);
+  app.post("/api/training/gaps/detect", WRITE, ctrl.postRunGapDetection as never);
 
-  // Evaluación automática de Q&A
-  app.post("/api/training/eval/run", ctrl.postRunQaEval);
-  app.get("/api/training/eval/runs", ctrl.getEvalRunsList);
-  app.get<{ Params: { id: string } }>("/api/training/eval/runs/:id", ctrl.getEvalRunDetailRoute);
+  app.post("/api/training/eval/run", WRITE, ctrl.postRunQaEval as never);
+  app.get("/api/training/eval/runs", READ, ctrl.getEvalRunsList);
+  app.get<{ Params: { id: string } }>("/api/training/eval/runs/:id", READ, ctrl.getEvalRunDetailRoute);
 
-  // A/B testing + Auto-promote + Diff
-  app.post("/api/training/eval/ab", ctrl.postAbTest);
-  app.post("/api/training/eval/auto-promote", ctrl.postAutoPromote);
-  app.get<{ Querystring: { a?: string; b?: string } }>("/api/training/eval/diff", ctrl.getEvalDiff);
+  app.post("/api/training/eval/ab", CONFIGURE, ctrl.postAbTest as never);
+  app.post("/api/training/eval/auto-promote", CONFIGURE, ctrl.postAutoPromote as never);
+  app.get<{ Querystring: { a?: string; b?: string } }>("/api/training/eval/diff", READ, ctrl.getEvalDiff);
 
-  // Tickets resueltos -> Q&A propuestas
-  app.post("/api/training/qa/propose-from-tickets", ctrl.postProposeQasFromTickets);
+  app.post("/api/training/qa/propose-from-tickets", WRITE, ctrl.postProposeQasFromTickets as never);
+  app.post("/api/training/qa/auto-generate", WRITE, ctrl.postAutoGenerateQas as never);
 
-  // Auto-generador de Q&A para items publicados sin Q&A
-  app.post("/api/training/qa/auto-generate", ctrl.postAutoGenerateQas);
+  app.post("/api/training/self/run", CONFIGURE, ctrl.postSelfTrainingRun as never);
+  app.post("/api/training/seed/expand", CONFIGURE, ctrl.postLoadExpandedCorpus as never);
 
-  // Self-training cycle (orchestrator)
-  app.post("/api/training/self/run", ctrl.postSelfTrainingRun);
+  app.get("/api/training/self/config", READ, ctrl.getSelfTrainingConfigRoute);
+  app.patch("/api/training/self/config", CONFIGURE, ctrl.patchSelfTrainingConfigRoute as never);
+  app.get("/api/training/self/history", READ, ctrl.getSelfTrainingHistoryRoute);
 
-  // Cargar corpus expandido (26 items + Q&A aprobadas)
-  app.post("/api/training/seed/expand", ctrl.postLoadExpandedCorpus);
+  app.post("/api/training/embeddings/backfill", CONFIGURE, ctrl.postBackfillEmbeddings as never);
 
-  // Self-training CRON config + historial
-  app.get("/api/training/self/config", ctrl.getSelfTrainingConfigRoute);
-  app.patch("/api/training/self/config", ctrl.patchSelfTrainingConfigRoute);
-  app.get("/api/training/self/history", ctrl.getSelfTrainingHistoryRoute);
-
-  // Embeddings backfill (semantic few-shot)
-  app.post("/api/training/embeddings/backfill", ctrl.postBackfillEmbeddings);
-
-  // Timeline + drift
   app.get<{ Querystring: { days?: string; threshold?: string } }>(
-    "/api/training/eval/timeline", ctrl.getEvalTimelineRoute
+    "/api/training/eval/timeline", READ, ctrl.getEvalTimelineRoute
   );
 
-  // Feedback patterns -> auto-curation
-  app.post("/api/training/feedback/patterns", ctrl.postFeedbackPatterns);
+  app.post("/api/training/feedback/patterns", WRITE, ctrl.postFeedbackPatterns as never);
 
-  // Reasoning trace por response_id
-  app.get<{ Params: { id: string } }>("/api/training/reasoning/:id", ctrl.getReasoningTraceRoute);
+  app.get<{ Params: { id: string } }>("/api/training/reasoning/:id", READ, ctrl.getReasoningTraceRoute);
 
-  // Hallucination detection
-  app.get("/api/training/hallucinations/report", ctrl.getHallucinationReportRoute);
-  app.get("/api/training/hallucinations/whitelist", ctrl.getHallucinationWhitelist);
-  app.post("/api/training/hallucinations/invalidate", ctrl.postInvalidateWhitelist);
+  app.get("/api/training/hallucinations/report", READ, ctrl.getHallucinationReportRoute);
+  app.get("/api/training/hallucinations/whitelist", READ, ctrl.getHallucinationWhitelist);
+  app.post("/api/training/hallucinations/invalidate", CONFIGURE, ctrl.postInvalidateWhitelist as never);
 
-  // Active learning · borderline Q&A
-  app.get<{ Querystring: { limit?: string } }>("/api/training/active/borderline", ctrl.getBorderlineQAsRoute);
+  app.get<{ Querystring: { limit?: string } }>("/api/training/active/borderline", READ, ctrl.getBorderlineQAsRoute);
 }

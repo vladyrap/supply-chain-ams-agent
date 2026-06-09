@@ -27,9 +27,10 @@ const MODEL_PRICING: Record<string, { input: number; output: number }> = {
   "gemini-2.5-pro":        { input: 1.25, output: 10.00 },
 };
 
-let cachedSummary: UsageSummary | null = null;
-let cachedAt = 0;
+// FIX A3 (audit v1.1.0): cache POR TENANT (antes era global → leak cross-tenant).
+const cachedSummaryByTenant = new Map<string, { value: UsageSummary; at: number }>();
 const CACHE_TTL_MS = 60_000;
+const ALL_TENANTS_SCOPE = "*";
 
 // ===== Types =====
 export interface UsageWindow { calls: number; usd: number; clp: number }
@@ -108,12 +109,25 @@ function calcDelta(current: number, previous: number): UsageDelta {
   };
 }
 
-async function getWindowCounts(intervalSqlOrNull: string | null, offsetSql = ""): Promise<{ calls: number; usd: number }> {
-  const where = intervalSqlOrNull
-    ? `WHERE created_at > NOW() - INTERVAL '${intervalSqlOrNull}' ${offsetSql}`
-    : "";
+// FIX A3: queries reciben tenantId. Scope "*" = todos (solo super_admin).
+function tenantFilter(tenantId: string): { sql: string; params: unknown[] } {
+  if (tenantId === ALL_TENANTS_SCOPE) return { sql: "", params: [] };
+  return { sql: "tenant_id = $1", params: [tenantId] };
+}
+
+async function getWindowCounts(
+  tenantId: string,
+  intervalSqlOrNull: string | null,
+  offsetSql = "",
+): Promise<{ calls: number; usd: number }> {
+  const tf = tenantFilter(tenantId);
+  const conditions: string[] = [];
+  if (intervalSqlOrNull) conditions.push(`created_at > NOW() - INTERVAL '${intervalSqlOrNull}' ${offsetSql}`);
+  if (tf.sql) conditions.push(tf.sql);
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   const { rows } = await query<{ calls: string; usd: string }>(
     `SELECT COUNT(*)::text AS calls, COALESCE(SUM(cost_usd), 0)::text AS usd FROM agent_usage ${where}`,
+    tf.params,
   );
   return { calls: Number(rows[0]?.calls ?? 0), usd: Number(rows[0]?.usd ?? 0) };
 }
@@ -178,7 +192,9 @@ function calcSavings(byModel: UsageModelBreakdown[], monthlyUsdProjected: number
 
 // ===== v0.12.6 NUEVOS HELPERS =====
 
-async function getTokens(): Promise<UsageTokens> {
+async function getTokens(tenantId: string): Promise<UsageTokens> {
+  const tf = tenantFilter(tenantId);
+  const where = tf.sql ? `WHERE ${tf.sql}` : "";
   const { rows } = await query<{ input: string; output: string; input_usd: string; output_usd: string }>(`
     SELECT
       COALESCE(SUM(prompt_tokens), 0)::text AS input,
@@ -199,8 +215,8 @@ async function getTokens(): Promise<UsageTokens> {
           ELSE 2.50
         END) / 1000000, 0)
       ), 0)::text AS output_usd
-    FROM agent_usage
-  `);
+    FROM agent_usage ${where}
+  `, tf.params);
   const input = Number(rows[0]?.input ?? 0);
   const output = Number(rows[0]?.output ?? 0);
   const total = input + output;
@@ -214,14 +230,16 @@ async function getTokens(): Promise<UsageTokens> {
   };
 }
 
-async function getBurnRate(): Promise<UsageBurnRate> {
+async function getBurnRate(tenantId: string): Promise<UsageBurnRate> {
+  const tf = tenantFilter(tenantId);
+  const where = tf.sql ? `WHERE ${tf.sql}` : "";
   const { rows } = await query<{ last_calls: string; last_usd: string; prev_calls: string }>(`
     SELECT
       COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour')::text AS last_calls,
       COALESCE(SUM(cost_usd) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour'), 0)::text AS last_usd,
       COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '2 hour' AND created_at <= NOW() - INTERVAL '1 hour')::text AS prev_calls
-    FROM agent_usage
-  `);
+    FROM agent_usage ${where}
+  `, tf.params);
   const lastHourCalls = Number(rows[0]?.last_calls ?? 0);
   const lastHourUsd = Number(rows[0]?.last_usd ?? 0);
   const prevHourCalls = Number(rows[0]?.prev_calls ?? 0);
@@ -235,7 +253,9 @@ async function getBurnRate(): Promise<UsageBurnRate> {
   };
 }
 
-async function getHistogram(): Promise<UsageHistogram[]> {
+async function getHistogram(tenantId: string): Promise<UsageHistogram[]> {
+  const tf = tenantFilter(tenantId);
+  const where = tf.sql ? `WHERE ${tf.sql}` : "";
   const { rows } = await query<{ bucket: string; min_usd: string; calls: string }>(`
     SELECT bucket, MIN(cost_usd)::text AS min_usd, COUNT(*)::text AS calls FROM (
       SELECT cost_usd,
@@ -246,11 +266,11 @@ async function getHistogram(): Promise<UsageHistogram[]> {
           WHEN cost_usd < 0.005 THEN 'medium'
           ELSE 'large'
         END AS bucket
-      FROM agent_usage
+      FROM agent_usage ${where}
     ) sub
     GROUP BY bucket
     ORDER BY MIN(cost_usd) ASC
-  `);
+  `, tf.params);
   const total = rows.reduce((s, r) => s + Number(r.calls), 0);
   return rows.map((r) => ({
     bucket: r.bucket,
@@ -260,15 +280,17 @@ async function getHistogram(): Promise<UsageHistogram[]> {
   }));
 }
 
-async function getSameDayLastWeek(today: UsageWindow): Promise<UsageSameDayComparison> {
+async function getSameDayLastWeek(tenantId: string, today: UsageWindow): Promise<UsageSameDayComparison> {
+  const tf = tenantFilter(tenantId);
+  const tenantAnd = tf.sql ? `AND ${tf.sql}` : "";
   const { rows } = await query<{ calls: string; usd: string; date: string }>(`
     SELECT
       COUNT(*)::text AS calls,
       COALESCE(SUM(cost_usd), 0)::text AS usd,
       to_char(NOW() - INTERVAL '7 days', 'YYYY-MM-DD') AS date
     FROM agent_usage
-    WHERE created_at::date = (NOW() - INTERVAL '7 days')::date
-  `);
+    WHERE created_at::date = (NOW() - INTERVAL '7 days')::date ${tenantAnd}
+  `, tf.params);
   const sameUsd = Number(rows[0]?.usd ?? 0);
   return {
     today: { calls: today.calls, usd: today.usd, clp: toClp(today.usd) },
@@ -453,10 +475,12 @@ function buildRecommendations(opts: {
   return recs.slice(0, 6);
 }
 
-export function invalidateCache(): void { cachedAt = 0; cachedSummary = null; }
+export function invalidateCache(): void { cachedSummaryByTenant.clear(); }
 
-export async function getAdminUsageSummary(): Promise<UsageSummary> {
-  if (cachedSummary && Date.now() - cachedAt < CACHE_TTL_MS) return cachedSummary;
+export async function getAdminUsageSummary(tenantId: string): Promise<UsageSummary> {
+  const cached = cachedSummaryByTenant.get(tenantId);
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.value;
+  const tf = tenantFilter(tenantId);
 
   try {
     const tableCheck = await query<{ exists: boolean }>(
@@ -468,24 +492,27 @@ export async function getAdminUsageSummary(): Promise<UsageSummary> {
     }
 
     const [today, week, weekPrev, month, monthPrev, all, tokens, burnRate, histogram] = await Promise.all([
-      getWindowCounts("1 day"),
-      getWindowCounts("7 days"),
-      getWindowCounts("14 days", "AND created_at <= NOW() - INTERVAL '7 days'"),
-      getWindowCounts("30 days"),
-      getWindowCounts("60 days", "AND created_at <= NOW() - INTERVAL '30 days'"),
-      getWindowCounts(null),
-      getTokens(),
-      getBurnRate(),
-      getHistogram(),
+      getWindowCounts(tenantId, "1 day"),
+      getWindowCounts(tenantId, "7 days"),
+      getWindowCounts(tenantId, "14 days", "AND created_at <= NOW() - INTERVAL '7 days'"),
+      getWindowCounts(tenantId, "30 days"),
+      getWindowCounts(tenantId, "60 days", "AND created_at <= NOW() - INTERVAL '30 days'"),
+      getWindowCounts(tenantId, null),
+      getTokens(tenantId),
+      getBurnRate(tenantId),
+      getHistogram(tenantId),
     ]);
 
     const totalUsd = all.usd;
     const todayWindow: UsageWindow = { calls: today.calls, usd: today.usd, clp: toClp(today.usd) };
-    const sameDayLastWeek = await getSameDayLastWeek(todayWindow);
+    const sameDayLastWeek = await getSameDayLastWeek(tenantId, todayWindow);
 
+    const byModelWhere = tf.sql ? `WHERE ${tf.sql}` : "";
     const { rows: byModelRows } = await query<{ model: string; calls: string; usd: string }>(
       `SELECT model, COUNT(*)::text AS calls, COALESCE(SUM(cost_usd), 0)::text AS usd
-       FROM agent_usage GROUP BY model ORDER BY SUM(cost_usd) DESC NULLS LAST LIMIT 10`,
+       FROM agent_usage ${byModelWhere}
+       GROUP BY model ORDER BY SUM(cost_usd) DESC NULLS LAST LIMIT 10`,
+      tf.params,
     );
     const byModel: UsageModelBreakdown[] = byModelRows.map((r) => {
       const usd = Number(r.usd);
@@ -496,13 +523,15 @@ export async function getAdminUsageSummary(): Promise<UsageSummary> {
     });
     const flashPctOfTotal = byModel.find((m) => m.model === "gemini-2.5-flash")?.pctOfTotal ?? 0;
 
+    const dailyAnd = tf.sql ? `AND ${tf.sql}` : "";
     const { rows: dailyRows } = await query<{ date: string; calls: string; usd: string }>(
       `SELECT to_char(created_at, 'YYYY-MM-DD') AS date,
               COUNT(*)::text AS calls,
               COALESCE(SUM(cost_usd), 0)::text AS usd
        FROM agent_usage
-       WHERE created_at > NOW() - INTERVAL '30 days'
+       WHERE created_at > NOW() - INTERVAL '30 days' ${dailyAnd}
        GROUP BY date ORDER BY date ASC`,
+      tf.params,
     );
     let daily: UsageDailyPoint[] = dailyRows.map((r) => {
       const usd = Number(r.usd);
@@ -518,8 +547,9 @@ export async function getAdminUsageSummary(): Promise<UsageSummary> {
               COUNT(*)::text AS calls,
               COALESCE(SUM(cost_usd), 0)::text AS usd
        FROM agent_usage
-       WHERE created_at > NOW() - INTERVAL '7 days'
+       WHERE created_at > NOW() - INTERVAL '7 days' ${dailyAnd}
        GROUP BY hour ORDER BY hour ASC`,
+      tf.params,
     );
     const heatmapByHour = new Map<number, UsageHeatmapHour>();
     for (let h = 0; h < 24; h++) heatmapByHour.set(h, { hour: h, calls: 0, usd: 0, clp: 0 });
@@ -532,8 +562,9 @@ export async function getAdminUsageSummary(): Promise<UsageSummary> {
     const { rows: srcRows } = await query<{ source: string; calls: string; usd: string }>(
       `SELECT source, COUNT(*)::text AS calls, COALESCE(SUM(cost_usd), 0)::text AS usd
        FROM agent_usage
-       WHERE created_at > NOW() - INTERVAL '30 days'
+       WHERE created_at > NOW() - INTERVAL '30 days' ${dailyAnd}
        GROUP BY source ORDER BY SUM(cost_usd) DESC NULLS LAST LIMIT 8`,
+      tf.params,
     );
     const topSources: UsageTopSource[] = srcRows.map((r) => {
       const usd = Number(r.usd);
@@ -569,8 +600,10 @@ export async function getAdminUsageSummary(): Promise<UsageSummary> {
       burnRate,
     });
 
+    const lastWhere = tf.sql ? `WHERE ${tf.sql}` : "";
     const { rows: lastRows } = await query<{ last: string }>(
-      `SELECT MAX(created_at)::text AS last FROM agent_usage`,
+      `SELECT MAX(created_at)::text AS last FROM agent_usage ${lastWhere}`,
+      tf.params,
     );
 
     const result: UsageSummary = {
@@ -594,8 +627,7 @@ export async function getAdminUsageSummary(): Promise<UsageSummary> {
       },
     };
 
-    cachedSummary = result;
-    cachedAt = Date.now();
+    cachedSummaryByTenant.set(tenantId, { value: result, at: Date.now() });
     return result;
   } catch (err) {
     logger.error({ err }, "admin-usage: error fetching summary");

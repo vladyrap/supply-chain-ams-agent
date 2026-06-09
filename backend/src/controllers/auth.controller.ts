@@ -51,10 +51,24 @@ function meta(req: FastifyRequest) {
   };
 }
 
+// FIX C5 (audit v1.1.0): signup público gated por env.
+// En prod, ENABLE_PUBLIC_SIGNUP debe ser explícitamente "true" para permitir
+// signup desde el form. Si está apagado, retorna 403 y obliga a usar seed CLI
+// o invite-flow. Esto cierra la escalada de privilegios via race condition
+// del "primer usuario = admin".
+const SIGNUP_ENABLED = process.env.ENABLE_PUBLIC_SIGNUP === "true";
+
 export async function postSignup(
   req: FastifyRequest<{ Body: { email?: string; password?: string; name?: string; role?: Role } }>,
   reply: FastifyReply
 ) {
+  // FIX C5: en prod, signup desactivado por default.
+  if (!SIGNUP_ENABLED) {
+    return reply.code(403).send({
+      success: false,
+      error: "Signup público desactivado. Contactá al admin para crear cuenta.",
+    });
+  }
   const b = req.body || {};
   if (!b.email || !b.password) {
     return reply.code(400).send({ success: false, error: "email y password son obligatorios" });
@@ -64,14 +78,12 @@ export async function postSignup(
     if (existing) {
       return reply.code(409).send({ success: false, error: "Ya existe un usuario con ese email" });
     }
-    // SEGURIDAD: solo permitir role="admin" si no hay usuarios todavía (primer signup queda admin).
-    // Para roles distintos del default, solo un admin (autenticado) podrá cambiar el rol.
-    const allUsers = await listUsers();
-    const requestedRole: Role = b.role === "admin" || b.role === "aprobador" || b.role === "viewer"
-      ? b.role
-      : "consultor";
-    // Bootstrap: si NO hay usuarios y el primero pide admin, lo aceptamos.
-    const safeRole: Role = allUsers.length === 0 ? "admin" : (requestedRole === "admin" ? "consultor" : requestedRole);
+    // FIX C5: NUNCA aceptar role=admin desde el body. El primer-user-bootstrap
+    // se hace por seed CLI o por env BOOTSTRAP_ADMIN_EMAIL/PASSWORD al boot,
+    // no via HTTP. Si el operador necesita un admin de emergencia, debe usar
+    // el script database/seeds/bootstrap-admin.ts.
+    // Todo signup nuevo arranca como "consultor".
+    const safeRole: Role = "consultor";
     const user = await createUser({
       email: b.email,
       password: b.password,
@@ -85,9 +97,10 @@ export async function postSignup(
     return reply.send({ success: true, user });
   } catch (err) {
     logger.error({ err }, "Fallo en /api/auth/signup");
+    // FIX M18: no leakear err.message del backend (puede incluir SQL/schema).
     return reply.code(400).send({
       success: false,
-      error: err instanceof Error ? err.message : "Error creando usuario",
+      error: "No se pudo crear el usuario. Verificá los datos e intentá de nuevo.",
     });
   }
 }

@@ -158,12 +158,31 @@ export async function recordAuditEvent(input: AuditEventInput): Promise<AuditEve
   }
 }
 
-/** Lista eventos con filtros + paginación. */
-export async function listAuditEvents(filters: AuditEventFilters = {}): Promise<AuditEventRecord[]> {
+// FIX A1+A2 (audit v1.1.0): TODAS las queries de audit filtran por tenant_id.
+// Antes: cualquier user con permiso audit_trail veía eventos cross-tenant.
+// Ahora: tenant_id obligatorio en la firma. Caller (controller) lo pasa desde
+// req.tenantId. Si el caller llega a pasar "" → filtra por "" (no leak, pero
+// devuelve vacío). Forense: super_admin puede pasar "*" para ver TODOS los tenants.
+
+const ALL_TENANTS = "*";
+
+function tenantClause(tenantId: string, startIdx: number): { clause: string; param?: string } {
+  if (tenantId === ALL_TENANTS) return { clause: "" };
+  return { clause: `tenant_id = $${startIdx}`, param: tenantId };
+}
+
+/** Lista eventos con filtros + paginación. tenantId obligatorio. */
+export async function listAuditEvents(
+  tenantId: string,
+  filters: AuditEventFilters = {},
+): Promise<AuditEventRecord[]> {
   await ensureSchema();
   const conditions: string[] = [];
   const params: unknown[] = [];
   let i = 1;
+
+  const tc = tenantClause(tenantId, i);
+  if (tc.clause) { conditions.push(tc.clause); params.push(tc.param); i++; }
 
   if (filters.ticketId)    { conditions.push(`ticket_id = $${i++}`);    params.push(filters.ticketId); }
   if (filters.eventType)   { conditions.push(`event_type = $${i++}`);   params.push(filters.eventType); }
@@ -195,38 +214,52 @@ export async function listAuditEvents(filters: AuditEventFilters = {}): Promise<
   }
 }
 
-/** Lista eventos de un ticket específico, ordenados por created_at ASC (timeline). */
-export async function getAuditByTicket(ticketKey: string, limit = 500): Promise<AuditEventRecord[]> {
+/** Eventos de un ticket específico, ordenados ASC (timeline). tenant scoped. */
+export async function getAuditByTicket(
+  tenantId: string,
+  ticketKey: string,
+  limit = 500,
+): Promise<AuditEventRecord[]> {
   await ensureSchema();
+  const tc = tenantClause(tenantId, 1);
+  const params: unknown[] = [];
+  let whereExtra = "";
+  let paramIdx = 1;
+  if (tc.clause) { whereExtra = `AND ${tc.clause}`; params.push(tc.param); paramIdx = 2; }
+  params.push(ticketKey, Math.min(limit, 1000));
   try {
     const { rows } = await query<Parameters<typeof rowToRecord>[0]>(
       `SELECT id, tenant_id, ticket_id, actor_user_id, actor_name, actor_role,
               event_type, category, severity, payload, source, correlation_id,
               created_at
          FROM audit_events
-        WHERE ticket_id = $1
+        WHERE ticket_id = $${paramIdx} ${whereExtra}
         ORDER BY created_at ASC
-        LIMIT $2`,
-      [ticketKey, Math.min(limit, 1000)]
+        LIMIT $${paramIdx + 1}`,
+      params
     );
     return rows.map(rowToRecord);
   } catch (err) {
-    logger.error({ err, ticketKey }, "audit_events byTicket failed");
+    logger.error({ err, ticketKey, tenantId }, "audit_events byTicket failed");
     return [];
   }
 }
 
-/** Resumen agregado para dashboard de auditoría. */
-export async function getAuditSummary(): Promise<AuditEventSummary> {
+/** Resumen agregado para dashboard de auditoría — tenant scoped. */
+export async function getAuditSummary(tenantId: string): Promise<AuditEventSummary> {
   await ensureSchema();
+  const tc = tenantClause(tenantId, 1);
+  const w = tc.clause ? `WHERE ${tc.clause}` : "";
+  const wAnd = tc.clause ? `AND ${tc.clause}` : "";
+  const p: unknown[] = tc.param ? [tc.param] : [];
   try {
     const [total, byCat, bySev, byType, last7d, last24h] = await Promise.all([
-      query<{ c: string }>(`SELECT COUNT(*)::text AS c FROM audit_events`),
-      query<{ category: string; c: string }>(`SELECT category, COUNT(*)::text AS c FROM audit_events GROUP BY category`),
-      query<{ severity: string; c: string }>(`SELECT severity, COUNT(*)::text AS c FROM audit_events GROUP BY severity`),
-      query<{ event_type: string; c: string }>(`SELECT event_type, COUNT(*)::text AS c FROM audit_events GROUP BY event_type ORDER BY COUNT(*) DESC LIMIT 20`),
-      query<{ c: string }>(`SELECT COUNT(*)::text AS c FROM audit_events WHERE created_at > now() - interval '7 days'`),
-      query<{ c: string }>(`SELECT COUNT(*)::text AS c FROM audit_events WHERE created_at > now() - interval '24 hours'`),
+      query<{ c: string }>(`SELECT COUNT(*)::text AS c FROM audit_events ${w}`, p),
+      query<{ category: string; c: string }>(`SELECT category, COUNT(*)::text AS c FROM audit_events ${w} GROUP BY category`, p),
+      query<{ severity: string; c: string }>(`SELECT severity, COUNT(*)::text AS c FROM audit_events ${w} GROUP BY severity`, p),
+      query<{ event_type: string; c: string }>(`SELECT event_type, COUNT(*)::text AS c FROM audit_events ${w} GROUP BY event_type ORDER BY COUNT(*) DESC LIMIT 20`, p),
+      query<{ c: string }>(`SELECT COUNT(*)::text AS c FROM audit_events WHERE created_at > now() - interval '7 days' ${wAnd}`, p),
+      query<{ c: string }>(`SELECT COUNT(*)::text AS c FROM audit_events WHERE created_at > now() - interval '24 hours' ${wAnd}`, p),
     ]);
 
     const byCategory: Record<string, number> = {};

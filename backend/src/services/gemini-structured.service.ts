@@ -137,6 +137,14 @@ export async function callGeminiStructured<T = unknown>(
 
     const rawText = resp.text ?? "";
 
+    // FIX M13 (audit v1.1.0): chequear finishReason. Si Gemini bloqueó por SAFETY
+    // u OTHER, NO devolver string vacío como respuesta válida — tirar para que
+    // el caller maneje (vs ticket queda "enriched" con análisis fantasma).
+    const finishReason = (resp as { candidates?: Array<{ finishReason?: string }> }).candidates?.[0]?.finishReason;
+    if (finishReason && finishReason !== "STOP" && finishReason !== "MAX_TOKENS") {
+      throw new Error(`Gemini blocked response: finishReason=${finishReason}`);
+    }
+
     if (!cfg.jsonOutput) {
       // No structured — devolvemos string como T (caller responsable)
       const durationMs = Date.now() - t0;

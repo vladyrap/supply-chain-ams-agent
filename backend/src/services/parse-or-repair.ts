@@ -11,6 +11,7 @@
 
 import type { GoogleGenAI, Schema } from "@google/genai";
 import { logger } from "../utils/logger";
+import { assertCanCallGemini } from "../utils/gemini-rate-limiter";
 
 export class RepairFailedError extends Error {
   constructor(public readonly originalText: string, public readonly retryText?: string) {
@@ -84,12 +85,16 @@ export async function parseOrRepair<T>(
   ].join("\n");
 
   try {
+    // FIX A19 (audit v1.1.0): rate limit también en repair. Antes este call
+    // se hacía sin chequear cap → 2× cost por ticket cuando Gemini devolvía
+    // JSON malo. Tope explícito + maxOutputTokens menor para limitar costo.
+    assertCanCallGemini(`repair:${opts.taskType ?? "unknown"}`);
     const retryResp = await opts.client.models.generateContent({
       model: opts.model,
       contents: [{ role: "user", parts: [{ text: repairPrompt }] }],
       config: {
         temperature: 0.1, // bajísima para forzar JSON literal
-        maxOutputTokens: 4096,
+        maxOutputTokens: 1500, // FIX A19: bajar de 4096 → 1500 (repairs son cortos)
         responseMimeType: "application/json",
         ...(opts.responseSchema ? { responseSchema: opts.responseSchema } : {}),
       },

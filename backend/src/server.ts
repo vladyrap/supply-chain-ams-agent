@@ -88,35 +88,55 @@ export function buildServer() {
     crossOriginResourcePolicy: { policy: "cross-origin" },
   });
 
-  // v0.12.8 — Rate limit global por IP. 200 req/min default.
-  // Excepciones: /health (sin rate limit), /metrics (sin rate limit).
+  // FIX A8 (audit v1.1.0): rate limit global sin allowList por loopback.
+  // Antes: ["127.0.0.1", "::1"] + trustProxy:true → spoof X-Forwarded-For: 127.0.0.1
+  // bypassea rate limit. La allowList ahora es controlada por env (vacía default).
+  // keyGenerator solo lee req.ip (que respeta trustProxy + última hop).
+  const rlAllowList = (process.env.RATE_LIMIT_ALLOWLIST ?? "")
+    .split(",").map((s) => s.trim()).filter(Boolean);
   app.register(rateLimit, {
     max: Number(process.env.RATE_LIMIT_MAX_PER_MIN ?? 200),
     timeWindow: "1 minute",
-    allowList: ["127.0.0.1", "::1"],
-    skipOnError: true,
-    keyGenerator: (req) => {
-      // Si hay X-Forwarded-For (proxy), usar primera IP. Si no, IP directa.
-      const fwd = req.headers["x-forwarded-for"];
-      const ip = Array.isArray(fwd) ? fwd[0] : (fwd?.split(",")[0]?.trim() ?? req.ip);
-      return ip ?? "unknown";
-    },
+    allowList: rlAllowList, // vacío por default
+    skipOnError: false, // FIX: si rate-limit lib falla, mejor 503 que skip silente
+    keyGenerator: (req) => req.ip ?? "unknown",
   });
 
-  // v0.12.11 — Origin-based CSRF protection.
-  // Para mutations (POST/PUT/PATCH/DELETE) validamos que el header Origin
-  // o Referer pertenezca a ALLOWED_ORIGINS. Si no → 403.
-  // Defense-in-depth contra CSRF sin requerir tokens explicitos en forms.
-  // GET/HEAD/OPTIONS quedan libres (son safe per spec).
+  // FIX A10 (audit v1.1.0): CSRF estricto — rechazar mutations SIN Origin/Referer.
+  // Antes: si no hay Origin/Referer (curl, botnet) → pass. Combo con rutas sin
+  // auth = anónimo borra KB con curl. Ahora: requerir Origin O presencia en
+  // CSRF_BYPASS_TOKENS env (lista de tokens HMAC para server-to-server legítimos).
   const ENFORCE_CSRF = process.env.ENFORCE_ORIGIN_CSRF !== "false"; // ON por default
+  const SERVER_TO_SERVER_TOKENS = (process.env.CSRF_BYPASS_TOKENS ?? "")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  // Paths que legítimamente reciben requests sin Origin (Twilio webhook, etc).
+  // Toda nueva ruta server-to-server debe agregarse aquí explícitamente.
+  const CSRF_BYPASS_PATHS = [
+    "/api/voice/twilio/", // Twilio firma su propio request
+    "/api/sap/inbound/",  // SAP webhook (puede no mandar Origin)
+  ];
   if (ENFORCE_CSRF) {
     app.addHook("onRequest", async (req, reply) => {
       const method = req.method.toUpperCase();
       if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
-      // Skip si no hay Origin/Referer (curl, server-to-server)
+      const url = req.url;
+      // Bypass por path explícito
+      if (CSRF_BYPASS_PATHS.some((p) => url.startsWith(p))) return;
+      // Bypass por token HMAC en header
+      const csrfBypassHeader = req.headers["x-csrf-bypass"];
+      if (typeof csrfBypassHeader === "string" && SERVER_TO_SERVER_TOKENS.includes(csrfBypassHeader)) {
+        return;
+      }
       const origin = req.headers.origin;
       const referer = req.headers.referer;
-      if (!origin && !referer) return; // permitir clientes sin browser
+      // FIX A10: si no hay Origin/Referer Y no estamos en path/token bypass → 403.
+      if (!origin && !referer) {
+        reply.code(403).send({
+          success: false,
+          error: "Origen requerido para mutaciones (CSRF protection).",
+        });
+        return;
+      }
       const checkAgainst = origin || (referer ? new URL(referer).origin : null);
       if (checkAgainst && !ALLOWED_ORIGINS.includes(checkAgainst)) {
         reply.code(403).send({
@@ -220,20 +240,41 @@ export function buildServer() {
   app.register(scopeItemsRoutes);
   app.register(customerResponseRoutes);
 
+  // FIX M18 (audit v1.1.0): mensajes genéricos para 4xx también.
+  // Antes: 4xx devolvía err.message tal cual → leak de schema/SQL/PG codes.
+  // Ahora: mapa explícito por código + fallback genérico.
   app.setErrorHandler((err, req, reply) => {
     logger.error({ err }, "Unhandled error");
     const status = (err as { statusCode?: number }).statusCode ?? 500;
-    // Sólo reportar a Sentry los 5xx (los 4xx son ruido).
+    const errAny = err as { validation?: unknown; code?: string };
     if (status >= 500) {
       captureException(err, { url: req.url, method: req.method });
     }
-    reply.code(status).send({
-      success: false,
-      error:
-        status >= 500
-          ? "Error procesando la solicitud del agente AMS"
-          : err.message || "Bad request",
-    });
+    let safeMessage: string;
+    if (status >= 500) {
+      safeMessage = "Error procesando la solicitud del agente AMS";
+    } else if (status === 401) {
+      safeMessage = "No autorizado";
+    } else if (status === 403) {
+      safeMessage = "Acceso denegado";
+    } else if (status === 404) {
+      safeMessage = "Recurso no encontrado";
+    } else if (status === 409) {
+      safeMessage = "Conflicto con el estado actual del recurso";
+    } else if (status === 413) {
+      safeMessage = "Payload demasiado grande";
+    } else if (status === 415) {
+      safeMessage = "Content-Type no soportado";
+    } else if (status === 429) {
+      safeMessage = "Demasiadas peticiones — intentá de nuevo en unos segundos";
+    } else if (errAny.validation) {
+      // Errores de validación de schema Fastify son seguros de devolver.
+      safeMessage = err.message;
+    } else {
+      // Otros 4xx: mensaje genérico (no leakear).
+      safeMessage = "Petición inválida";
+    }
+    reply.code(status).send({ success: false, error: safeMessage });
   });
 
   return app;

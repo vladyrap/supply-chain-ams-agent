@@ -21,35 +21,41 @@ import {
   postKbHelpful,
   getMetrics,
 } from "../controllers/support.controller";
+import { requireAuth } from "../middleware/requireAuth";
+import { requirePermission } from "../middleware/requirePermission";
 
-// Dejamos que Fastify infiera los tipos de los handlers (evita TS2769 cuando
-// hay Params + Body simultáneos en el genérico de la ruta).
+// FIX C7 (audit v1.1.0): RBAC en rutas mutantes.
+// Mapeo a PlatformScreen real del RBAC:
+//   - support → "incidentes" (tickets/conversations)
+//   - knowledge → "conocimiento_rag"
+const READ = { preHandler: requireAuth };
+const TICKETS_WRITE = { preHandler: requirePermission("incidentes", "edit") };
+const KB_WRITE = { preHandler: requirePermission("conocimiento_rag", "edit") };
+const KB_APPROVE = { preHandler: requirePermission("conocimiento_rag", "approve") };
+const KB_DELETE = { preHandler: requirePermission("conocimiento_rag", "delete") };
+
 export async function supportRoutes(app: FastifyInstance) {
-  // Conversations
-  app.post("/api/support/conversations", postStartConversation);
-  app.get("/api/support/conversations", getConversations);
-  app.get("/api/support/conversations/:id", getConversationDetail);
-  app.post("/api/support/conversations/:id/messages", postSendMessage);
-  app.post("/api/support/conversations/:id/close", postCloseConversation);
-  app.post("/api/support/conversations/:id/escalate", postManualEscalate);
+  app.post("/api/support/conversations", READ, postStartConversation as never);
+  app.get("/api/support/conversations", READ, getConversations as never);
+  app.get("/api/support/conversations/:id", READ, getConversationDetail as never);
+  app.post("/api/support/conversations/:id/messages", READ, postSendMessage as never);
+  app.post("/api/support/conversations/:id/close", TICKETS_WRITE, postCloseConversation as never);
+  app.post("/api/support/conversations/:id/escalate", TICKETS_WRITE, postManualEscalate as never);
 
-  // Tickets
-  app.get("/api/support/tickets", getTicketsRoute);
-  app.get("/api/support/tickets/:id", getTicketDetail);
-  app.post("/api/support/tickets/:id/assign", postAssignTicket);
-  app.post("/api/support/tickets/:id/resolve", postResolveTicket);
-  app.post("/api/support/tickets/:id/close", postCloseTicket);
-  app.patch("/api/support/tickets/:id/status", patchTicketStatus);
+  app.get("/api/support/tickets", READ, getTicketsRoute as never);
+  app.get("/api/support/tickets/:id", READ, getTicketDetail as never);
+  app.post("/api/support/tickets/:id/assign", TICKETS_WRITE, postAssignTicket as never);
+  app.post("/api/support/tickets/:id/resolve", TICKETS_WRITE, postResolveTicket as never);
+  app.post("/api/support/tickets/:id/close", TICKETS_WRITE, postCloseTicket as never);
+  app.patch("/api/support/tickets/:id/status", TICKETS_WRITE, patchTicketStatus as never);
 
-  // KB
-  app.get("/api/support/kb", getKbArticles);
-  app.get("/api/support/kb/:id", getKbArticleDetail);
-  app.post("/api/support/kb", postCreateKb);
-  app.post("/api/support/kb/:id/approve", postApproveKb);
-  app.post("/api/support/kb/:id/archive", postArchiveKb);
-  app.delete("/api/support/kb/:id", deleteKb);
-  app.post("/api/support/kb/:id/helpful", postKbHelpful);
+  app.get("/api/support/kb", READ, getKbArticles as never);
+  app.get("/api/support/kb/:id", READ, getKbArticleDetail as never);
+  app.post("/api/support/kb", KB_WRITE, postCreateKb as never);
+  app.post("/api/support/kb/:id/approve", KB_APPROVE, postApproveKb as never);
+  app.post("/api/support/kb/:id/archive", KB_APPROVE, postArchiveKb as never);
+  app.delete("/api/support/kb/:id", KB_DELETE, deleteKb as never);
+  app.post("/api/support/kb/:id/helpful", READ, postKbHelpful as never);
 
-  // Métricas
-  app.get("/api/support/metrics", getMetrics);
+  app.get("/api/support/metrics", READ, getMetrics);
 }
