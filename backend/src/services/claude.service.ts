@@ -7,6 +7,7 @@ import path from "node:path";
 import { ClaudeError, ConfigError } from "../utils/errors";
 import { logger } from "../utils/logger";
 import { retryWithBackoff } from "../utils/retry";
+import { assertCanCallGemini } from "../utils/gemini-rate-limiter";
 import { retrieveRelevantChunks, formatContextBlock } from "./rag.service";
 import { extractUsage, recordUsageFireAndForget } from "./usage.service";
 import type { Attachment, ConfidenceLevel } from "../types/ams.types";
@@ -213,6 +214,8 @@ export async function chatWithAgent(input: ClaudeChatInput): Promise<ClaudeChatR
   );
 
   try {
+    // v0.12.3 — Hard cap defensivo. Throws GeminiRateLimitExceeded si excede.
+    assertCanCallGemini("chatWithAgent");
     const resp = await retryWithBackoff(
       () => ai.models.generateContent({
         model,

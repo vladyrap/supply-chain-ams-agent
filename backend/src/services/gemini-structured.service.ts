@@ -25,6 +25,7 @@ import {
   geminiCallsTotal, geminiJsonInvalidTotal, geminiRepairAttemptsTotal,
   geminiCallDuration, geminiFallbackUsedTotal, geminiConfidenceLevel,
 } from "../utils/metrics";
+import { assertCanCallGemini } from "../utils/gemini-rate-limiter";
 
 let cachedClient: GoogleGenAI | null = null;
 function getClient(): GoogleGenAI {
@@ -120,6 +121,8 @@ export async function callGeminiStructured<T = unknown>(
     const client = getClient();
     const schema = SCHEMA_BY_TASK[input.taskType];
 
+    // v0.12.3 — Hard cap defensivo (200/día, 80/hora, 20/min default).
+    assertCanCallGemini(`structured:${input.taskType}`);
     const resp = await client.models.generateContent({
       model: cfg.model,
       contents: [{ role: "user", parts: [{ text: userText }] }],
