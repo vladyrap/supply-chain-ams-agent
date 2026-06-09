@@ -42,6 +42,8 @@ import { adminUsageRoutes } from "./routes/admin-usage.routes";
 import { googleAuthRoutes } from "./routes/auth-google.routes";
 // v1.1.0 — Multi-tenancy plugin
 import { tenantPlugin } from "./middleware/tenant";
+// v1.2.0 — Tenants CRUD (super_admin)
+import { tenantsRoutes } from "./routes/tenants.routes";
 import { registry, httpRequestsTotal, httpRequestDuration } from "./utils/metrics";
 
 export function buildServer() {
@@ -237,6 +239,8 @@ export function buildServer() {
   app.register(adminUsageRoutes);
   // v1.1.0 — SSO Google (no-op si no hay credenciales)
   app.register(googleAuthRoutes);
+  // v1.2.0 — Tenants catálogo (CRUD super_admin)
+  app.register(tenantsRoutes);
   app.register(scopeItemsRoutes);
   app.register(customerResponseRoutes);
 
