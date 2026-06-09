@@ -46,6 +46,31 @@ export function buildServer() {
     bodyLimit: 30 * 1024 * 1024,
   });
 
+  // v0.12.7 — Fix BUG-001: Fastify por default rechaza con 400 cualquier request
+  // con Content-Type: application/json y body vacio. Eso rompe llamadas legitimas
+  // de DELETE/POST sin payload, que el frontend a veces emite con el header pero
+  // sin body. Reemplazamos el parser para devolver objeto vacio en esos casos.
+  app.removeContentTypeParser("application/json");
+  app.addContentTypeParser(
+    "application/json",
+    { parseAs: "string" },
+    (_req, body, done) => {
+      const raw = (body as string | Buffer | undefined) ?? "";
+      const text = typeof raw === "string" ? raw : raw.toString("utf-8");
+      if (text.trim() === "") {
+        done(null, {});
+        return;
+      }
+      try {
+        done(null, JSON.parse(text));
+      } catch (err) {
+        const wrapped = err as Error & { statusCode?: number };
+        wrapped.statusCode = 400;
+        done(wrapped, undefined);
+      }
+    },
+  );
+
   const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS ||
     "http://localhost:6700,http://localhost:6600,http://127.0.0.1:6700,http://127.0.0.1:6600")
     .split(",").map((s) => s.trim()).filter(Boolean);
