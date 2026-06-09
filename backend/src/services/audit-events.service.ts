@@ -45,6 +45,23 @@ async function ensureSchema(): Promise<void> {
     await query(`CREATE INDEX IF NOT EXISTS idx_audit_events_actor      ON audit_events(actor_user_id) WHERE actor_user_id IS NOT NULL;`);
     await query(`CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at DESC);`);
     await query(`CREATE INDEX IF NOT EXISTS idx_audit_events_correlation ON audit_events(correlation_id) WHERE correlation_id IS NOT NULL;`);
+
+    // v0.12.1 — dedup constraint para evitar la duplicación masiva
+    // (16k duplicados observados el 2026-06-05 por bug del frontend).
+    // Función IMMUTABLE wrapper sobre EXTRACT(EPOCH) + partial unique index.
+    // Idempotente. Detalle: date_trunc(TIMESTAMPTZ) NO es immutable → usamos epoch.
+    await query(`
+      CREATE OR REPLACE FUNCTION audit_events_minute_bucket(ts TIMESTAMPTZ)
+      RETURNS BIGINT LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+        SELECT EXTRACT(EPOCH FROM ts)::bigint / 60;
+      $$;
+    `);
+    await query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_events_dedup_minute
+        ON audit_events (event_type, ticket_id, audit_events_minute_bucket(created_at))
+        WHERE ticket_id IS NOT NULL;
+    `);
+
     schemaEnsured = true;
   } catch (err) {
     logger.warn({ err }, "ensure audit_events schema failed (best-effort)");
@@ -106,6 +123,36 @@ export async function recordAuditEvent(input: AuditEventInput): Promise<AuditEve
     );
     return rows[0] ? rowToRecord(rows[0]) : null;
   } catch (err) {
+    // v0.12.1 — manejar dedup violation gracefully:
+    // si el INSERT falla por uq_audit_events_dedup_minute (PostgreSQL 23505),
+    // devolvemos el evento existente del mismo (event_type, ticket_id, minuto).
+    // El cliente nunca ve el conflicto, just queda idempotente.
+    const errCode = (err as { code?: string } | null)?.code;
+    if (errCode === "23505" && input.ticketId) {
+      try {
+        const { rows: existing } = await query<Parameters<typeof rowToRecord>[0]>(
+          `SELECT id, tenant_id, ticket_id, actor_user_id, actor_name, actor_role,
+                  event_type, category, severity, payload, source, correlation_id,
+                  created_at
+             FROM audit_events
+            WHERE event_type = $1
+              AND ticket_id = $2
+              AND audit_events_minute_bucket(created_at) = audit_events_minute_bucket(now())
+            ORDER BY created_at DESC
+            LIMIT 1`,
+          [input.eventType, input.ticketId],
+        );
+        if (existing[0]) {
+          logger.debug(
+            { eventType: input.eventType, ticketId: input.ticketId },
+            "audit_events dedup: returning existing record (within same minute)",
+          );
+          return rowToRecord(existing[0]);
+        }
+      } catch (selectErr) {
+        logger.warn({ selectErr }, "audit_events dedup fallback select failed");
+      }
+    }
     logger.error({ err, eventType: input.eventType }, "audit_events insert failed");
     return null;
   }
