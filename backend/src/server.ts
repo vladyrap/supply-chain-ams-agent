@@ -53,7 +53,10 @@ export function buildServer() {
       else cb(null, false);
     },
     credentials: true,
-    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    // v0.12.2 — agregado PUT para /api/tickets/:key/intelligence (AIE pipeline).
+    // El frontend hace PUT en useAutoEnrichment cuando persiste resultado del analisis.
+    // Sin PUT en CORS, el preflight rechaza con "Method PUT is not allowed".
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   });
   app.register(cookie, {
     secret: process.env.COOKIE_SECRET || "ams-dev-cookie-secret-change-in-prod-please",
