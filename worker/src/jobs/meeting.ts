@@ -21,6 +21,8 @@ export interface MeetingJobData {
   mimeType: string;
   dataBase64: string;
   language?: string;  // ISO 639-1, default "es"
+  /** FIX (QAS MT v1.2.2): tenant_id obligatorio para evento + persistencia. */
+  tenantId?: string;
 }
 
 interface WhisperResponse {
@@ -159,8 +161,10 @@ export async function processMeeting(data: MeetingJobData): Promise<void> {
     );
     logger.info({ meetingId }, "meeting: done");
 
-    // Emit cross-service (no crítico)
-    emitEvent("meeting.done", {
+    // Emit cross-service (no crítico). FIX QAS MT v1.2.2: tenantId obligatorio.
+    const tenantIdForEmit = (data as MeetingJobData).tenantId || "default";
+    emitEvent(tenantIdForEmit, "meeting.done", {
+      tenant_id: tenantIdForEmit,
       meeting_id: meetingId,
       title: fileName,
       duration_sec: whisperResp.duration ?? null,

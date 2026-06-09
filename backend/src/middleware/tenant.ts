@@ -19,6 +19,11 @@
 // =============================================================================
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+// FIX QAS MT v1.2.2 (BUG CRÍTICO): sin fastify-plugin el decorateRequest y el
+// hook onRequest quedan encapsulados en el scope del plugin y NO afectan a las
+// rutas registradas en el server padre. Resultado: req.tenantId === undefined
+// en TODO endpoint, login imposible, multi-tenancy roto.
+import fp from "fastify-plugin";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -101,13 +106,22 @@ function sanitize(tenant: string): string {
 /**
  * Hook que setea request.tenantId en TODAS las requests.
  * IMPORTANTE: En server.ts, registrar ANTES de los routes (fix C1).
+ *
+ * Envuelto con fastify-plugin (fp) para que el decorateRequest y el hook
+ * onRequest se apliquen al scope PADRE — sino quedan encapsulados al plugin
+ * y las rutas no ven req.tenantId (fix QAS MT v1.2.2).
  */
-export async function tenantPlugin(app: FastifyInstance): Promise<void> {
+async function tenantPluginImpl(app: FastifyInstance): Promise<void> {
   app.decorateRequest("tenantId", "");
   app.addHook("onRequest", async (req: FastifyRequest, _reply: FastifyReply) => {
     req.tenantId = resolveTenantId(req);
   });
 }
+
+export const tenantPlugin = fp(tenantPluginImpl, {
+  name: "tenant-plugin",
+  fastify: "4.x",
+});
 
 /**
  * Helper SEGURO para construir WHERE clauses tenant-scoped.

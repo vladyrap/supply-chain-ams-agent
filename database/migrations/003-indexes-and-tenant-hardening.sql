@@ -23,12 +23,25 @@ CREATE INDEX IF NOT EXISTS idx_tickets_demo_intelligence_gin
   ON tickets_demo USING GIN (intelligence jsonb_path_ops);
 
 -- M4 · BRIN sobre agent_usage.created_at (admin dashboard)
-CREATE INDEX IF NOT EXISTS idx_agent_usage_created_brin
-  ON agent_usage USING BRIN (created_at) WITH (pages_per_range = 32);
-
--- Tenant scoping en agent_usage (filtro común post fix A3)
-CREATE INDEX IF NOT EXISTS idx_agent_usage_tenant_created
-  ON agent_usage (tenant_id, created_at DESC);
+-- FIX (QAS audit MT v1.2.2): solo aplicar si la tabla existe (creada en runtime
+-- por admin-usage.service). Antes este bloque fallaba "table not exist" o
+-- "column not exist" en QAS fresh.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='agent_usage') THEN
+    -- Agregar columna tenant_id si falta (la tabla la crea el service sin esta col)
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='agent_usage' AND column_name='tenant_id') THEN
+      ALTER TABLE agent_usage ADD COLUMN tenant_id TEXT;
+    END IF;
+    -- BRIN index sobre created_at
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_agent_usage_created_brin
+             ON agent_usage USING BRIN (created_at) WITH (pages_per_range = 32)';
+    -- Tenant scoping
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_agent_usage_tenant_created
+             ON agent_usage (tenant_id, created_at DESC)';
+  END IF;
+END $$;
 
 -- M5 · Composite indexes en audit_events
 CREATE INDEX IF NOT EXISTS idx_audit_events_ticket_created

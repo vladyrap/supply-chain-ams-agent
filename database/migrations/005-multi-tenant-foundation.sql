@@ -209,10 +209,16 @@ SELECT mt_add_tenant_id('sap_inbound_events');
 SELECT mt_add_tenant_id('integration_destinations');
 SELECT mt_add_tenant_id('integration_deliveries');
 
--- Telemetría (agent_usage ya tiene tenant_id por mig 003, pero faltaba NOT NULL)
+-- Telemetría — FIX (QAS audit MT v1.2.2): defensa contra agent_usage sin columna
+-- tenant_id si la migration 003 corrió antes de que el service creara la tabla.
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'agent_usage') THEN
+    -- ADD COLUMN si falta (la tabla la crea el service en runtime sin esta col)
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='agent_usage' AND column_name='tenant_id') THEN
+      ALTER TABLE agent_usage ADD COLUMN tenant_id TEXT;
+    END IF;
     UPDATE agent_usage SET tenant_id = 'default' WHERE tenant_id IS NULL;
     ALTER TABLE agent_usage ALTER COLUMN tenant_id SET NOT NULL;
     IF NOT EXISTS (
@@ -268,8 +274,14 @@ END $$;
 CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_created_v2
   ON audit_events(tenant_id, created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_agent_usage_tenant_created_v2
-  ON agent_usage(tenant_id, created_at DESC);
+-- FIX (QAS MT v1.2.2): wrap en DO block para skip si tabla no existe.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='agent_usage') THEN
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_agent_usage_tenant_created_v2
+             ON agent_usage(tenant_id, created_at DESC)';
+  END IF;
+END $$;
 
 -- =====================================================================
 -- 6. Cleanup helper function
