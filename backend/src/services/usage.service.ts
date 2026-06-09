@@ -31,6 +31,13 @@ export interface UsageRecord {
   incidentId?: string | null;
   conversationId?: string | null;
   metadata?: Record<string, unknown>;
+  /**
+   * FIX QAS v1.2.3 — tenant_id es NOT NULL en agent_usage. Si los callers
+   * no lo pasan se cae el INSERT (silenciado por el catch, pero NO se
+   * registra el gasto → panel /admin/costs queda en 0).
+   * Default "default" para callers viejos pre-multi-tenant.
+   */
+  tenantId?: string;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -64,15 +71,17 @@ export async function recordUsage(rec: UsageRecord): Promise<void> {
     const total = rec.totalTokens ?? (prompt + completion);
     if (total === 0) return; // nada que registrar
     const cost = costUsd(rec.model, prompt, completion);
+    // FIX QAS v1.2.3 — agregar tenant_id (NOT NULL en schema multi-tenant).
+    const tenantId = (rec.tenantId ?? "default").toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 64) || "default";
     await query(
       `INSERT INTO agent_usage
          (source, model, prompt_tokens, completion_tokens, total_tokens,
-          cost_usd, incident_id, conversation_id, metadata)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)`,
+          cost_usd, incident_id, conversation_id, metadata, tenant_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)`,
       [
         rec.source, rec.model, prompt, completion, total, cost,
         rec.incidentId ?? null, rec.conversationId ?? null,
-        JSON.stringify(rec.metadata ?? {}),
+        JSON.stringify(rec.metadata ?? {}), tenantId,
       ]
     );
   } catch (err) {
