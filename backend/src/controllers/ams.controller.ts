@@ -382,9 +382,23 @@ export async function streamResearch(req: FastifyRequest, reply: FastifyReply) {
   }
   reply.raw.writeHead(200, sseHeaders);
   const send = (obj: unknown) => {
-    reply.raw.write(`data: ${JSON.stringify(obj)}\n\n`);
+    if (clientClosed) return; // FIX M15: no escribir a socket cerrado
+    try {
+      reply.raw.write(`data: ${JSON.stringify(obj)}\n\n`);
+    } catch {
+      /* socket cerrado entre check y write — ignorar */
+    }
   };
   reply.hijack();
+
+  // FIX M15 (audit v1.1.0): detectar cierre del cliente para terminar el loop
+  // de research lo antes posible. Antes: cliente cerraba tab → flushPromise
+  // seguía corriendo + research seguía gastando Gemini por respuesta que
+  // nadie veía. Ahora: clientClosed flag corta el while loop y los sends.
+  let clientClosed = false;
+  req.raw.once("close", () => {
+    clientClosed = true;
+  });
 
   // Cola de eventos. researchWithAgent invocará onEvent y nosotros los drenamos.
   const queue: ResearchEvent[] = [];
@@ -392,6 +406,7 @@ export async function streamResearch(req: FastifyRequest, reply: FastifyReply) {
   // eslint-disable-next-line no-async-promise-executor
   const flushPromise = new Promise<void>(async (resolve) => {
     while (!finished || queue.length > 0) {
+      if (clientClosed) break; // M15: salir si cliente desconectó
       while (queue.length > 0) {
         send(queue.shift());
       }
@@ -409,7 +424,9 @@ export async function streamResearch(req: FastifyRequest, reply: FastifyReply) {
       client: normalized.client,
       environment: normalized.environment,
       attachments: normalized.attachments,
-      onEvent: (ev) => queue.push(ev),
+      onEvent: (ev) => {
+        if (!clientClosed) queue.push(ev);
+      },
     });
   } catch (err) {
     queue.push({
@@ -419,7 +436,7 @@ export async function streamResearch(req: FastifyRequest, reply: FastifyReply) {
   } finally {
     finished = true;
     await flushPromise;
-    reply.raw.end();
+    try { reply.raw.end(); } catch { /* ya cerrado */ }
   }
 }
 

@@ -71,10 +71,26 @@ export async function deleteEvidence(req: FastifyRequest<{ Params: { id: string 
 // fields: scenarioId, type, title, description?, durationSeconds?, tags? (csv), createdBy
 // file:   file
 // ============================================================
+// FIX A11 (audit v1.1.0): allowlist de mime types para evitar XSS stored
+// via SVG/HTML upload. Solo videos + imágenes estándar + PDFs.
+const ALLOWED_UPLOAD_MIMES = new Set([
+  "image/jpeg", "image/png", "image/webp", "image/gif",
+  "video/mp4", "video/webm", "video/quicktime", "video/x-msvideo",
+  "application/pdf",
+]);
+
 export async function uploadEvidence(req: FastifyRequest, reply: FastifyReply) {
   try {
     const data = await req.file();
     if (!data) return reply.code(400).send({ success: false, error: "No se recibió archivo" });
+
+    // FIX A11: rechazar mimetype no esperado ANTES de leer el buffer.
+    if (!ALLOWED_UPLOAD_MIMES.has(data.mimetype)) {
+      return reply.code(415).send({
+        success: false,
+        error: `Tipo de archivo no permitido: ${data.mimetype}. Permitidos: imágenes (jpg/png/webp/gif), videos (mp4/webm/mov/avi), PDF.`,
+      });
+    }
 
     const fields = (data.fields || {}) as Record<string, { value?: string } | undefined>;
     const scenarioId = fields.scenarioId?.value || "";
@@ -125,9 +141,18 @@ export async function getEvidenceFile(req: FastifyRequest<{ Params: { id: string
     if (!ev) return reply.code(404).send({ success: false, error: "Evidencia no encontrada" });
     if (!ev.storagePath) return reply.code(404).send({ success: false, error: "Esta evidencia no tiene archivo asociado" });
     const buffer = await svc.readEvidenceFile(ev.storagePath);
-    reply.header("Content-Type", ev.fileType || "application/octet-stream");
+    // FIX A11: re-validar fileType al servir + Content-Security-Policy estricto
+    // y X-Content-Type-Options nosniff. Si el fileType no está en allowlist,
+    // forzar application/octet-stream + attachment (no inline).
+    const safeMime = ALLOWED_UPLOAD_MIMES.has(ev.fileType || "")
+      ? (ev.fileType as string)
+      : "application/octet-stream";
+    const disposition = ALLOWED_UPLOAD_MIMES.has(ev.fileType || "") ? "inline" : "attachment";
+    reply.header("Content-Type", safeMime);
     reply.header("Content-Length", String(buffer.length));
-    reply.header("Content-Disposition", `inline; filename="${(ev.fileName || "evidence").replace(/"/g, "")}"`);
+    reply.header("Content-Disposition", `${disposition}; filename="${(ev.fileName || "evidence").replace(/"/g, "")}"`);
+    reply.header("X-Content-Type-Options", "nosniff");
+    reply.header("Content-Security-Policy", "default-src 'none'; sandbox");
     return reply.send(buffer);
   } catch (err) {
     logger.error({ err }, "testing.getEvidenceFile fail");

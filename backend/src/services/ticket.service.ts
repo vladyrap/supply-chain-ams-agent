@@ -426,7 +426,7 @@ export interface UpsertIntelligenceInput {
 
 export interface UpsertIntelligenceResult {
   ticket: Ticket | null;
-  conflict?: { reason: string; serverHash: string };
+  conflict?: { reason: string; serverHash?: string };
 }
 
 /**
@@ -442,25 +442,38 @@ export async function upsertTicketIntelligence(
   const intel = input.intelligence;
   if (!intel) return { ticket: null };
 
-  // Check conflict: si server ya tiene mismo hash enriched, skip
+  // Check conflict + FIX A17 (audit v1.1.0): optimistic locking por analysisVersion.
+  // Si la versión enviada por el cliente es menor a la del server → 409, el cliente
+  // debe re-fetch el ticket. Evita last-write-wins entre 2 tabs/2 nodes paralelos.
   try {
     const { rows: existing } = await query<{
       intelligence_status: IntelligenceStatus | null;
       intelligence_input_hash: string | null;
+      intelligence: TicketIntelligence | null;
     }>(
-      `SELECT intelligence_status, intelligence_input_hash
+      `SELECT intelligence_status, intelligence_input_hash, intelligence
          FROM tickets_demo WHERE key = $1`,
       [key]
     );
     const cur = existing[0];
-    if (cur && cur.intelligence_status === "enriched"
-        && cur.intelligence_input_hash
-        && intel.inputHash
-        && cur.intelligence_input_hash === intel.inputHash
-        && intel.status === "enriched") {
-      // Idempotente — ya está enriched con mismo hash. No re-escribir.
-      const ticket = await getUserTicketByKey(key);
-      return { ticket, conflict: { reason: "already_enriched_with_same_hash", serverHash: cur.intelligence_input_hash } };
+    if (cur) {
+      // Idempotente: mismo hash + ya enriched → no re-escribir.
+      if (cur.intelligence_status === "enriched"
+          && cur.intelligence_input_hash
+          && intel.inputHash
+          && cur.intelligence_input_hash === intel.inputHash
+          && intel.status === "enriched") {
+        const ticket = await getUserTicketByKey(key);
+        return { ticket, conflict: { reason: "already_enriched_with_same_hash", serverHash: cur.intelligence_input_hash } };
+      }
+      // FIX A17: si server tiene versión mayor a la que el cliente intenta guardar,
+      // 409 conflict (cliente debe re-fetch).
+      const serverVersion = (cur.intelligence as { analysisVersion?: number } | null)?.analysisVersion;
+      const clientVersion = (intel as { analysisVersion?: number }).analysisVersion;
+      if (typeof serverVersion === "number" && typeof clientVersion === "number" && clientVersion < serverVersion) {
+        const ticket = await getUserTicketByKey(key);
+        return { ticket, conflict: { reason: "stale_analysis_version", serverHash: cur.intelligence_input_hash ?? undefined } };
+      }
     }
   } catch (err) {
     logger.debug({ err }, "intelligence conflict check skipped");

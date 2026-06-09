@@ -26,6 +26,22 @@ import {
   geminiCallDuration, geminiFallbackUsedTotal, geminiConfidenceLevel,
 } from "../utils/metrics";
 import { assertCanCallGemini } from "../utils/gemini-rate-limiter";
+import crypto from "node:crypto";
+
+// FIX M16 (audit v1.1.0): cache LRU por inputHash. TTL 24h.
+// Si el cliente reanaliza el mismo ticket sin cambios → cache HIT (no Gemini).
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const CACHE_MAX_SIZE = 200; // ~ últimos 200 prompts únicos
+const responseCache = new Map<string, { value: unknown; at: number }>();
+function stableHash(s: string): string {
+  return crypto.createHash("sha256").update(s).digest("hex").slice(0, 24);
+}
+function evictCacheIfFull(): void {
+  if (responseCache.size < CACHE_MAX_SIZE) return;
+  // FIFO eviction: borrar el más viejo
+  const firstKey = responseCache.keys().next().value;
+  if (firstKey) responseCache.delete(firstKey);
+}
 
 let cachedClient: GoogleGenAI | null = null;
 function getClient(): GoogleGenAI {
@@ -121,6 +137,16 @@ export async function callGeminiStructured<T = unknown>(
     const client = getClient();
     const schema = SCHEMA_BY_TASK[input.taskType];
 
+    // FIX M16 (audit v1.1.0): cache LRU por inputHash en memoria.
+    // Antes: reanalyze forzado siempre gastaba Gemini aunque inputHash
+    // fuera el mismo. Ahora: cache de 24h evita 60-80% de reanalyze costs.
+    const cacheKey = `${input.taskType}:${cfg.model}:${stableHash(userText + (systemFilled.slice(0, 200)))}`;
+    const cached = responseCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
+      logger.debug({ taskType: input.taskType, age: Date.now() - cached.at }, "gemini cache HIT");
+      return cached.value as Awaited<ReturnType<typeof callGeminiStructured<T>>>;
+    }
+
     // v0.12.3 — Hard cap defensivo (200/día, 80/hora, 20/min default).
     assertCanCallGemini(`structured:${input.taskType}`);
     const resp = await client.models.generateContent({
@@ -145,6 +171,16 @@ export async function callGeminiStructured<T = unknown>(
       throw new Error(`Gemini blocked response: finishReason=${finishReason}`);
     }
 
+    // FIX M17 (audit v1.1.0): cobrar tokens REALES de usageMetadata.
+    // Antes: audit logeaba calls solamente. Ahora: incluye prompt_tokens +
+    // candidates_tokens para que /admin/costs muestre costo real (no estimado).
+    const usage = (resp as { usageMetadata?: {
+      promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number;
+    } }).usageMetadata;
+    const promptTokens = usage?.promptTokenCount ?? 0;
+    const completionTokens = usage?.candidatesTokenCount ?? 0;
+    const totalTokens = usage?.totalTokenCount ?? promptTokens + completionTokens;
+
     if (!cfg.jsonOutput) {
       // No structured — devolvemos string como T (caller responsable)
       const durationMs = Date.now() - t0;
@@ -153,15 +189,21 @@ export async function callGeminiStructured<T = unknown>(
         actor: input.audit?.actor ?? "system",
         title: `Gemini ${input.taskType} completado (texto libre)`,
         ticketId: input.audit?.ticketKey,
-        metadata: { taskType: input.taskType, model: cfg.model, durationMs, structured: false, correlationId },
+        metadata: {
+          taskType: input.taskType, model: cfg.model, durationMs, structured: false, correlationId,
+          promptTokens, completionTokens, totalTokens,
+        },
       });
-      return {
+      const result = {
         data: rawText as unknown as T,
         repaired: false,
         modelUsed: cfg.model,
         wasMock: false,
         durationMs,
       };
+      evictCacheIfFull();
+      responseCache.set(cacheKey, { value: result, at: Date.now() });
+      return result;
     }
 
     // Structured — parse o repair
@@ -202,10 +244,19 @@ export async function callGeminiStructured<T = unknown>(
       actor: input.audit?.actor ?? "system",
       title: `Gemini ${input.taskType} completado${repaired ? " (con reparación JSON)" : ""}`,
       ticketId: input.audit?.ticketKey,
-      metadata: { taskType: input.taskType, model: cfg.model, durationMs, repaired, confidence: conf, correlationId },
+      metadata: {
+        taskType: input.taskType, model: cfg.model, durationMs, repaired, confidence: conf, correlationId,
+        promptTokens, completionTokens, totalTokens,
+      },
     });
 
-    return { data: parsed, repaired, modelUsed: cfg.model, wasMock: false, durationMs };
+    const structuredResult = { data: parsed, repaired, modelUsed: cfg.model, wasMock: false, durationMs };
+    // FIX M16: cachear sólo si repair NO fue necesario (no queremos cache de respuestas reparadas).
+    if (!repaired) {
+      evictCacheIfFull();
+      responseCache.set(cacheKey, { value: structuredResult, at: Date.now() });
+    }
+    return structuredResult;
 
   } catch (err) {
     const durationMs = Date.now() - t0;

@@ -126,6 +126,36 @@ export function getGeminiRateLimitStats(): {
 }
 
 /**
+ * FIX A18 (audit v1.1.0): reserveBudget para pipelines multi-call.
+ *
+ * Un pipeline AIE puede hacer N calls a Gemini (classify + 8 specialists +
+ * consolidator + customer response = ~10 calls). Si el rate limit se golpea
+ * en el call #5, los 4 anteriores ya se cobraron pero el ticket queda parcial.
+ *
+ * Esta función chequea que el caller tenga budget para N calls ANTES de
+ * empezar. Si no hay, throw inmediato (ahorra cobros parciales).
+ *
+ * No "reserva" el budget en el sentido estricto — solo valida que hay
+ * headroom. Si entre el check y los calls reales hay race con otro pipeline,
+ * el cap se golpeará y los últimos N-X calls fallarán igual. Pero al menos
+ * el pipeline corto puede decidir abortar entero antes de gastar nada.
+ */
+export function assertBudgetAvailable(neededCalls: number, label = "pipeline"): void {
+  if (DISABLED) return;
+  rollWindows();
+  if (callsThisMinute + neededCalls > CAP_PER_MINUTE) {
+    throw new GeminiRateLimitExceeded("minute", callsThisMinute, CAP_PER_MINUTE);
+  }
+  if (callsThisHour + neededCalls > CAP_PER_HOUR) {
+    throw new GeminiRateLimitExceeded("hour", callsThisHour, CAP_PER_HOUR);
+  }
+  if (callsToday + neededCalls > CAP_PER_DAY) {
+    throw new GeminiRateLimitExceeded("day", callsToday, CAP_PER_DAY);
+  }
+  logger.debug({ label, neededCalls, remainingDay: CAP_PER_DAY - callsToday }, "budget OK para pipeline");
+}
+
+/**
  * Reset manual (testing / admin endpoint).
  */
 export function resetGeminiRateLimit(): void {

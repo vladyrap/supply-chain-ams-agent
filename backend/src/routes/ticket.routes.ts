@@ -69,9 +69,34 @@ export async function ticketRoutes(app: FastifyInstance) {
 
   // AIE v0.10 — Auto Intelligence Enrichment
   // PUT intelligence (persistir resultado del pipeline frontend)
+  // FIX M14 (audit v1.1.0): bodyLimit reducido a 256KB (analisis intelligence
+  // no debería pasar de eso) + schema validation. Antes: 30MB global permitía
+  // DoS guardando blob en columna JSONB.
   app.put<{ Params: { key: string }; Body: { intelligence: TicketIntelligence } }>(
     "/api/tickets/:key/intelligence",
-    { preHandler: requirePermission("ticket_command_center", "edit") },
+    {
+      preHandler: requirePermission("ticket_command_center", "edit"),
+      bodyLimit: 256 * 1024,
+      schema: {
+        body: {
+          type: "object",
+          required: ["intelligence"],
+          properties: {
+            intelligence: {
+              type: "object",
+              // Validación liviana — no enforce todos los campos, solo
+              // que sea objeto y status si presente sea string conocido.
+              properties: {
+                status: { type: "string", maxLength: 32 },
+                inputHash: { type: "string", maxLength: 128 },
+                analysisVersion: { type: "integer" },
+              },
+              additionalProperties: true,
+            },
+          },
+        },
+      },
+    },
     putTicketIntelligence);
   // GET intelligence (lighter que GET /tickets/:key — útil para badge en lista)
   app.get<{ Params: { key: string } }>(
