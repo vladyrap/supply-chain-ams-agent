@@ -1,0 +1,73 @@
+name: Deploy on tag
+
+# =============================================================================
+# v1.1.0 — Deploy automático al VPS cuando se pushea un tag vX.Y.Z
+# =============================================================================
+# Requiere secrets configurados en el repo (Settings → Secrets):
+#   - VPS_HOST          (ej: 49.13.x.x)
+#   - VPS_USER          (ej: ams)
+#   - VPS_SSH_KEY       (clave SSH privada, formato OpenSSH)
+#   - VPS_DEPLOY_PATH   (ej: /opt/supply-chain-ams-stack)
+#
+# El workflow se dispara SOLO en tags con formato v*.*.* (ej: v1.1.0)
+# Llama a `bash deploy.sh prod` en el VPS (idempotente).
+# =============================================================================
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag a desplegar (ej: v1.1.0)"
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy a VPS prod
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Echo tag
+        run: |
+          echo "Desplegando tag: ${{ github.ref_name || github.event.inputs.tag }}"
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
+
+      - name: Add VPS host fingerprint
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Pull + redeploy stack
+        env:
+          TAG: ${{ github.ref_name || github.event.inputs.tag }}
+        run: |
+          ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} bash -lc "'
+            set -euo pipefail
+            cd ${{ secrets.VPS_DEPLOY_PATH }}
+            echo \"==> Deploying tag $TAG\"
+            cd ../supply-chain-ams-agent && git fetch --tags && git checkout $TAG
+            cd ../supply-chain-ams-platform && git fetch --tags && git checkout $TAG || true
+            cd ${{ secrets.VPS_DEPLOY_PATH }} && git pull
+            bash deploy.sh prod
+            echo \"==> Deploy OK\"
+          '"
+
+      - name: Smoke test post-deploy
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(curl -sk -o /dev/null -w "%{http_code}" https://${{ secrets.AMS_DOMAIN || 'ams.tudominio.cl' }}/status || echo 000)
+            if [ "$STATUS" = "200" ]; then
+              echo "✓ /status responde 200"
+              exit 0
+            fi
+            echo "Esperando warmup... (status: $STATUS, intento $i/30)"
+            sleep 5
+          done
+          echo "✗ Timeout esperando warmup post-deploy"
+          exit 1
