@@ -1,0 +1,95 @@
+# =============================================================================
+# Alertmanager — Routing de alertas Prometheus a Slack/email (v0.13)
+# =============================================================================
+# Recibe alertas de Prometheus y las enruta según severity.
+# Soporta Slack webhook + email SMTP + PagerDuty.
+#
+# Activar:
+#   1. Setear SLACK_WEBHOOK_URL en .env del stack
+#   2. Setear ALERT_EMAIL_TO si querés también email
+#   3. Recargar config: docker exec ams-alertmanager kill -HUP 1
+# =============================================================================
+
+global:
+  resolve_timeout: 5m
+  # SMTP para alertas email (opcional)
+  smtp_smarthost: '${SMTP_HOST:-smtp.gmail.com}:587'
+  smtp_from: '${ALERT_EMAIL_FROM:-noreply@tuempresa.cl}'
+  smtp_auth_username: '${SMTP_USER:-}'
+  smtp_auth_password: '${SMTP_PASS:-}'
+  smtp_require_tls: true
+
+route:
+  group_by: ['alertname', 'severity', 'service']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'slack-default'
+  routes:
+    # Critical → Slack + email + (opcional) PagerDuty
+    - matchers:
+        - severity = "critical"
+      receiver: 'slack-critical'
+      group_wait: 10s
+      repeat_interval: 1h
+      continue: true
+
+    # Warnings → solo Slack
+    - matchers:
+        - severity = "warning"
+      receiver: 'slack-warnings'
+      repeat_interval: 6h
+
+    # Info → silent (solo si se quiere, ir al log)
+    - matchers:
+        - severity = "info"
+      receiver: 'slack-default'
+      repeat_interval: 24h
+
+receivers:
+  - name: 'slack-default'
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#ams-alerts'
+        send_resolved: true
+        title: '🔔 [{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+        text: |
+          *Severidad:* {{ .CommonLabels.severity }}
+          *Servicio:* {{ .CommonLabels.service }}
+          *Resumen:* {{ range .Alerts }}{{ .Annotations.summary }}{{ end }}
+          *Detalle:* {{ range .Alerts }}{{ .Annotations.description }}{{ end }}
+          *Inicio:* {{ range .Alerts }}{{ .StartsAt.Format "2006-01-02 15:04:05" }}{{ end }}
+
+  - name: 'slack-critical'
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#ams-alerts-critical'
+        send_resolved: true
+        title: '🚨 [CRITICAL] {{ .CommonLabels.alertname }}'
+        color: 'danger'
+        text: |
+          @channel ⚠ ALERTA CRÍTICA
+          *Servicio:* {{ .CommonLabels.service }}
+          *Resumen:* {{ range .Alerts }}{{ .Annotations.summary }}{{ end }}
+          *Runbook:* {{ range .Alerts }}{{ .Annotations.runbook_url }}{{ end }}
+    email_configs:
+      - to: '${ALERT_EMAIL_TO:-ops@tuempresa.cl}'
+        send_resolved: true
+        headers:
+          Subject: '🚨 [AMS CRITICAL] {{ .CommonLabels.alertname }}'
+
+  - name: 'slack-warnings'
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#ams-alerts'
+        send_resolved: true
+        title: '⚠ [WARN] {{ .CommonLabels.alertname }}'
+        color: 'warning'
+
+inhibit_rules:
+  # Si está down todo el backend, no spamear con alertas de DB/redis individuales
+  - source_matchers:
+      - alertname = "BackendDown"
+    target_matchers:
+      - service =~ "database|redis|gemini"
+    equal: ['environment']

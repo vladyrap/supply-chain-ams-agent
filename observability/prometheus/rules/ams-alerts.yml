@@ -1,0 +1,121 @@
+# =============================================================================
+# Prometheus alert rules — AMS Platform (v0.13)
+# =============================================================================
+# Reglas que evalúa Prometheus cada 30s. Cuando se cumple condición → notifica
+# a Alertmanager → routing a Slack/email según severity.
+# =============================================================================
+
+groups:
+  - name: ams-backend-health
+    interval: 30s
+    rules:
+      - alert: BackendDown
+        expr: up{job="ams-backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: backend
+        annotations:
+          summary: 'Backend AMS caído por >1min'
+          description: 'El endpoint /metrics no responde. Verificar contenedor: docker ps | grep backend'
+          runbook_url: 'https://github.com/vladyrap/supply-chain-ams-stack/blob/main/RUNBOOK.md#container-backend-restarting'
+
+      - alert: BackendHighMemory
+        expr: process_resident_memory_bytes{job="ams-backend"} > 1.5e9
+        for: 5m
+        labels:
+          severity: warning
+          service: backend
+        annotations:
+          summary: 'Backend usando >1.5GB RAM por 5min'
+          description: 'Posible memory leak. Investigar heap snapshot.'
+
+      - alert: BackendHighErrorRate
+        expr: rate(http_requests_total{status_code=~"5.."}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          service: backend
+        annotations:
+          summary: 'Tasa de errores 5xx >5% en 5min'
+          description: 'Backend devolviendo errores con frecuencia. Revisar logs.'
+
+  - name: ams-database
+    interval: 30s
+    rules:
+      - alert: DatabaseDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: database
+        annotations:
+          summary: 'PostgreSQL no responde'
+          description: 'DB caída. Verificar: docker logs ams-db-prod'
+
+      - alert: DatabaseDiskFull
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) < 0.10
+        for: 5m
+        labels:
+          severity: critical
+          service: database
+        annotations:
+          summary: 'Disco del VPS <10% libre'
+          description: 'Limpiar backups viejos o aumentar disk.'
+
+  - name: ams-gemini-cost
+    interval: 60s
+    rules:
+      - alert: GeminiDailyBudgetExceeded
+        expr: increase(gemini_calls_total[24h]) > 1000
+        for: 1m
+        labels:
+          severity: warning
+          service: gemini
+        annotations:
+          summary: 'Más de 1000 calls a Gemini en 24h'
+          description: 'Volumen alto - verificar uso anómalo. Panel: /admin/costs'
+          runbook_url: 'https://github.com/vladyrap/supply-chain-ams-stack/blob/main/RUNBOOK.md#gemini-devuelve-429--503'
+
+      - alert: GeminiRateLimitNearCap
+        expr: gemini_calls_total > 180  # 90% de cap default 200/dia
+        for: 30s
+        labels:
+          severity: warning
+          service: gemini
+        annotations:
+          summary: 'Rate limiter Gemini al 90% del cap diario'
+          description: 'Considerar aumentar GEMINI_CAP_PER_DAY si volumen legítimo.'
+
+      - alert: GeminiHigh5xxRate
+        expr: rate(gemini_calls_total{status="error"}[5m]) > 0.30
+        for: 5m
+        labels:
+          severity: warning
+          service: gemini
+        annotations:
+          summary: 'Gemini devolviendo >30% errores en 5min'
+          description: 'Posible issue Google Cloud. Status: https://status.cloud.google.com/'
+
+  - name: ams-business
+    interval: 60s
+    rules:
+      - alert: NoNewTicketsIn24h
+        expr: increase(tickets_created_total[24h]) == 0
+        for: 1h
+        labels:
+          severity: info
+          service: business
+        annotations:
+          summary: 'Sin tickets creados en 24h'
+          description: '¿Cliente offline? Verificar con cuenta.'
+
+      - alert: AuditEventsAnomalyLow
+        expr: rate(audit_events_insert_total[1h]) < 0.01
+        for: 30m
+        labels:
+          severity: info
+          service: business
+        annotations:
+          summary: 'Auditoría con muy pocos eventos en 1h'
+          description: 'Sistema podría estar idle o haber problema de logging.'
