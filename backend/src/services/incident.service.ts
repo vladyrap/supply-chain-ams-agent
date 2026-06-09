@@ -110,8 +110,8 @@ export async function saveIncident(tenantId: string, data: SaveIncidentInput): P
     estimatedResolution = null;
   }
 
-  // 3. Indexar en búsqueda semántica (no bloqueante)
-  upsertSearchFireAndForget({
+  // 3. Indexar en búsqueda semántica (no bloqueante, scoped al tenant)
+  upsertSearchFireAndForget(tenantId, {
     source_type: "incident",
     source_id: rec.id,
     title: rec.message.slice(0, 120),
@@ -194,7 +194,7 @@ export async function listIncidents(tenantId: string, filters: ListFilters = {})
     const base = rowToRecord(row);
     let est: TicketEstimatedResolution | null = row.estimated_resolution ?? null;
     if (!est) {
-      est = await enrichIncidentLazy({
+      est = await enrichIncidentLazy(tenantId, {
         id: row.id,
         message: row.message,
         sap_module: row.sap_module ?? null,
@@ -236,7 +236,7 @@ export async function getIncidentById(tenantId: string, id: string): Promise<Inc
   };
   let est: TicketEstimatedResolution | null = row.estimated_resolution ?? null;
   if (!est) {
-    est = await enrichIncidentLazy({
+    est = await enrichIncidentLazy(tenantId, {
       id: row.id,
       message: row.message,
       sap_module: row.sap_module ?? null,

@@ -299,7 +299,7 @@ export async function processInboundEvent(
   );
 
   // Emit integration event
-  emitEventFireAndForget("sap.inbound", {
+  emitEventFireAndForget(tenantId, "sap.inbound", {
     source: input.source,
     severity: input.severity ?? "info",
     title: input.title,

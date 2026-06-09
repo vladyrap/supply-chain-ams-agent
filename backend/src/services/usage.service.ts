@@ -96,9 +96,17 @@ export interface UsageSummary {
   byDay:    { day: string;    calls: number; tokens: number; costUsd: number }[];
 }
 
-export async function getUsageSummary(days = 30): Promise<UsageSummary> {
+// MT-3: getUsageSummary alineado con admin-usage. Recibe tenantId. Pasar "*"
+// para summary cross-tenant (solo super_admin).
+const ALL_TENANTS_SCOPE = "*";
+
+export async function getUsageSummary(tenantId: string, days = 30): Promise<UsageSummary> {
   const safeDays = Math.max(1, Math.min(days, 365));
   const interval = `${safeDays} days`;
+  const tFilter = tenantId === ALL_TENANTS_SCOPE ? "" : "AND tenant_id = $1";
+  const tFilterStandalone = tenantId === ALL_TENANTS_SCOPE ? "" : "WHERE tenant_id = $1";
+  const tFilterDays = tenantId === ALL_TENANTS_SCOPE ? "" : "AND au.tenant_id = $1";
+  const params: unknown[] = tenantId === ALL_TENANTS_SCOPE ? [] : [tenantId];
 
   const [totalsRow, byModelRows, bySourceRows, byDayRows] = await Promise.all([
     query<{ calls: string; pt: string; ct: string; tt: string; cost: string }>(
@@ -107,21 +115,24 @@ export async function getUsageSummary(days = 30): Promise<UsageSummary> {
               COALESCE(sum(completion_tokens),0)::text AS ct,
               COALESCE(sum(total_tokens),0)::text      AS tt,
               COALESCE(sum(cost_usd),0)::text          AS cost
-         FROM agent_usage WHERE created_at >= now() - interval '${interval}'`
+         FROM agent_usage WHERE created_at >= now() - interval '${interval}' ${tFilter}`,
+      params
     ),
     query<{ model: string; calls: string; tokens: string; cost: string }>(
       `SELECT model, count(*)::text AS calls,
               COALESCE(sum(total_tokens),0)::text AS tokens,
               COALESCE(sum(cost_usd),0)::text     AS cost
-         FROM agent_usage WHERE created_at >= now() - interval '${interval}'
-        GROUP BY model ORDER BY sum(cost_usd) DESC`
+         FROM agent_usage WHERE created_at >= now() - interval '${interval}' ${tFilter}
+        GROUP BY model ORDER BY sum(cost_usd) DESC`,
+      params
     ),
     query<{ source: string; calls: string; tokens: string; cost: string }>(
       `SELECT source, count(*)::text AS calls,
               COALESCE(sum(total_tokens),0)::text AS tokens,
               COALESCE(sum(cost_usd),0)::text     AS cost
-         FROM agent_usage WHERE created_at >= now() - interval '${interval}'
-        GROUP BY source ORDER BY sum(cost_usd) DESC`
+         FROM agent_usage WHERE created_at >= now() - interval '${interval}' ${tFilter}
+        GROUP BY source ORDER BY sum(cost_usd) DESC`,
+      params
     ),
     query<{ d: string; calls: string; tokens: string; cost: string }>(
       `WITH days AS (
@@ -134,10 +145,13 @@ export async function getUsageSummary(days = 30): Promise<UsageSummary> {
               COALESCE(sum(au.total_tokens),0)::text            AS tokens,
               COALESCE(sum(au.cost_usd),0)::text                AS cost
          FROM days d
-         LEFT JOIN agent_usage au ON au.created_at::date = d.day
-        GROUP BY d.day ORDER BY d.day`
+         LEFT JOIN agent_usage au ON au.created_at::date = d.day ${tFilterDays}
+        GROUP BY d.day ORDER BY d.day`,
+      params
     ),
   ]);
+  // (referencia silenciosa para evitar warning si no se usa)
+  void tFilterStandalone;
 
   const t = totalsRow.rows[0];
   const now = new Date();

@@ -387,7 +387,7 @@ export async function postRunGapDetection(
 ) {
   const days = Math.max(1, Math.min(90, req.body?.daysBack ?? 14));
   try {
-    const report = await runGapDetection(days);
+    const report = await runGapDetection(req.tenantId, days);
     return reply.send({ success: true, report });
   } catch (err) {
     logger.error({ err }, "training.runGapDetection fail");
@@ -404,7 +404,7 @@ export async function postRunQaEval(
 ) {
   const limit = req.body?.limit;
   try {
-    const report = await runQaEvaluation({ limit, triggeredBy: req.body?.triggeredBy });
+    const report = await runQaEvaluation(req.tenantId, { limit, triggeredBy: req.body?.triggeredBy });
     return reply.send({ success: true, report });
   } catch (err) {
     logger.error({ err }, "training.runQaEval fail");
@@ -413,9 +413,9 @@ export async function postRunQaEval(
   }
 }
 
-export async function getEvalRunsList(_req: FastifyRequest, reply: FastifyReply) {
+export async function getEvalRunsList(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const runs = await listEvalRuns(30);
+    const runs = await listEvalRuns(req.tenantId, 30);
     return reply.send({ success: true, count: runs.length, runs });
   } catch (err) {
     logger.error({ err }, "training.listEvalRuns fail");
@@ -429,7 +429,7 @@ export async function getEvalRunDetailRoute(
 ) {
   const { id } = req.params;
   try {
-    const detail = await getEvalRunDetail(id);
+    const detail = await getEvalRunDetail(req.tenantId, id);
     if (!detail) return reply.code(404).send({ success: false, error: "Run no encontrado" });
     return reply.send({ success: true, run: detail });
   } catch (err) {
@@ -455,7 +455,7 @@ export async function postAbTest(
     return reply.code(400).send({ success: false, error: "promptB.systemPrompt y promptB.label son obligatorios" });
   }
   try {
-    const report = await runAbTest({
+    const report = await runAbTest(req.tenantId, {
       promptA: b.promptA,
       promptB: b.promptB,
       limit: b.limit,
@@ -482,7 +482,7 @@ export async function postAutoPromote(
     return reply.code(400).send({ success: false, error: "candidate.systemPrompt y candidate.label son obligatorios" });
   }
   try {
-    const result = await autoPromoteIfBetter({
+    const result = await autoPromoteIfBetter(req.tenantId, {
       candidate: b.candidate,
       minDelta: b.minDelta,
       limit: b.limit,
@@ -505,7 +505,7 @@ export async function getEvalDiff(
   const { a, b } = req.query;
   if (!a || !b) return reply.code(400).send({ success: false, error: "a y b son obligatorios" });
   try {
-    const diff = await diffEvalRuns(a, b);
+    const diff = await diffEvalRuns(req.tenantId, a, b);
     if (!diff) return reply.code(404).send({ success: false, error: "Run(s) no encontrado(s)" });
     return reply.send({ success: true, diff });
   } catch (err) {
@@ -522,7 +522,7 @@ export async function postProposeQasFromTickets(
   reply: FastifyReply
 ) {
   try {
-    const report = await proposeQAsFromTickets({
+    const report = await proposeQAsFromTickets(req.tenantId, {
       limit: req.body?.limit,
       daysBack: req.body?.daysBack,
     });
@@ -542,7 +542,7 @@ export async function postAutoGenerateQas(
   reply: FastifyReply
 ) {
   try {
-    const report = await autoGenerateQasForItems({ limit: req.body?.limit });
+    const report = await autoGenerateQasForItems(req.tenantId, { limit: req.body?.limit });
     return reply.send({ success: true, report });
   } catch (err) {
     logger.error({ err }, "training.autoGenerateQas fail");
@@ -565,7 +565,7 @@ export async function postSelfTrainingRun(
   reply: FastifyReply
 ) {
   try {
-    const report = await runSelfTrainingCycle(req.body || {});
+    const report = await runSelfTrainingCycle(req.tenantId, req.body || {});
     return reply.send({ success: true, report });
   } catch (err) {
     logger.error({ err }, "training.selfTraining fail");
@@ -612,9 +612,9 @@ export async function patchSelfTrainingConfigRoute(
   }
 }
 
-export async function getSelfTrainingHistoryRoute(_req: FastifyRequest, reply: FastifyReply) {
+export async function getSelfTrainingHistoryRoute(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const runs = await listSelfTrainingHistory(30);
+    const runs = await listSelfTrainingHistory(req.tenantId, 30);
     return reply.send({ success: true, count: runs.length, runs });
   } catch (err) {
     logger.error({ err }, "selfTraining.history fail");
@@ -648,7 +648,7 @@ export async function getEvalTimelineRoute(
   const days = req.query?.days ? parseInt(req.query.days, 10) : 30;
   const threshold = req.query?.threshold ? parseInt(req.query.threshold, 10) : 10;
   try {
-    const data = await getEvalTimeline(days, threshold);
+    const data = await getEvalTimeline(req.tenantId, days, threshold);
     return reply.send({ success: true, ...data });
   } catch (err) {
     logger.error({ err }, "eval.timeline fail");
@@ -664,7 +664,7 @@ export async function postFeedbackPatterns(
   reply: FastifyReply
 ) {
   try {
-    const report = await runFeedbackPatternDetection({
+    const report = await runFeedbackPatternDetection(req.tenantId, {
       daysBack: req.body?.daysBack,
       minClusterSize: req.body?.minClusterSize,
     });
@@ -697,9 +697,9 @@ export async function getReasoningTraceRoute(
 // ============================================================
 // HALLUCINATION REPORT + WHITELIST
 // ============================================================
-export async function getHallucinationReportRoute(_req: FastifyRequest, reply: FastifyReply) {
+export async function getHallucinationReportRoute(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const report = await getHallucinationReport();
+    const report = await getHallucinationReport(req.tenantId);
     return reply.send({ success: true, report });
   } catch (err) {
     logger.error({ err }, "hallucination-report fail");
@@ -707,9 +707,9 @@ export async function getHallucinationReportRoute(_req: FastifyRequest, reply: F
   }
 }
 
-export async function getHallucinationWhitelist(_req: FastifyRequest, reply: FastifyReply) {
+export async function getHallucinationWhitelist(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const w = await getWhitelistFromCorpus();
+    const w = await getWhitelistFromCorpus(req.tenantId);
     return reply.send({ success: true, count: w.size, transactions: Array.from(w).sort() });
   } catch (err) {
     logger.error({ err }, "whitelist fail");
@@ -731,7 +731,7 @@ export async function getBorderlineQAsRoute(
 ) {
   try {
     const limit = req.query?.limit ? parseInt(req.query.limit, 10) : 30;
-    const report = await getBorderlineQAs({ limit });
+    const report = await getBorderlineQAs(req.tenantId, { limit });
     return reply.send({ success: true, ...report });
   } catch (err) {
     logger.error({ err }, "borderline QAs fail");

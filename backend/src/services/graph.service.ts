@@ -1,16 +1,11 @@
-// Knowledge graph: nodos + edges de todas las entidades de conocimiento
-// del sistema. Pensado para visualización con force-directed layout.
+// Knowledge graph (multi-tenant).
 //
-// Tipos de nodos:
-//   - incident, ticket, conversation, kb, meeting
+// MT-3: getKnowledgeGraph recibe tenantId. Nodos y edges se limitan a las
+// entidades del tenant.
 //
-// Tipos de edges:
-//   - conversation -[escalated]-> ticket
-//   - ticket       -[uses]->      kb
-//   - kb           -[from]->      ticket          (source_ticket_id)
-//   - incident     -[siblingOf]-> incident        (mismo cliente + módulo, opcional)
-//
-// El endpoint aplica un límite por tipo para no devolver miles de nodos.
+// Tipos de nodos: incident, ticket, conversation, kb, meeting.
+// Tipos de edges: conversation→ticket (escalated), ticket→kb (uses_kb),
+//                 kb→ticket (kb_from).
 import { query } from "../database/db";
 
 export type GraphNodeType = "incident" | "ticket" | "conversation" | "kb" | "meeting";
@@ -36,33 +31,36 @@ export interface GraphPayload {
   counts: Record<GraphNodeType, number>;
 }
 
-export async function getKnowledgeGraph(opts: { limitPerType?: number } = {}): Promise<GraphPayload> {
+export async function getKnowledgeGraph(
+  tenantId: string,
+  opts: { limitPerType?: number } = {},
+): Promise<GraphPayload> {
   const limit = Math.min(opts.limitPerType ?? 30, 100);
 
   const [incRows, tktRows, convRows, kbRows, meetRows] = await Promise.all([
     query<{ id: string; message: string; sap_module: string | null; client_name: string | null; created_at: string }>(
       `SELECT id, message, sap_module, client_name, created_at
-         FROM incidents ORDER BY created_at DESC LIMIT $1`,
-      [limit]
+         FROM incidents WHERE tenant_id = $2 ORDER BY created_at DESC LIMIT $1`,
+      [limit, tenantId]
     ),
     query<{ id: string; code: string; title: string; status: string; conversation_id: string | null; kb_article_id: string | null; system_affected: string | null }>(
       `SELECT id, code, title, status, conversation_id, kb_article_id, system_affected
-         FROM support_tickets ORDER BY created_at DESC LIMIT $1`,
-      [limit]
+         FROM support_tickets WHERE tenant_id = $2 ORDER BY created_at DESC LIMIT $1`,
+      [limit, tenantId]
     ),
     query<{ id: string; channel: string; intent: string | null; client: string | null; status: string; escalated_to_ticket: string | null }>(
       `SELECT id, channel, intent, client, status, escalated_to_ticket
-         FROM support_conversations ORDER BY created_at DESC LIMIT $1`,
-      [limit]
+         FROM support_conversations WHERE tenant_id = $2 ORDER BY created_at DESC LIMIT $1`,
+      [limit, tenantId]
     ),
     query<{ id: string; title: string; system: string | null; status: string; source_ticket_id: string | null; helpful_count: number; use_count: number }>(
       `SELECT id, title, system, status, source_ticket_id, helpful_count, use_count
-         FROM kb_articles ORDER BY created_at DESC LIMIT $1`,
-      [limit]
+         FROM kb_articles WHERE tenant_id = $2 ORDER BY created_at DESC LIMIT $1`,
+      [limit, tenantId]
     ),
     query<{ id: string; title: string; status: string }>(
-      `SELECT id, title, status FROM meetings ORDER BY created_at DESC LIMIT $1`,
-      [limit]
+      `SELECT id, title, status FROM meetings WHERE tenant_id = $2 ORDER BY created_at DESC LIMIT $1`,
+      [limit, tenantId]
     ),
   ]);
 
@@ -126,21 +124,18 @@ export async function getKnowledgeGraph(opts: { limitPerType?: number } = {}): P
 
   const edges: GraphEdge[] = [];
 
-  // conversation → ticket (escalation)
   for (const c of convRows.rows) {
     if (c.escalated_to_ticket && presentIds.has(c.escalated_to_ticket)) {
       edges.push({ from: c.id, to: c.escalated_to_ticket, kind: "escalated" });
     }
   }
 
-  // ticket → kb (uses)
   for (const t of tktRows.rows) {
     if (t.kb_article_id && presentIds.has(t.kb_article_id)) {
       edges.push({ from: t.id, to: t.kb_article_id, kind: "uses_kb" });
     }
   }
 
-  // kb → source ticket
   for (const k of kbRows.rows) {
     if (k.source_ticket_id && presentIds.has(k.source_ticket_id)) {
       edges.push({ from: k.id, to: k.source_ticket_id, kind: "kb_from" });

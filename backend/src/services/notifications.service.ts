@@ -1,6 +1,8 @@
-// Notificaciones consolidadas: unifica eventos relevantes de varias tablas
-// (support_tickets escalados/resueltos, kb_articles aprobados, meetings done,
-// incidents nuevos) en una sola lista ordenada por timestamp.
+// Notificaciones consolidadas (multi-tenant).
+//
+// MT-3: listNotifications recibe tenantId obligatorio. Unifica eventos
+// del tenant desde varias tablas: tickets escalados/resueltos, kb_articles,
+// meetings done, incidents nuevos.
 //
 // El "read" lo maneja el cliente vía localStorage (lastReadTs). El backend
 // solo devuelve los eventos; cliente filtra cuáles son "no leídos".
@@ -14,13 +16,13 @@ export type NotificationKind =
   | "incident_created";
 
 export interface Notification {
-  id: string;                  // único: kind:resource_id
+  id: string;
   kind: NotificationKind;
-  title: string;               // texto principal mostrado
+  title: string;
   subtitle?: string;
-  href: string;                // ruta a la que lleva el click
-  badge?: string;              // ej. "MM", "alta"
-  createdAt: string;           // ISO
+  href: string;
+  badge?: string;
+  createdAt: string;
 }
 
 export interface ListNotificationsParams {
@@ -29,48 +31,55 @@ export interface ListNotificationsParams {
   since?: string;
 }
 
-export async function listNotifications(params: ListNotificationsParams = {}): Promise<Notification[]> {
+export async function listNotifications(
+  tenantId: string,
+  params: ListNotificationsParams = {},
+): Promise<Notification[]> {
   const limit = Math.min(params.limit ?? 30, 100);
   const since = params.since ? new Date(params.since) : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const sinceIso = since.toISOString();
 
-  // 5 queries en paralelo
+  // 5 queries en paralelo, todas scoped al tenant
   const [
     tktEscalated, tktResolved, kbApproved, meetingsDone, incidents,
   ] = await Promise.all([
     query<{ id: string; code: string; title: string; system_affected: string | null; priority: string; created_at: string }>(
       `SELECT id, code, title, system_affected, priority, created_at::text
          FROM support_tickets
-        WHERE created_at > $1
+        WHERE tenant_id = $3 AND created_at > $1
         ORDER BY created_at DESC LIMIT $2`,
-      [since.toISOString(), limit]
+      [sinceIso, limit, tenantId]
     ),
     query<{ id: string; code: string; title: string; system_affected: string | null; resolved_at: string }>(
       `SELECT id, code, title, system_affected, resolved_at::text
          FROM support_tickets
-        WHERE resolved_at IS NOT NULL AND resolved_at > $1
+        WHERE tenant_id = $3
+          AND resolved_at IS NOT NULL AND resolved_at > $1
         ORDER BY resolved_at DESC LIMIT $2`,
-      [since.toISOString(), limit]
+      [sinceIso, limit, tenantId]
     ),
     query<{ id: string; title: string; system: string | null; approved_at: string }>(
       `SELECT id, title, system, approved_at::text
          FROM kb_articles
-        WHERE status = 'approved' AND approved_at IS NOT NULL AND approved_at > $1
+        WHERE tenant_id = $3
+          AND status = 'approved' AND approved_at IS NOT NULL AND approved_at > $1
         ORDER BY approved_at DESC LIMIT $2`,
-      [since.toISOString(), limit]
+      [sinceIso, limit, tenantId]
     ),
     query<{ id: string; title: string; processed_at: string }>(
       `SELECT id, title, processed_at::text
          FROM meetings
-        WHERE status = 'done' AND processed_at IS NOT NULL AND processed_at > $1
+        WHERE tenant_id = $3
+          AND status = 'done' AND processed_at IS NOT NULL AND processed_at > $1
         ORDER BY processed_at DESC LIMIT $2`,
-      [since.toISOString(), limit]
+      [sinceIso, limit, tenantId]
     ),
     query<{ id: string; message: string; sap_module: string | null; created_at: string }>(
       `SELECT id, message, sap_module, created_at::text
          FROM incidents
-        WHERE created_at > $1
+        WHERE tenant_id = $3 AND created_at > $1
         ORDER BY created_at DESC LIMIT $2`,
-      [since.toISOString(), Math.min(limit, 15)]   // limitamos incidents porque son los más frecuentes
+      [sinceIso, Math.min(limit, 15), tenantId]
     ),
   ]);
 
@@ -131,7 +140,6 @@ export async function listNotifications(params: ListNotificationsParams = {}): P
     });
   }
 
-  // Ordenar por timestamp desc y limitar
   out.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   return out.slice(0, limit);
 }

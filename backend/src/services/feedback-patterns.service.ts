@@ -81,16 +81,15 @@ export interface FeedbackPatternReport {
 
 const MIN_CLUSTER_SIZE = 3;
 
-export async function runFeedbackPatternDetection(opts: {
-  daysBack?: number;
-  minClusterSize?: number;
-} = {}): Promise<FeedbackPatternReport> {
+export async function runFeedbackPatternDetection(
+  tenantId: string,
+  opts: {
+    daysBack?: number;
+    minClusterSize?: number;
+  } = {}
+): Promise<FeedbackPatternReport> {
   const daysBack = Math.max(1, Math.min(60, opts.daysBack ?? 14));
   const minClusterSize = Math.max(2, opts.minClusterSize ?? MIN_CLUSTER_SIZE);
-
-  // MT-2: este job no tiene contexto HTTP, usamos "default" tenant. TODO MT-6:
-  // cuando el cron sea per-tenant, recibir tenantId como parámetro.
-  const tenantId = "default";
 
   // ensure schema kb_training_gaps
   await training.getSnapshot(tenantId).catch(() => null);
@@ -103,9 +102,10 @@ export async function runFeedbackPatternDetection(opts: {
         WHERE kind = 'negative'
           AND COALESCE(reason, '') <> ''
           AND created_at > now() - ($1 || ' days')::interval
+          AND tenant_id = $2
         ORDER BY created_at DESC
         LIMIT 200`,
-      [String(daysBack)]
+      [String(daysBack), tenantId]
     );
     negatives = rows;
   } catch (err) {
@@ -166,11 +166,12 @@ export async function runFeedbackPatternDetection(opts: {
 
   report.clustersFound = significantClusters.length;
 
-  // Existing gap signatures para deduplicar
+  // Existing gap signatures para deduplicar (scoped al tenant)
   const existingSigs = new Set<string>();
   try {
     const { rows } = await query<{ title: string }>(
-      `SELECT title FROM kb_training_gaps WHERE status IN ('OPEN','IN_PROGRESS')`
+      `SELECT title FROM kb_training_gaps WHERE status IN ('OPEN','IN_PROGRESS') AND tenant_id = $1`,
+      [tenantId]
     );
     for (const r of rows) {
       const m = r.title.match(/^\[sig:fb-cluster:([^\]]+)\]/);

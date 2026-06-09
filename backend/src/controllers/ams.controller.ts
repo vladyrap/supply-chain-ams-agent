@@ -172,7 +172,7 @@ export async function postChat(req: FastifyRequest, reply: FastifyReply) {
 
     await recordAudit("INCIDENT_SAVED", { incidentId: incident.id });
 
-    emitEventFireAndForget("incident.created", {
+    emitEventFireAndForget(req.tenantId, "incident.created", {
       incident_id: incident.id,
       user: normalized.user,
       client: normalized.client,
@@ -303,7 +303,7 @@ export async function postResearch(req: FastifyRequest, reply: FastifyReply) {
     });
     await recordAudit("INCIDENT_SAVED", { incidentId: incident.id });
 
-    emitEventFireAndForget("incident.created", {
+    emitEventFireAndForget(req.tenantId, "incident.created", {
       incident_id: incident.id,
       user: normalized.user,
       client: normalized.client,
@@ -552,7 +552,7 @@ export async function postChatStream(req: FastifyRequest, reply: FastifyReply) {
     });
     await recordAudit("INCIDENT_SAVED", { incidentId: incident.id });
 
-    emitEventFireAndForget("incident.created", {
+    emitEventFireAndForget(req.tenantId, "incident.created", {
       incident_id: incident.id,
       user: normalized.user,
       client: normalized.client,
@@ -626,9 +626,9 @@ export async function getIncident(
   }
 }
 
-export async function getAmsStats(_req: FastifyRequest, reply: FastifyReply) {
+export async function getAmsStats(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const stats = await getStats();
+    const stats = await getStats(req.tenantId);
     return reply.send({ success: true, stats });
   } catch (err) {
     logger.error({ err }, "Fallo calculando stats");

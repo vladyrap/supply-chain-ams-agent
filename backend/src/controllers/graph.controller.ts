@@ -8,7 +8,7 @@ export async function getGraphRoute(
 ) {
   try {
     const limit = req.query.limit ? parseInt(req.query.limit, 10) : 30;
-    const g = await getKnowledgeGraph({ limitPerType: Number.isFinite(limit) ? limit : 30 });
+    const g = await getKnowledgeGraph(req.tenantId, { limitPerType: Number.isFinite(limit) ? limit : 30 });
     return reply.send({ success: true, graph: g });
   } catch (err) {
     logger.error({ err }, "graph fail");

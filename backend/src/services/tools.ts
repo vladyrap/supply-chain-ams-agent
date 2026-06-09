@@ -228,7 +228,7 @@ const TOOLS: Record<string, ToolDefinition> = {
     async execute(args, ctx) {
       const q = String(args.query || "").trim();
       const sys = (args.system as string | undefined) ?? ctx.module;
-      const chunks = await retrieveRelevantChunks(q, { module: sys, client: ctx.client });
+      const chunks = await retrieveRelevantChunks(ctx.tenantId, q, { module: sys, client: ctx.client });
       return {
         count: chunks.length,
         chunks: chunks.map((c) => ({

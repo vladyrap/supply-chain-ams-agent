@@ -1,18 +1,17 @@
-// Tickets cerrados → Q&A propuestas.
+// Tickets cerrados → Q&A propuestas (multi-tenant).
+//
+// MT-3: proposeQAsFromTickets recibe tenantId obligatorio. Lee solo
+// tickets resueltos del tenant y crea items/Q&A bajo el mismo tenant_id.
 //
 // Pipeline:
-//   1) Lee tickets resueltos / cerrados recientes que NO tengan Q&A
-//      asociadas (vía source_ticket_id de algún kb_training_item con
-//      Q&A, o por heurística simple: no hay Q&A cuyo conocimiento haga
-//      referencia al ticket).
+//   1) Lee tickets resueltos/cerrados recientes (scoped) que NO tengan
+//      Q&A asociadas.
 //   2) Para cada uno, le pasa a Gemini el ticket + su conversación y
 //      le pide Q&A en JSON.
-//   3) Si el ticket NO tiene un kb_training_item creado todavía, también
-//      crea el item base como DRAFT con la info del ticket.
+//   3) Si el ticket NO tiene un kb_training_item creado, también crea
+//      el item base como DRAFT con la info del ticket.
 //   4) Inserta las Q&A en kb_training_qa con approved=false para que
 //      el humano las revise y apruebe.
-//
-// Diseñado para ser corrido manualmente desde UI o por cron futuro.
 
 import { GoogleGenAI } from "@google/genai";
 import { query } from "../database/db";
@@ -128,38 +127,38 @@ Reglas:
   }
 }
 
-export async function proposeQAsFromTickets(opts: {
-  limit?: number;
-  daysBack?: number;
-} = {}): Promise<TicketToQaReport> {
+export async function proposeQAsFromTickets(
+  tenantId: string,
+  opts: { limit?: number; daysBack?: number } = {},
+): Promise<TicketToQaReport> {
   const limit = Math.max(1, Math.min(MAX_LIMIT, opts.limit ?? DEFAULT_LIMIT));
   const daysBack = Math.max(1, Math.min(180, opts.daysBack ?? 30));
-
-  // MT-2: cron sin contexto HTTP, usamos "default". TODO MT-6: parametrizar tenantId.
-  const tenantId = "default";
 
   // Ensure schema (kb_training_*)
   await training.getSnapshot(tenantId).catch(() => null);
 
-  // 1. Tickets resueltos sin Q&A asociadas (heurística: ticket sin kb item, o item sin Q&A)
+  // 1. Tickets resueltos sin Q&A asociadas, scoped al tenant.
+  // Heurística: ticket sin kb item del mismo tenant referenciándolo.
   let tickets: TicketRow[] = [];
   try {
     const { rows } = await query<TicketRow>(
       `SELECT t.id, t.code, t.title, t.summary, t.sap_module, t.conversation_id, t.client, t.resolved_at
          FROM support_tickets t
-        WHERE t.status IN ('resolved','closed')
+        WHERE t.tenant_id = $3
+          AND t.status IN ('resolved','closed')
           AND t.resolved_at > now() - ($1 || ' days')::interval
           AND NOT EXISTS (
             SELECT 1 FROM kb_training_items i
-            WHERE i.source = 'from_ticket' OR i.source LIKE 'ticket #' || t.code || '%'
+            WHERE i.tenant_id = t.tenant_id
+              AND (i.source = 'from_ticket' OR i.source LIKE 'ticket #' || t.code || '%')
           )
         ORDER BY t.resolved_at DESC
         LIMIT $2`,
-      [String(daysBack), limit]
+      [String(daysBack), limit, tenantId]
     );
     tickets = rows;
   } catch (err) {
-    logger.warn({ err }, "ticket-to-qa fetch tickets fail");
+    logger.warn({ err, tenantId }, "ticket-to-qa fetch tickets fail");
   }
 
   const report: TicketToQaReport = {
@@ -216,7 +215,7 @@ export async function proposeQAsFromTickets(opts: {
       });
       report.itemsCreated++;
 
-      // Crear Q&A pending (approved=false)
+      // Crear Q&A pending (approved=false), scoped al tenant
       await training.createQA(tenantId, proposal.qas.slice(0, 6).map((q) => ({
         knowledgeItemId: newItem.id,
         question: q.question?.slice(0, 500) ?? "",
@@ -239,6 +238,6 @@ export async function proposeQAsFromTickets(opts: {
     }
   }
 
-  logger.info({ ...report, byTicket: undefined }, "ticket-to-qa run");
+  logger.info({ ...report, byTicket: undefined, tenantId }, "ticket-to-qa run");
   return report;
 }

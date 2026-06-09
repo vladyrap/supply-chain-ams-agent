@@ -277,7 +277,7 @@ export async function postResolveTicket(
       });
     }
 
-    emitEventFireAndForget("ticket.resolved", {
+    emitEventFireAndForget(req.tenantId, "ticket.resolved", {
       code: t.code,
       title: t.title,
       system_affected: t.system_affected,
@@ -286,7 +286,7 @@ export async function postResolveTicket(
       kb_article_created: !!kbArticle,
     });
     if (kbArticle) {
-      emitEventFireAndForget("kb.created", {
+      emitEventFireAndForget(req.tenantId, "kb.created", {
         title: kbArticle.title,
         system: kbArticle.system,
         source: kbArticle.source,
@@ -339,7 +339,7 @@ export async function postCloseTicket(
       action: "TICKET_CLOSED",
       actor: me ?? "system",
     });
-    emitEventFireAndForget("ticket.closed", {
+    emitEventFireAndForget(req.tenantId, "ticket.closed", {
       code: t.code,
       title: t.title,
       system_affected: t.system_affected,
@@ -429,7 +429,7 @@ export async function postApproveKb(
       actor: me,
       details: { articleId: a.id },
     });
-    emitEventFireAndForget("kb.approved", {
+    emitEventFireAndForget(req.tenantId, "kb.approved", {
       title: a.title,
       system: a.system,
       category: a.category,

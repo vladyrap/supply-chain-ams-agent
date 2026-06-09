@@ -1,17 +1,21 @@
-// Hallucination detection.
+// Hallucination detection (multi-tenant).
+//
+// MT-3: la whitelist y el reporte son por tenant. Cada tenant tiene su
+// propio corpus de transacciones SAP "permitidas" y su propio log de
+// alucinaciones para análisis.
 //
 // Construye una whitelist de transacciones SAP que aparecen en el
-// corpus de entrenamiento (kb_training_items + kb_training_qa).
+// corpus del tenant (kb_training_items + kb_training_qa).
 // Cuando el agente responde, extrae las transacciones SAP mencionadas
-// y compara con la whitelist. Si menciona transacciones nuevas que
-// no están en el corpus, las flag como potencial alucinación.
+// y compara con la whitelist del tenant. Si menciona transacciones
+// nuevas que no están en el corpus de ese tenant, las flag.
 //
 // Patrones detectados:
 //   - Transacciones SAP: 2-6 chars alphanumeric mayúsculas (ME21N, VA01, /SCWM/PRDO, etc.)
 //   - Tablas SAP: 3-10 chars mayúsculas (KNA1, EKPO, etc.)
 //   - Códigos custom Z* o Y* → siempre suspicious
 //
-// Tabla agent_hallucinations para tracking + reporte.
+// Tabla agent_hallucinations para tracking + reporte (scoped).
 
 import { query } from "../database/db";
 import { logger } from "../utils/logger";
@@ -23,6 +27,7 @@ async function ensureSchema(): Promise<void> {
     await query(`
       CREATE TABLE IF NOT EXISTS agent_hallucinations (
         id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id       TEXT NOT NULL DEFAULT 'default',
         response_id     TEXT,
         user_query      TEXT,
         suspicious      TEXT[] NOT NULL DEFAULT '{}'::text[],
@@ -32,7 +37,10 @@ async function ensureSchema(): Promise<void> {
         created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
+    // Migración idempotente: tenant_id si la tabla ya existía.
+    await query(`ALTER TABLE agent_hallucinations ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';`);
     await query(`CREATE INDEX IF NOT EXISTS idx_halluc_created ON agent_hallucinations(created_at DESC)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_halluc_tenant  ON agent_hallucinations(tenant_id, created_at DESC)`);
     schemaEnsured = true;
   } catch (err) {
     logger.warn({ err }, "ensure agent_hallucinations schema failed");
@@ -40,8 +48,6 @@ async function ensureSchema(): Promise<void> {
 }
 
 // Regex para extraer transacciones SAP típicas
-//  - X[A-Z0-9]{1,5}  (VA01, ME21N, MIGO, etc.)
-//  - /[A-Z]+/[A-Z0-9_]+ (/SCWM/PRDO)
 const TX_REGEX = /\b\/?[A-Z][A-Z0-9_]{1,15}(?:\/[A-Z0-9_]+)?\b/g;
 
 // Whitelist de comunes que no son transacciones (pero hacen match)
@@ -55,8 +61,8 @@ const COMMON_NOT_TX = new Set([
   "NO", "SI", "YES", "OK", "KO",
 ]);
 
-let cachedWhitelist: Set<string> | null = null;
-let cachedAt = 0;
+// MT-3: cache POR TENANT.
+const cachedWhitelistByTenant = new Map<string, { set: Set<string>; at: number }>();
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
 function extractTransactions(text: string): string[] {
@@ -65,50 +71,53 @@ function extractTransactions(text: string): string[] {
   if (!matches) return [];
   for (const m of matches) {
     const tx = m.toUpperCase();
-    // Filtrar muy cortos o palabras comunes
     if (tx.length < 3) continue;
     if (COMMON_NOT_TX.has(tx.replace(/^\//, ""))) continue;
-    // Solo aceptar si tiene al menos 1 dígito O empieza con /
     if (!/\d/.test(tx) && !tx.startsWith("/")) continue;
     seen.add(tx);
   }
   return Array.from(seen);
 }
 
-export async function getWhitelistFromCorpus(): Promise<Set<string>> {
-  if (cachedWhitelist && Date.now() - cachedAt < CACHE_TTL_MS) return cachedWhitelist;
+export async function getWhitelistFromCorpus(tenantId: string): Promise<Set<string>> {
+  const cached = cachedWhitelistByTenant.get(tenantId);
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.set;
   const w = new Set<string>();
   try {
     const { rows } = await query<{ text: string }>(
       `SELECT (title || ' ' || summary || ' ' || content || ' ' || array_to_string(tags, ' ')) AS text
          FROM kb_training_items
-        WHERE status IN ('PUBLISHED','VALIDATED','PENDING_REVIEW','DRAFT')`
+        WHERE tenant_id = $1
+          AND status IN ('PUBLISHED','VALIDATED','PENDING_REVIEW','DRAFT')`,
+      [tenantId]
     );
     for (const r of rows) {
       for (const tx of extractTransactions(r.text)) w.add(tx);
     }
   } catch (err) {
-    logger.debug({ err }, "whitelist items fail");
+    logger.debug({ err, tenantId }, "whitelist items fail");
   }
   try {
     const { rows } = await query<{ text: string }>(
-      `SELECT (question || ' ' || expected_answer) AS text FROM kb_training_qa WHERE approved = true`
+      `SELECT (question || ' ' || expected_answer) AS text
+         FROM kb_training_qa
+        WHERE tenant_id = $1 AND approved = true`,
+      [tenantId]
     );
     for (const r of rows) {
       for (const tx of extractTransactions(r.text)) w.add(tx);
     }
   } catch (err) {
-    logger.debug({ err }, "whitelist qa fail");
+    logger.debug({ err, tenantId }, "whitelist qa fail");
   }
-  cachedWhitelist = w;
-  cachedAt = Date.now();
-  logger.info({ size: w.size }, "hallucination whitelist refreshed");
+  cachedWhitelistByTenant.set(tenantId, { set: w, at: Date.now() });
+  logger.info({ size: w.size, tenantId }, "hallucination whitelist refreshed");
   return w;
 }
 
-export function invalidateWhitelist(): void {
-  cachedWhitelist = null;
-  cachedAt = 0;
+export function invalidateWhitelist(tenantId?: string): void {
+  if (tenantId) cachedWhitelistByTenant.delete(tenantId);
+  else cachedWhitelistByTenant.clear();
 }
 
 export interface HallucinationCheck {
@@ -122,13 +131,13 @@ export interface HallucinationCheck {
 
 /**
  * Analiza la respuesta del agente. Devuelve métricas + persiste si hay riesgo.
+ * Scoped al tenant.
  */
-export async function checkHallucinations(input: {
-  responseId?: string;
-  userQuery?: string;
-  responseText: string;
-}): Promise<HallucinationCheck> {
-  const whitelist = await getWhitelistFromCorpus();
+export async function checkHallucinations(
+  tenantId: string,
+  input: { responseId?: string; userQuery?: string; responseText: string },
+): Promise<HallucinationCheck> {
+  const whitelist = await getWhitelistFromCorpus(tenantId);
   const tx = extractTransactions(input.responseText);
   const inWhitelist: string[] = [];
   const suspicious: string[] = [];
@@ -142,21 +151,20 @@ export async function checkHallucinations(input: {
       suspicious.push(t);
     }
   }
-  // Risk score: % suspicious sobre el total, + bonus si hay custom Z/Y
   const total = tx.length;
   const baseRisk = total > 0 ? Math.round((suspicious.length / total) * 100) : 0;
   const bonus = Math.min(20, customZY.length * 10);
   const riskScore = Math.min(100, baseRisk + bonus);
 
-  // Persistir si hay riesgo real
   if (suspicious.length > 0 || customZY.length > 0) {
     await ensureSchema();
     try {
       await query(
         `INSERT INTO agent_hallucinations
-           (response_id, user_query, suspicious, custom_z_y, total_tx_found, risk_score)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+           (tenant_id, response_id, user_query, suspicious, custom_z_y, total_tx_found, risk_score)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [
+          tenantId,
           input.responseId ?? null,
           input.userQuery?.slice(0, 2000) ?? null,
           suspicious,
@@ -166,7 +174,7 @@ export async function checkHallucinations(input: {
         ]
       );
     } catch (err) {
-      logger.debug({ err }, "hallucination persist fail");
+      logger.debug({ err, tenantId }, "hallucination persist fail");
     }
   }
 
@@ -181,7 +189,7 @@ export async function checkHallucinations(input: {
 }
 
 // =====================================================
-// Reporte agregado
+// Reporte agregado (scoped al tenant)
 // =====================================================
 export interface HallucinationReport {
   totalLogged: number;
@@ -195,7 +203,7 @@ export interface HallucinationReport {
   }[];
 }
 
-export async function getHallucinationReport(): Promise<HallucinationReport> {
+export async function getHallucinationReport(tenantId: string): Promise<HallucinationReport> {
   await ensureSchema();
   const report: HallucinationReport = {
     totalLogged: 0, last7d: 0, avgRisk7d: 0,
@@ -207,7 +215,9 @@ export async function getHallucinationReport(): Promise<HallucinationReport> {
          count(*)::text AS total,
          count(*) FILTER (WHERE created_at > now() - interval '7 days')::text AS last7d,
          COALESCE(round(avg(risk_score) FILTER (WHERE created_at > now() - interval '7 days'))::text, '0') AS avg
-       FROM agent_hallucinations`
+       FROM agent_hallucinations
+      WHERE tenant_id = $1`,
+      [tenantId]
     );
     report.totalLogged = Number(rows[0]?.total ?? 0);
     report.last7d = Number(rows[0]?.last7d ?? 0);
@@ -215,14 +225,15 @@ export async function getHallucinationReport(): Promise<HallucinationReport> {
   } catch { /* */ }
 
   try {
-    // Top suspicious por frecuencia
     const { rows } = await query<{ tx: string; c: string }>(
       `SELECT unnest(suspicious) AS tx, count(*)::text AS c
          FROM agent_hallucinations
-        WHERE created_at > now() - interval '30 days'
+        WHERE tenant_id = $1
+          AND created_at > now() - interval '30 days'
         GROUP BY tx
         ORDER BY c::int DESC
-        LIMIT 10`
+        LIMIT 10`,
+      [tenantId]
     );
     report.topSuspicious = rows.map((r) => ({ tx: r.tx, count: Number(r.c) }));
   } catch { /* */ }
@@ -231,8 +242,10 @@ export async function getHallucinationReport(): Promise<HallucinationReport> {
     const { rows } = await query<{ id: string; created_at: string; suspicious: string[]; custom_z_y: string[]; risk_score: number; user_query: string | null }>(
       `SELECT id, created_at, suspicious, custom_z_y, risk_score, user_query
          FROM agent_hallucinations
+        WHERE tenant_id = $1
         ORDER BY created_at DESC
-        LIMIT 10`
+        LIMIT 10`,
+      [tenantId]
     );
     report.recentSamples = rows;
   } catch { /* */ }

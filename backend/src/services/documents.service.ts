@@ -1,5 +1,6 @@
 // Document Factory backend service.
 // Persistencia real en Postgres. Reemplaza localStorage.
+// Multi-tenant: todas las funciones reciben tenantId y filtran por él (Sprint 3 ALTOS).
 
 import { query } from "../database/db";
 import { logger } from "../utils/logger";
@@ -79,39 +80,43 @@ function mapDoc(r: DocRow): GeneratedDocument {
   };
 }
 
-export async function getSnapshot(): Promise<{ documents: GeneratedDocument[] }> {
+export async function getSnapshot(tenantId: string): Promise<{ documents: GeneratedDocument[] }> {
   await ensureSchema();
-  const r = await query<DocRow>("SELECT * FROM generated_documents ORDER BY updated_at DESC LIMIT 500");
+  const r = await query<DocRow>(
+    "SELECT * FROM generated_documents WHERE tenant_id = $1 ORDER BY updated_at DESC LIMIT 500",
+    [tenantId]
+  );
   return { documents: r.rows.map(mapDoc) };
 }
 
-export async function upsertDocument(d: GeneratedDocument): Promise<GeneratedDocument> {
+export async function upsertDocument(tenantId: string, d: GeneratedDocument): Promise<GeneratedDocument> {
   await ensureSchema();
   const now = new Date().toISOString();
   const res = await query<DocRow>(
-    `INSERT INTO generated_documents (id,title,document_type,source_type,source_id,content,status,
+    `INSERT INTO generated_documents (tenant_id,id,title,document_type,source_type,source_id,content,status,
        created_by,tags,form_data,created_at,updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13)
      ON CONFLICT (id) DO UPDATE SET
        title=EXCLUDED.title, document_type=EXCLUDED.document_type,
        source_type=EXCLUDED.source_type, source_id=EXCLUDED.source_id,
        content=EXCLUDED.content, status=EXCLUDED.status,
        tags=EXCLUDED.tags, form_data=EXCLUDED.form_data,
        updated_at=EXCLUDED.updated_at
+     WHERE generated_documents.tenant_id = $1
      RETURNING *`,
-    [d.id, d.title, d.documentType, d.sourceType, d.sourceId || null, d.content, d.status,
+    [tenantId, d.id, d.title, d.documentType, d.sourceType, d.sourceId || null, d.content, d.status,
      d.createdBy, d.tags || [], JSON.stringify(d.formData || {}),
      d.createdAt || now, now]
   );
   return mapDoc(res.rows[0]);
 }
 
-export async function deleteDocument(id: string): Promise<void> {
+export async function deleteDocument(tenantId: string, id: string): Promise<void> {
   await ensureSchema();
-  await query("DELETE FROM generated_documents WHERE id = $1", [id]);
+  await query("DELETE FROM generated_documents WHERE id = $1 AND tenant_id = $2", [id, tenantId]);
 }
 
-export async function resetDemo(): Promise<void> {
+export async function resetDemo(tenantId: string): Promise<void> {
   await ensureSchema();
-  await query("DELETE FROM generated_documents");
+  await query("DELETE FROM generated_documents WHERE tenant_id = $1", [tenantId]);
 }

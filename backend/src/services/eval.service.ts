@@ -120,6 +120,7 @@ function isQuotaError(err: unknown): boolean {
 // ============================================================
 
 export async function createEvalRun(
+  tenantId: string,
   name: string,
   configs: EvalConfig[],
   questions: EvalQuestion[]
@@ -131,9 +132,9 @@ export async function createEvalRun(
   const runIds: string[] = [];
   for (const cfg of configs) {
     const run = await queryRow<{ id: string }>(
-      `INSERT INTO eval_runs (name, config_label, config, status, total, completed)
-       VALUES ($1, $2, $3::jsonb, 'pending', $4, 0) RETURNING id`,
-      [name, cfg.label, JSON.stringify(cfg), questions.length]
+      `INSERT INTO eval_runs (tenant_id, name, config_label, config, status, total, completed)
+       VALUES ($1, $2, $3, $4::jsonb, 'pending', $5, 0) RETURNING id`,
+      [tenantId, name, cfg.label, JSON.stringify(cfg), questions.length]
     );
     if (!run) throw new Error("no se pudo crear run");
     runIds.push(run.id);
@@ -141,9 +142,9 @@ export async function createEvalRun(
     // Bulk insert de eval_results pendientes
     for (const q of questions) {
       await query(
-        `INSERT INTO eval_results (run_id, config_label, question, expected_module, status)
-         VALUES ($1, $2, $3, $4, 'pending')`,
-        [run.id, cfg.label, q.text, q.expected_module ?? null]
+        `INSERT INTO eval_results (tenant_id, run_id, config_label, question, expected_module, status)
+         VALUES ($1, $2, $3, $4, $5, 'pending')`,
+        [tenantId, run.id, cfg.label, q.text, q.expected_module ?? null]
       );
     }
   }
@@ -151,63 +152,65 @@ export async function createEvalRun(
   return { runIds };
 }
 
-export async function listEvalRuns(): Promise<EvalRunRow[]> {
+export async function listEvalRuns(tenantId: string): Promise<EvalRunRow[]> {
   const { rows } = await query<EvalRunRow>(
     `SELECT id, name, config_label, config, status, total, completed,
             summary, created_at, updated_at
        FROM eval_runs
+      WHERE tenant_id = $1
       ORDER BY created_at DESC
-      LIMIT 200`
+      LIMIT 200`,
+    [tenantId]
   );
   return rows;
 }
 
-export async function getEvalRun(runId: string): Promise<{
+export async function getEvalRun(tenantId: string, runId: string): Promise<{
   run: EvalRunRow | null;
   results: EvalResultRow[];
 }> {
   const run = await queryRow<EvalRunRow>(
     `SELECT id, name, config_label, config, status, total, completed,
             summary, created_at, updated_at
-       FROM eval_runs WHERE id = $1`,
-    [runId]
+       FROM eval_runs WHERE id = $1 AND tenant_id = $2`,
+    [runId, tenantId]
   );
   if (!run) return { run: null, results: [] };
   const { rows: results } = await query<EvalResultRow>(
     `SELECT id, run_id, config_label, question, expected_module, response,
             confidence, latency_ms, has_12_blocks, status, error, created_at
-       FROM eval_results WHERE run_id = $1 ORDER BY created_at ASC`,
-    [runId]
+       FROM eval_results WHERE run_id = $1 AND tenant_id = $2 ORDER BY created_at ASC`,
+    [runId, tenantId]
   );
   return { run, results };
 }
 
-export function executeEvalRunFireAndForget(runId: string): void {
+export function executeEvalRunFireAndForget(tenantId: string, runId: string): void {
   // No await: corre en background.
-  executeEvalRun(runId).catch((err) => {
-    logger.error({ err, runId }, "eval: run execution fail");
+  executeEvalRun(tenantId, runId).catch((err) => {
+    logger.error({ err, runId, tenantId }, "eval: run execution fail");
   });
 }
 
-export async function executeEvalRun(runId: string): Promise<void> {
+export async function executeEvalRun(tenantId: string, runId: string): Promise<void> {
   const run = await queryRow<EvalRunRow>(
-    `SELECT id, name, config_label, config, status, total, completed FROM eval_runs WHERE id = $1`,
-    [runId]
+    `SELECT id, name, config_label, config, status, total, completed FROM eval_runs WHERE id = $1 AND tenant_id = $2`,
+    [runId, tenantId]
   );
   if (!run) throw new Error("run no encontrado");
   if (run.status === "running" || run.status === "done") {
     logger.warn({ runId, status: run.status }, "eval: run ya estaba ejecutándose / terminado");
     return;
   }
-  await query(`UPDATE eval_runs SET status='running', updated_at=now() WHERE id=$1`, [runId]);
+  await query(`UPDATE eval_runs SET status='running', updated_at=now() WHERE id=$1 AND tenant_id=$2`, [runId, tenantId]);
 
   const cfg = run.config as EvalConfig;
   const systemPrompt = await loadPrompt();
   const client = getAi();
 
   const { rows: pending } = await query<EvalResultRow>(
-    `SELECT id, question FROM eval_results WHERE run_id = $1 AND status = 'pending' ORDER BY created_at ASC`,
-    [runId]
+    `SELECT id, question FROM eval_results WHERE run_id = $1 AND tenant_id = $2 AND status = 'pending' ORDER BY created_at ASC`,
+    [runId, tenantId]
   );
 
   logger.info({ runId, label: cfg.label, count: pending.length }, "eval: run starting");
@@ -242,43 +245,43 @@ export async function executeEvalRun(runId: string): Promise<void> {
         `UPDATE eval_results
             SET response=$1, confidence=$2, latency_ms=$3, has_12_blocks=$4,
                 status='ok', error=NULL
-          WHERE id=$5`,
-        [text, confidence, latencyMs, blocks12, row.id]
+          WHERE id=$5 AND tenant_id=$6`,
+        [text, confidence, latencyMs, blocks12, row.id, tenantId]
       );
     } catch (err) {
       const latencyMs = Date.now() - t0;
       if (isQuotaError(err)) {
         await query(
-          `UPDATE eval_results SET status='quota_error', latency_ms=$1, error=$2 WHERE id=$3`,
-          [latencyMs, "Gemini quota 429", row.id]
+          `UPDATE eval_results SET status='quota_error', latency_ms=$1, error=$2 WHERE id=$3 AND tenant_id=$4`,
+          [latencyMs, "Gemini quota 429", row.id, tenantId]
         );
-        logger.warn({ runId, label: cfg.label }, "eval: quota error, espero 25s y sigo");
+        logger.warn({ runId, tenantId, label: cfg.label }, "eval: quota error, espero 25s y sigo");
         await new Promise((r) => setTimeout(r, 25_000));
       } else {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const msg = String((err as any)?.message ?? err).slice(0, 500);
         await query(
-          `UPDATE eval_results SET status='error', latency_ms=$1, error=$2 WHERE id=$3`,
-          [latencyMs, msg, row.id]
+          `UPDATE eval_results SET status='error', latency_ms=$1, error=$2 WHERE id=$3 AND tenant_id=$4`,
+          [latencyMs, msg, row.id, tenantId]
         );
       }
     }
     // Update progress
-    await query(`UPDATE eval_runs SET completed = completed + 1, updated_at = now() WHERE id = $1`, [runId]);
+    await query(`UPDATE eval_runs SET completed = completed + 1, updated_at = now() WHERE id = $1 AND tenant_id = $2`, [runId, tenantId]);
   }
 
-  const summary = await computeSummary(runId);
+  const summary = await computeSummary(tenantId, runId);
   await query(
-    `UPDATE eval_runs SET status='done', summary=$1::jsonb, updated_at=now() WHERE id=$2`,
-    [JSON.stringify(summary), runId]
+    `UPDATE eval_runs SET status='done', summary=$1::jsonb, updated_at=now() WHERE id=$2 AND tenant_id=$3`,
+    [JSON.stringify(summary), runId, tenantId]
   );
-  logger.info({ runId, summary }, "eval: run done");
+  logger.info({ runId, tenantId, summary }, "eval: run done");
 }
 
-async function computeSummary(runId: string): Promise<EvalSummary> {
+async function computeSummary(tenantId: string, runId: string): Promise<EvalSummary> {
   const { rows } = await query<EvalResultRow>(
-    `SELECT status, latency_ms, has_12_blocks, confidence FROM eval_results WHERE run_id=$1`,
-    [runId]
+    `SELECT status, latency_ms, has_12_blocks, confidence FROM eval_results WHERE run_id=$1 AND tenant_id=$2`,
+    [runId, tenantId]
   );
   const total = rows.length;
   const ok = rows.filter((r) => r.status === "ok").length;

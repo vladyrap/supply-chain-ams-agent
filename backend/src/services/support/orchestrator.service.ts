@@ -288,7 +288,7 @@ async function escalateConversation(
   });
 
   // Emit hacia integraciones (Slack/Email/Webhook) — fire-and-forget
-  emitEventFireAndForget("ticket.escalated", {
+  emitEventFireAndForget(tenantId, "ticket.escalated", {
     code: ticket.code,
     title: ticket.title,
     summary: ticket.summary,
@@ -418,7 +418,7 @@ export async function manualEscalate(
     },
   });
 
-  emitEventFireAndForget("ticket.escalated", {
+  emitEventFireAndForget(tenantId, "ticket.escalated", {
     code: ticket.code,
     title: ticket.title,
     summary: ticket.summary,

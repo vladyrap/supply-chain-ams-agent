@@ -29,9 +29,9 @@ export async function postCreateEval(
     }
   }
   try {
-    const { runIds } = await createEvalRun(name.trim(), configs, questions);
+    const { runIds } = await createEvalRun(req.tenantId, name.trim(), configs, questions);
     // Lanza la ejecución en background — no bloquea la respuesta.
-    for (const id of runIds) executeEvalRunFireAndForget(id);
+    for (const id of runIds) executeEvalRunFireAndForget(req.tenantId, id);
     return reply.send({ success: true, runIds });
   } catch (err) {
     logger.error({ err }, "eval: create fail");
@@ -39,9 +39,9 @@ export async function postCreateEval(
   }
 }
 
-export async function getEvalsList(_req: FastifyRequest, reply: FastifyReply) {
+export async function getEvalsList(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const runs = await listEvalRuns();
+    const runs = await listEvalRuns(req.tenantId);
     return reply.send({ success: true, count: runs.length, runs });
   } catch (err) {
     logger.error({ err }, "eval: list fail");
@@ -54,7 +54,7 @@ export async function getEvalDetail(
   reply: FastifyReply
 ) {
   try {
-    const { run, results } = await getEvalRun(req.params.id);
+    const { run, results } = await getEvalRun(req.tenantId, req.params.id);
     if (!run) return reply.code(404).send({ success: false, error: "no encontrado" });
     return reply.send({ success: true, run, results });
   } catch (err) {

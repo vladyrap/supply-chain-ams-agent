@@ -202,7 +202,7 @@ Reglas:
   }
 }
 
-export async function runQaEvaluation(opts: {
+export async function runQaEvaluation(tenantId: string, opts: {
   limit?: number;
   triggeredBy?: string;
   /** Si se pasa, se usa este system prompt en lugar del activo del agente */
@@ -213,24 +213,24 @@ export async function runQaEvaluation(opts: {
   await ensureSchema();
   const limit = Math.max(1, Math.min(MAX_BATCH, opts.limit ?? DEFAULT_BATCH));
 
-  // 1. Leer prompt activo (solo para registrarlo en el run)
+  // 1. Leer prompt activo (solo para registrarlo en el run) — per tenant (MT-3)
   let promptLabel: string | null = opts.promptLabelOverride ?? null;
   if (!promptLabel) {
     try {
       const { getActivePrompt } = await import("./agent-lab.service");
-      const v = await getActivePrompt();
+      const v = await getActivePrompt(tenantId);
       if (v) promptLabel = v.label;
     } catch { /* ignore */ }
   }
 
   // 2. Crear run
   const { rows: runRows } = await query<{ id: string }>(
-    `INSERT INTO qa_eval_runs (triggered_by, prompt_label) VALUES ($1, $2) RETURNING id`,
-    [opts.triggeredBy ?? "sistema", promptLabel]
+    `INSERT INTO qa_eval_runs (tenant_id, triggered_by, prompt_label) VALUES ($1, $2, $3) RETURNING id`,
+    [tenantId, opts.triggeredBy ?? "sistema", promptLabel]
   );
   const runId = runRows[0]!.id;
 
-  // 3. Tomar Q&A aprobadas a evaluar (con turnos si los tiene)
+  // 3. Tomar Q&A aprobadas a evaluar (con turnos si los tiene) — scoped al tenant
   const { rows: qas } = await query<{
     id: string; question: string; expected_answer: string;
     knowledge_item_id: string | null;
@@ -243,15 +243,16 @@ export async function runQaEvaluation(opts: {
        FROM kb_training_qa q
        LEFT JOIN kb_training_items i ON i.id = q.knowledge_item_id
       WHERE q.approved = true
+        AND q.tenant_id = $2
       ORDER BY q.created_at DESC
       LIMIT $1`,
-    [limit]
+    [limit, tenantId]
   );
 
   if (qas.length === 0) {
     await query(
-      `UPDATE qa_eval_runs SET total_qas = 0, passed = 0, failed = 0, finished_at = now() WHERE id = $1`,
-      [runId]
+      `UPDATE qa_eval_runs SET total_qas = 0, passed = 0, failed = 0, finished_at = now() WHERE id = $1 AND tenant_id = $2`,
+      [runId, tenantId]
     );
     return {
       runId, totalQas: 0, passed: 0, failed: 0, partial: 0, avgScore: 0,
@@ -313,10 +314,10 @@ export async function runQaEvaluation(opts: {
       // Persistir cada resultado individual
       await query(
         `INSERT INTO qa_eval_results
-           (run_id, qa_id, item_id, question, expected, actual, score, verdict, notes, latency_ms)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+           (tenant_id, run_id, qa_id, item_id, question, expected, actual, score, verdict, notes, latency_ms)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [
-          runId, qa.id, qa.knowledge_item_id,
+          tenantId, runId, qa.id, qa.knowledge_item_id,
           qa.question, qa.expected_answer, actual,
           judged.score, judged.verdict, judged.notes, latencyMs,
         ]
@@ -349,8 +350,8 @@ export async function runQaEvaluation(opts: {
   await query(
     `UPDATE qa_eval_runs
         SET total_qas = $1, passed = $2, failed = $3, avg_score = $4, finished_at = now()
-      WHERE id = $5`,
-    [results.length, passed, failed, avgScore, runId]
+      WHERE id = $5 AND tenant_id = $6`,
+    [results.length, passed, failed, avgScore, runId, tenantId]
   );
 
   const report: EvalRunReport = {
@@ -376,15 +377,16 @@ export interface EvalRunSummary {
   finished_at: string | null;
 }
 
-export async function listEvalRuns(limit = 30): Promise<EvalRunSummary[]> {
+export async function listEvalRuns(tenantId: string, limit = 30): Promise<EvalRunSummary[]> {
   await ensureSchema();
   const { rows } = await query<EvalRunSummary>(
     `SELECT id, triggered_by, total_qas, passed, failed, avg_score,
             prompt_label, started_at, finished_at
        FROM qa_eval_runs
+      WHERE tenant_id = $2
       ORDER BY started_at DESC
       LIMIT $1`,
-    [Math.max(1, Math.min(200, limit))]
+    [Math.max(1, Math.min(200, limit)), tenantId]
   );
   return rows;
 }
@@ -393,10 +395,10 @@ export interface EvalRunDetail extends EvalRunSummary {
   results: EvalSingleResult[];
 }
 
-export async function getEvalRunDetail(runId: string): Promise<EvalRunDetail | null> {
+export async function getEvalRunDetail(tenantId: string, runId: string): Promise<EvalRunDetail | null> {
   await ensureSchema();
   const { rows: runs } = await query<EvalRunSummary>(
-    `SELECT * FROM qa_eval_runs WHERE id = $1 LIMIT 1`, [runId]
+    `SELECT * FROM qa_eval_runs WHERE id = $1 AND tenant_id = $2 LIMIT 1`, [runId, tenantId]
   );
   if (runs.length === 0) return null;
   const { rows: res } = await query<{
@@ -405,9 +407,9 @@ export async function getEvalRunDetail(runId: string): Promise<EvalRunDetail | n
   }>(
     `SELECT qa_id, item_id, question, expected, actual, score, verdict, notes, latency_ms
        FROM qa_eval_results
-      WHERE run_id = $1
+      WHERE run_id = $1 AND tenant_id = $2
       ORDER BY created_at ASC`,
-    [runId]
+    [runId, tenantId]
   );
   return {
     ...runs[0],
@@ -444,15 +446,15 @@ export interface AbTestReport {
   unchangedQas: string[];
 }
 
-export async function runAbTest(input: AbTestInput): Promise<AbTestReport> {
+export async function runAbTest(tenantId: string, input: AbTestInput): Promise<AbTestReport> {
   // Corremos A primero (sin override = activo), luego B con override
-  const runA = await runQaEvaluation({
+  const runA = await runQaEvaluation(tenantId, {
     limit: input.limit,
     triggeredBy: (input.triggeredBy ?? "ab-test") + ":A",
     systemPromptOverride: input.promptA?.systemPrompt,
     promptLabelOverride: input.promptA?.label ?? "(activo)",
   });
-  const runB = await runQaEvaluation({
+  const runB = await runQaEvaluation(tenantId, {
     limit: input.limit,
     triggeredBy: (input.triggeredBy ?? "ab-test") + ":B",
     systemPromptOverride: input.promptB.systemPrompt,
@@ -529,8 +531,8 @@ export interface RunDiffReport {
   onlyB: RunDiffResult[];
 }
 
-export async function diffEvalRuns(idA: string, idB: string): Promise<RunDiffReport | null> {
-  const [a, b] = await Promise.all([getEvalRunDetail(idA), getEvalRunDetail(idB)]);
+export async function diffEvalRuns(tenantId: string, idA: string, idB: string): Promise<RunDiffReport | null> {
+  const [a, b] = await Promise.all([getEvalRunDetail(tenantId, idA), getEvalRunDetail(tenantId, idB)]);
   if (!a || !b) return null;
 
   const mapA = new Map(a.results.map((r) => [r.qaId, r]));
@@ -601,9 +603,9 @@ export async function diffEvalRuns(idA: string, idB: string): Promise<RunDiffRep
   };
 }
 
-export async function autoPromoteIfBetter(input: AutoPromoteInput): Promise<AutoPromoteResult> {
+export async function autoPromoteIfBetter(tenantId: string, input: AutoPromoteInput): Promise<AutoPromoteResult> {
   const minDelta = Math.max(1, input.minDelta ?? 5);
-  const ab = await runAbTest({
+  const ab = await runAbTest(tenantId, {
     promptB: { systemPrompt: input.candidate.systemPrompt, label: input.candidate.label },
     limit: input.limit,
     triggeredBy: input.triggeredBy ?? "auto-promote",
@@ -644,7 +646,7 @@ export async function autoPromoteIfBetter(input: AutoPromoteInput): Promise<Auto
   // Adoptar
   try {
     const { adoptPrompt } = await import("./agent-lab.service");
-    const adopted = await adoptPrompt({
+    const adopted = await adoptPrompt(tenantId, {
       label: input.candidate.label,
       systemPrompt: input.candidate.systemPrompt,
       temperature: input.candidate.temperature,

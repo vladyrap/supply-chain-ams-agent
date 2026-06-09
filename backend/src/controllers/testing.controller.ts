@@ -1,3 +1,4 @@
+// Multi-tenant: pasamos req.tenantId al service (Sprint 3 ALTOS).
 import type { FastifyRequest, FastifyReply } from "fastify";
 import { logger } from "../utils/logger";
 import * as svc from "../services/testing.service";
@@ -9,9 +10,9 @@ import { analyzeVideoEvidence } from "../services/testing-video-analysis.service
 // ============================================================
 // Snapshot
 // ============================================================
-export async function getSnapshot(_req: FastifyRequest, reply: FastifyReply) {
+export async function getSnapshot(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const snap = await svc.getSnapshot();
+    const snap = await svc.getSnapshot(req.tenantId);
     return reply.send({ success: true, ...snap });
   } catch (err) {
     logger.error({ err }, "testing.snapshot fail");
@@ -24,7 +25,7 @@ export async function getSnapshot(_req: FastifyRequest, reply: FastifyReply) {
 // ============================================================
 export async function upsertScenario(req: FastifyRequest<{ Body: svc.TestingScenario }>, reply: FastifyReply) {
   try {
-    const s = await svc.upsertScenario(req.body);
+    const s = await svc.upsertScenario(req.tenantId, req.body);
     return reply.send({ success: true, scenario: s });
   } catch (err) {
     logger.error({ err }, "testing.upsertScenario fail");
@@ -34,7 +35,7 @@ export async function upsertScenario(req: FastifyRequest<{ Body: svc.TestingScen
 
 export async function deleteScenario(req: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) {
   try {
-    await svc.deleteScenario(req.params.id);
+    await svc.deleteScenario(req.tenantId, req.params.id);
     return reply.send({ success: true });
   } catch (err) {
     logger.error({ err }, "testing.deleteScenario fail");
@@ -47,7 +48,7 @@ export async function deleteScenario(req: FastifyRequest<{ Params: { id: string 
 // ============================================================
 export async function createEvidenceJson(req: FastifyRequest<{ Body: svc.EvidenceItem }>, reply: FastifyReply) {
   try {
-    const e = await svc.createEvidence(req.body);
+    const e = await svc.createEvidence(req.tenantId, req.body);
     return reply.send({ success: true, evidence: e });
   } catch (err) {
     logger.error({ err }, "testing.createEvidence(json) fail");
@@ -57,7 +58,7 @@ export async function createEvidenceJson(req: FastifyRequest<{ Body: svc.Evidenc
 
 export async function deleteEvidence(req: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) {
   try {
-    await svc.deleteEvidence(req.params.id);
+    await svc.deleteEvidence(req.tenantId, req.params.id);
     return reply.send({ success: true });
   } catch (err) {
     logger.error({ err }, "testing.deleteEvidence fail");
@@ -109,7 +110,7 @@ export async function uploadEvidence(req: FastifyRequest, reply: FastifyReply) {
     // Lee el stream completo a memoria. Límite seteado por Fastify (default ~50MB).
     const buffer = await data.toBuffer();
 
-    const storagePath = await svc.saveUploadedFile(scenarioId, data.filename || "evidence.bin", buffer);
+    const storagePath = await svc.saveUploadedFile(req.tenantId, scenarioId, data.filename || "evidence.bin", buffer);
 
     const evidence: svc.EvidenceItem = {
       id: `ev_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -126,7 +127,7 @@ export async function uploadEvidence(req: FastifyRequest, reply: FastifyReply) {
       createdAt: new Date().toISOString(),
       createdBy,
     };
-    const saved = await svc.createEvidence(evidence);
+    const saved = await svc.createEvidence(req.tenantId, evidence);
     return reply.send({ success: true, evidence: saved });
   } catch (err) {
     logger.error({ err }, "testing.uploadEvidence fail");
@@ -137,10 +138,10 @@ export async function uploadEvidence(req: FastifyRequest, reply: FastifyReply) {
 // GET /api/testing/evidences/:id/file
 export async function getEvidenceFile(req: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) {
   try {
-    const ev = await svc.getEvidence(req.params.id);
+    const ev = await svc.getEvidence(req.tenantId, req.params.id);
     if (!ev) return reply.code(404).send({ success: false, error: "Evidencia no encontrada" });
     if (!ev.storagePath) return reply.code(404).send({ success: false, error: "Esta evidencia no tiene archivo asociado" });
-    const buffer = await svc.readEvidenceFile(ev.storagePath);
+    const buffer = await svc.readEvidenceFile(req.tenantId, ev.storagePath);
     // FIX A11: re-validar fileType al servir + Content-Security-Policy estricto
     // y X-Content-Type-Options nosniff. Si el fileType no está en allowlist,
     // forzar application/octet-stream + attachment (no inline).
@@ -165,7 +166,7 @@ export async function getEvidenceFile(req: FastifyRequest<{ Params: { id: string
 // ============================================================
 export async function upsertDefect(req: FastifyRequest<{ Body: svc.TestDefect }>, reply: FastifyReply) {
   try {
-    const d = await svc.upsertDefect(req.body);
+    const d = await svc.upsertDefect(req.tenantId, req.body);
     return reply.send({ success: true, defect: d });
   } catch (err) {
     logger.error({ err }, "testing.upsertDefect fail");
@@ -175,7 +176,7 @@ export async function upsertDefect(req: FastifyRequest<{ Body: svc.TestDefect }>
 
 export async function deleteDefect(req: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) {
   try {
-    await svc.deleteDefect(req.params.id);
+    await svc.deleteDefect(req.tenantId, req.params.id);
     return reply.send({ success: true });
   } catch (err) {
     logger.error({ err }, "testing.deleteDefect fail");
@@ -188,7 +189,7 @@ export async function deleteDefect(req: FastifyRequest<{ Params: { id: string } 
 // ============================================================
 export async function upsertManual(req: FastifyRequest<{ Body: svc.GeneratedUserManual }>, reply: FastifyReply) {
   try {
-    const m = await svc.upsertManual(req.body);
+    const m = await svc.upsertManual(req.tenantId, req.body);
     return reply.send({ success: true, manual: m });
   } catch (err) {
     logger.error({ err }, "testing.upsertManual fail");
@@ -201,7 +202,7 @@ export async function upsertManual(req: FastifyRequest<{ Body: svc.GeneratedUser
 // ============================================================
 export async function updateSettings(req: FastifyRequest<{ Body: Partial<svc.TestingSettings> }>, reply: FastifyReply) {
   try {
-    const s = await svc.updateSettings(req.body);
+    const s = await svc.updateSettings(req.tenantId, req.body);
     return reply.send({ success: true, settings: s });
   } catch (err) {
     logger.error({ err }, "testing.updateSettings fail");
@@ -209,10 +210,10 @@ export async function updateSettings(req: FastifyRequest<{ Body: Partial<svc.Tes
   }
 }
 
-export async function postResetDemo(_req: FastifyRequest, reply: FastifyReply) {
+export async function postResetDemo(req: FastifyRequest, reply: FastifyReply) {
   try {
-    await svc.resetDemo();
-    const snap = await svc.getSnapshot();
+    await svc.resetDemo(req.tenantId);
+    const snap = await svc.getSnapshot(req.tenantId);
     return reply.send({ success: true, ...snap });
   } catch (err) {
     logger.error({ err }, "testing.resetDemo fail");
@@ -253,7 +254,7 @@ export async function postAnalyzeVideo(
 ) {
   try {
     const language = req.body?.language || "es";
-    const result = await analyzeVideoEvidence(req.params.id, language);
+    const result = await analyzeVideoEvidence(req.tenantId, req.params.id, language);
     return reply.send({ success: true, ...result });
   } catch (err) {
     logger.error({ err }, "testing.analyzeVideo fail");

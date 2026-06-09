@@ -67,16 +67,17 @@ async function ensureSchema(): Promise<void> {
   }
 }
 
-export async function createFeedback(input: CreateFeedbackInput): Promise<AiFeedbackRow> {
+export async function createFeedback(tenantId: string, input: CreateFeedbackInput): Promise<AiFeedbackRow> {
   await ensureSchema();
   const { rows } = await query<AiFeedbackRow>(
     `
     INSERT INTO ai_response_feedback
-      (source, kind, reason, conversation_id, message_id, ticket_id, query, response, metadata, created_by)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
+      (tenant_id, source, kind, reason, conversation_id, message_id, ticket_id, query, response, metadata, created_by)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11)
     RETURNING *
     `,
     [
+      tenantId,
       input.source,
       input.kind,
       input.reason ?? null,
@@ -100,10 +101,13 @@ export interface ListFeedbackFilters {
   fromDate?: string;
 }
 
-export async function listFeedback(filters: ListFeedbackFilters = {}): Promise<AiFeedbackRow[]> {
+export async function listFeedback(tenantId: string, filters: ListFeedbackFilters = {}): Promise<AiFeedbackRow[]> {
   await ensureSchema();
   const conds: string[] = [];
   const params: unknown[] = [];
+  // Tenant scoping siempre primero.
+  params.push(tenantId);
+  conds.push(`tenant_id = $${params.length}`);
   if (filters.source) {
     params.push(filters.source);
     conds.push(`source = $${params.length}`);
@@ -126,7 +130,7 @@ export async function listFeedback(filters: ListFeedbackFilters = {}): Promise<A
 
   const sql = `
     SELECT * FROM ai_response_feedback
-    ${conds.length ? "WHERE " + conds.join(" AND ") : ""}
+    WHERE ${conds.join(" AND ")}
     ORDER BY created_at DESC
     LIMIT ${limitParam}
   `;
@@ -143,7 +147,7 @@ export interface FeedbackStats {
   recent7d: number;
 }
 
-export async function getFeedbackStats(): Promise<FeedbackStats> {
+export async function getFeedbackStats(tenantId: string): Promise<FeedbackStats> {
   await ensureSchema();
   const { rows: tot } = await query<{ total: string; positive: string; negative: string; recent7d: string }>(
     `
@@ -153,7 +157,9 @@ export async function getFeedbackStats(): Promise<FeedbackStats> {
       count(*) FILTER (WHERE kind = 'negative')::text AS negative,
       count(*) FILTER (WHERE created_at > now() - interval '7 days')::text AS recent7d
     FROM ai_response_feedback
-    `
+    WHERE tenant_id = $1
+    `,
+    [tenantId]
   );
   const { rows: bySource } = await query<{ source: string; positive: string; negative: string }>(
     `
@@ -161,8 +167,10 @@ export async function getFeedbackStats(): Promise<FeedbackStats> {
            count(*) FILTER (WHERE kind = 'positive')::text AS positive,
            count(*) FILTER (WHERE kind = 'negative')::text AS negative
     FROM ai_response_feedback
+    WHERE tenant_id = $1
     GROUP BY source
-    `
+    `,
+    [tenantId]
   );
   const total    = Number(tot[0]?.total ?? 0);
   const positive = Number(tot[0]?.positive ?? 0);

@@ -1,11 +1,12 @@
 // Playbooks AMS backend service.
 // Persistencia real en Postgres. Reemplaza el localStorage del frontend.
+// Multi-tenant: todas las funciones reciben tenantId y filtran por él (Sprint 3 ALTOS).
 
 import { query } from "../database/db";
 import { logger } from "../utils/logger";
 
 let schemaEnsured = false;
-let seeded = false;
+const seededTenants = new Set<string>();
 
 // ============================================================================
 // Tipos (mirror del frontend)
@@ -234,19 +235,23 @@ function seedPlaybooks(): AmsPlaybook[] {
   ];
 }
 
-async function seedIfEmpty(): Promise<void> {
-  if (seeded) return;
+async function seedIfEmpty(tenantId: string): Promise<void> {
+  if (seededTenants.has(tenantId)) return;
   try {
-    const c = await query<{ c: string }>("SELECT count(*)::text AS c FROM playbooks");
+    const c = await query<{ c: string }>(
+      "SELECT count(*)::text AS c FROM playbooks WHERE tenant_id = $1",
+      [tenantId]
+    );
     if (Number(c.rows[0]?.c || "0") === 0) {
       for (const p of seedPlaybooks()) {
         await query(
-          `INSERT INTO playbooks (id,title,description,sap_module,process,severity,trigger_when,steps,
+          `INSERT INTO playbooks (tenant_id,id,title,description,sap_module,process,severity,trigger_when,steps,
              required_data,responsible_role,sla_target_minutes,escalation_rules,evidence_required,
              communication_template,related_knowledge_items,related_scope_items,status,version,owner,tags,
              created_at,updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
-          [p.id, p.title, p.description, p.sapModule, p.process, p.severity, p.triggerWhen,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+           ON CONFLICT (id) DO NOTHING`,
+          [tenantId, p.id, p.title, p.description, p.sapModule, p.process, p.severity, p.triggerWhen,
            JSON.stringify(p.steps), p.requiredData, p.responsibleRole, p.slaTargetMinutes,
            p.escalationRules, p.evidenceRequired, p.communicationTemplate,
            p.relatedKnowledgeItems, p.relatedScopeItems, p.status, p.version, p.owner,
@@ -254,13 +259,13 @@ async function seedIfEmpty(): Promise<void> {
         );
       }
     }
-    seeded = true;
+    seededTenants.add(tenantId);
   } catch (err) {
     logger.warn({ err }, "seed playbooks failed");
   }
 }
 
-async function ready() { await ensureSchema(); await seedIfEmpty(); }
+async function ready(tenantId: string) { await ensureSchema(); await seedIfEmpty(tenantId); }
 
 // ============================================================================
 // Mappers
@@ -311,24 +316,30 @@ function mapExec(r: PbExecRow): PlaybookExecution {
 // API
 // ============================================================================
 
-export async function getSnapshot(): Promise<{ playbooks: AmsPlaybook[]; executions: PlaybookExecution[] }> {
-  await ready();
+export async function getSnapshot(tenantId: string): Promise<{ playbooks: AmsPlaybook[]; executions: PlaybookExecution[] }> {
+  await ready(tenantId);
   const [pR, eR] = await Promise.all([
-    query<PbRow>("SELECT * FROM playbooks ORDER BY updated_at DESC"),
-    query<PbExecRow>("SELECT * FROM playbook_executions ORDER BY started_at DESC LIMIT 500"),
+    query<PbRow>(
+      "SELECT * FROM playbooks WHERE tenant_id = $1 ORDER BY updated_at DESC",
+      [tenantId]
+    ),
+    query<PbExecRow>(
+      "SELECT * FROM playbook_executions WHERE tenant_id = $1 ORDER BY started_at DESC LIMIT 500",
+      [tenantId]
+    ),
   ]);
   return { playbooks: pR.rows.map(mapPb), executions: eR.rows.map(mapExec) };
 }
 
-export async function upsertPlaybook(p: AmsPlaybook): Promise<AmsPlaybook> {
-  await ready();
+export async function upsertPlaybook(tenantId: string, p: AmsPlaybook): Promise<AmsPlaybook> {
+  await ready(tenantId);
   const now = new Date().toISOString();
   const res = await query<PbRow>(
-    `INSERT INTO playbooks (id,title,description,sap_module,process,severity,trigger_when,steps,
+    `INSERT INTO playbooks (tenant_id,id,title,description,sap_module,process,severity,trigger_when,steps,
        required_data,responsible_role,sla_target_minutes,escalation_rules,evidence_required,
        communication_template,related_knowledge_items,related_scope_items,status,version,owner,tags,
        created_at,updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
      ON CONFLICT (id) DO UPDATE SET
        title=EXCLUDED.title, description=EXCLUDED.description, sap_module=EXCLUDED.sap_module,
        process=EXCLUDED.process, severity=EXCLUDED.severity, trigger_when=EXCLUDED.trigger_when,
@@ -340,8 +351,9 @@ export async function upsertPlaybook(p: AmsPlaybook): Promise<AmsPlaybook> {
        related_scope_items=EXCLUDED.related_scope_items, status=EXCLUDED.status,
        version=EXCLUDED.version, owner=EXCLUDED.owner, tags=EXCLUDED.tags,
        updated_at=EXCLUDED.updated_at
+     WHERE playbooks.tenant_id = $1
      RETURNING *`,
-    [p.id, p.title, p.description, p.sapModule, p.process, p.severity, p.triggerWhen,
+    [tenantId, p.id, p.title, p.description, p.sapModule, p.process, p.severity, p.triggerWhen,
      JSON.stringify(p.steps || []), p.requiredData || [], p.responsibleRole, p.slaTargetMinutes,
      p.escalationRules, p.evidenceRequired || [], p.communicationTemplate,
      p.relatedKnowledgeItems || [], p.relatedScopeItems || [],
@@ -350,36 +362,37 @@ export async function upsertPlaybook(p: AmsPlaybook): Promise<AmsPlaybook> {
   return mapPb(res.rows[0]);
 }
 
-export async function deletePlaybook(id: string): Promise<void> {
-  await ready();
-  await query("DELETE FROM playbooks WHERE id = $1", [id]);
+export async function deletePlaybook(tenantId: string, id: string): Promise<void> {
+  await ready(tenantId);
+  await query("DELETE FROM playbooks WHERE id = $1 AND tenant_id = $2", [id, tenantId]);
 }
 
-export async function upsertExecution(e: PlaybookExecution): Promise<PlaybookExecution> {
-  await ready();
+export async function upsertExecution(tenantId: string, e: PlaybookExecution): Promise<PlaybookExecution> {
+  await ready(tenantId);
   const res = await query<PbExecRow>(
-    `INSERT INTO playbook_executions (id,playbook_id,started_at,finished_at,started_by,incident_id,
+    `INSERT INTO playbook_executions (tenant_id,id,playbook_id,started_at,finished_at,started_by,incident_id,
        completed_steps,notes,status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
      ON CONFLICT (id) DO UPDATE SET
        finished_at=EXCLUDED.finished_at, completed_steps=EXCLUDED.completed_steps,
        notes=EXCLUDED.notes, status=EXCLUDED.status
+     WHERE playbook_executions.tenant_id = $1
      RETURNING *`,
-    [e.id, e.playbookId, e.startedAt, e.finishedAt || null, e.startedBy, e.incidentId || null,
+    [tenantId, e.id, e.playbookId, e.startedAt, e.finishedAt || null, e.startedBy, e.incidentId || null,
      e.completedSteps || [], JSON.stringify(e.notes || {}), e.status]
   );
   return mapExec(res.rows[0]);
 }
 
-export async function deleteExecution(id: string): Promise<void> {
-  await ready();
-  await query("DELETE FROM playbook_executions WHERE id = $1", [id]);
+export async function deleteExecution(tenantId: string, id: string): Promise<void> {
+  await ready(tenantId);
+  await query("DELETE FROM playbook_executions WHERE id = $1 AND tenant_id = $2", [id, tenantId]);
 }
 
-export async function resetDemo(): Promise<void> {
+export async function resetDemo(tenantId: string): Promise<void> {
   await ensureSchema();
-  await query("DELETE FROM playbook_executions");
-  await query("DELETE FROM playbooks");
-  seeded = false;
-  await seedIfEmpty();
+  await query("DELETE FROM playbook_executions WHERE tenant_id = $1", [tenantId]);
+  await query("DELETE FROM playbooks WHERE tenant_id = $1", [tenantId]);
+  seededTenants.delete(tenantId);
+  await seedIfEmpty(tenantId);
 }

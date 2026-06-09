@@ -1,11 +1,11 @@
-// Active learning loop.
+// Active learning loop (multi-tenant).
+//
+// MT-3: getBorderlineQAs recibe tenantId obligatorio y filtra Q&A evals
+// del tenant.
 //
 // Identifica Q&A "borderline" — las que el agente ni acierta ni falla
 // claramente. Score Gemini en rango 40-69 según las últimas evaluaciones.
-// Estas son las más valiosas para que el humano las revise: una pequeña
-// edición puede mover una "partial" a "pass" y mejorar el corpus.
-//
-// El endpoint priorizado devuelve estas Q&A ordenadas por uncertainty.
+// Estas son las más valiosas para que el humano las revise.
 
 import { query } from "../database/db";
 import { logger } from "../utils/logger";
@@ -20,9 +20,9 @@ export interface BorderlineQA {
   latestScore: number;
   latestVerdict: string;
   latestNotes: string | null;
-  evalCount: number;        // cuantas veces fue evaluada
+  evalCount: number;
   avgScore: number;
-  uncertainty: number;      // distancia al borde más cercano (50)
+  uncertainty: number;
   approved: boolean;
 }
 
@@ -34,7 +34,10 @@ export interface BorderlineReport {
 const MIN_SCORE = 40;
 const MAX_SCORE = 69;
 
-export async function getBorderlineQAs(opts: { limit?: number } = {}): Promise<BorderlineReport> {
+export async function getBorderlineQAs(
+  tenantId: string,
+  opts: { limit?: number } = {},
+): Promise<BorderlineReport> {
   const limit = Math.max(1, Math.min(100, opts.limit ?? 30));
 
   let rows: {
@@ -59,6 +62,7 @@ export async function getBorderlineQAs(opts: { limit?: number } = {}): Promise<B
           (array_agg(verdict  ORDER BY created_at DESC))[1] AS latest_verdict,
           (array_agg(notes    ORDER BY created_at DESC))[1] AS latest_notes
         FROM qa_eval_results
+        WHERE tenant_id = $4
         GROUP BY qa_id
       )
       SELECT
@@ -67,16 +71,16 @@ export async function getBorderlineQAs(opts: { limit?: number } = {}): Promise<B
         p.latest_score, p.latest_verdict, p.latest_notes,
         p.eval_count::text, p.avg_score::text, q.approved
       FROM per_qa p
-      JOIN kb_training_qa q ON q.id = p.qa_id
-      LEFT JOIN kb_training_items i ON i.id = q.knowledge_item_id
+      JOIN kb_training_qa q ON q.id = p.qa_id AND q.tenant_id = $4
+      LEFT JOIN kb_training_items i ON i.id = q.knowledge_item_id AND i.tenant_id = $4
       WHERE p.avg_score BETWEEN $1 AND $2
       ORDER BY ABS(p.avg_score - 50) ASC, p.eval_count DESC
       LIMIT $3`,
-      [MIN_SCORE, MAX_SCORE, limit]
+      [MIN_SCORE, MAX_SCORE, limit, tenantId]
     );
     rows = r.rows;
   } catch (err) {
-    logger.debug({ err }, "borderline query fail");
+    logger.debug({ err, tenantId }, "borderline query fail");
   }
 
   const items: BorderlineQA[] = rows.map((r) => {
@@ -93,7 +97,7 @@ export async function getBorderlineQAs(opts: { limit?: number } = {}): Promise<B
       latestNotes: r.latest_notes,
       evalCount: Number(r.eval_count),
       avgScore: avg,
-      uncertainty: Math.abs(50 - avg),  // 0 = peor, 9 mejor lejano de 50
+      uncertainty: Math.abs(50 - avg),
       approved: r.approved,
     };
   });

@@ -7,9 +7,9 @@ import { createServiceNowIncident, serviceNowStatus, type ServiceNowPayload } fr
 // ============================================================
 // Snapshot
 // ============================================================
-export async function getSnapshot(_req: FastifyRequest, reply: FastifyReply) {
+export async function getSnapshot(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const snap = await svc.getSnapshot();
+    const snap = await svc.getSnapshot(req.tenantId);
     return reply.send({ success: true, ...snap });
   } catch (err) {
     logger.error({ err }, "escalation.snapshot fail");
@@ -22,7 +22,7 @@ export async function getSnapshot(_req: FastifyRequest, reply: FastifyReply) {
 // ============================================================
 export async function upsertRule(req: FastifyRequest<{ Body: svc.EscalationRule }>, reply: FastifyReply) {
   try {
-    const r = await svc.upsertRule(req.body);
+    const r = await svc.upsertRule(req.tenantId, req.body);
     return reply.send({ success: true, rule: r });
   } catch (err) {
     logger.error({ err }, "escalation.upsertRule fail");
@@ -31,7 +31,7 @@ export async function upsertRule(req: FastifyRequest<{ Body: svc.EscalationRule 
 }
 export async function deleteRule(req: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) {
   try {
-    await svc.deleteRule(req.params.id);
+    await svc.deleteRule(req.tenantId, req.params.id);
     return reply.send({ success: true });
   } catch (err) {
     logger.error({ err }, "escalation.deleteRule fail");
@@ -44,7 +44,7 @@ export async function deleteRule(req: FastifyRequest<{ Params: { id: string } }>
 // ============================================================
 export async function upsertResponsible(req: FastifyRequest<{ Body: svc.N2Responsible }>, reply: FastifyReply) {
   try {
-    const r = await svc.upsertResponsible(req.body);
+    const r = await svc.upsertResponsible(req.tenantId, req.body);
     return reply.send({ success: true, responsible: r });
   } catch (err) {
     logger.error({ err }, "escalation.upsertResponsible fail");
@@ -53,7 +53,7 @@ export async function upsertResponsible(req: FastifyRequest<{ Body: svc.N2Respon
 }
 export async function deleteResponsible(req: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) {
   try {
-    await svc.deleteResponsible(req.params.id);
+    await svc.deleteResponsible(req.tenantId, req.params.id);
     return reply.send({ success: true });
   } catch (err) {
     logger.error({ err }, "escalation.deleteResponsible fail");
@@ -66,7 +66,7 @@ export async function deleteResponsible(req: FastifyRequest<{ Params: { id: stri
 // ============================================================
 export async function createRecord(req: FastifyRequest<{ Body: svc.EscalationRecord }>, reply: FastifyReply) {
   try {
-    const r = await svc.createRecord(req.body);
+    const r = await svc.createRecord(req.tenantId, req.body);
     return reply.send({ success: true, record: r });
   } catch (err) {
     logger.error({ err }, "escalation.createRecord fail");
@@ -78,7 +78,7 @@ export async function updateRecord(
   reply: FastifyReply
 ) {
   try {
-    const r = await svc.updateRecord(req.params.id, req.body);
+    const r = await svc.updateRecord(req.tenantId, req.params.id, req.body);
     if (!r) return reply.code(404).send({ success: false, error: "Registro no encontrado" });
     return reply.send({ success: true, record: r });
   } catch (err) {
@@ -92,7 +92,7 @@ export async function updateRecord(
 // ============================================================
 export async function updateConnectors(req: FastifyRequest<{ Body: Partial<svc.ItsmConnectorConfig> }>, reply: FastifyReply) {
   try {
-    const c = await svc.updateConnectors(req.body);
+    const c = await svc.updateConnectors(req.tenantId, req.body);
     return reply.send({ success: true, connectors: c });
   } catch (err) {
     logger.error({ err }, "escalation.updateConnectors fail");
@@ -101,17 +101,17 @@ export async function updateConnectors(req: FastifyRequest<{ Body: Partial<svc.I
 }
 export async function updateSettings(req: FastifyRequest<{ Body: Partial<svc.EscalationSettings> }>, reply: FastifyReply) {
   try {
-    const s = await svc.updateSettings(req.body);
+    const s = await svc.updateSettings(req.tenantId, req.body);
     return reply.send({ success: true, settings: s });
   } catch (err) {
     logger.error({ err }, "escalation.updateSettings fail");
     return reply.code(500).send({ success: false, error: "Error actualizando configuración" });
   }
 }
-export async function postResetDemo(_req: FastifyRequest, reply: FastifyReply) {
+export async function postResetDemo(req: FastifyRequest, reply: FastifyReply) {
   try {
-    await svc.resetDemoData();
-    const snap = await svc.getSnapshot();
+    await svc.resetDemoData(req.tenantId);
+    const snap = await svc.getSnapshot(req.tenantId);
     return reply.send({ success: true, ...snap });
   } catch (err) {
     logger.error({ err }, "escalation.reset fail");
@@ -155,7 +155,7 @@ export async function postSendJira(
       mode: result.mode as svc.ItsmMode,
       payload: { channel: "JIRA", payload },
     };
-    const cur = await svc.updateRecord(req.params.id, recPatch);
+    const cur = await svc.updateRecord(req.tenantId, req.params.id, recPatch);
     if (cur) {
       // Append event
       const event = {
@@ -164,7 +164,7 @@ export async function postSendJira(
         by: by || "system",
         note: result.ok ? `Ticket ${result.mode}: ${result.ticketId}` : `Falla: ${result.error}`,
       };
-      await svc.updateRecord(req.params.id, { events: [...(cur.events || []), event] });
+      await svc.updateRecord(req.tenantId, req.params.id, { events: [...(cur.events || []), event] });
     }
     return reply.send({ success: true, result });
   } catch (err) {
@@ -192,7 +192,7 @@ export async function postSendServiceNow(
       mode: result.mode as svc.ItsmMode,
       payload: { channel: "SERVICENOW", payload },
     };
-    const cur = await svc.updateRecord(req.params.id, recPatch);
+    const cur = await svc.updateRecord(req.tenantId, req.params.id, recPatch);
     if (cur) {
       const event = {
         type: "SENT_TO_SERVICENOW",
@@ -200,7 +200,7 @@ export async function postSendServiceNow(
         by: by || "system",
         note: result.ok ? `Incident ${result.mode}: ${result.ticketId}` : `Falla: ${result.error}`,
       };
-      await svc.updateRecord(req.params.id, { events: [...(cur.events || []), event] });
+      await svc.updateRecord(req.tenantId, req.params.id, { events: [...(cur.events || []), event] });
     }
     return reply.send({ success: true, result });
   } catch (err) {

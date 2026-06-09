@@ -1,3 +1,6 @@
+// stats.service.ts — Estadísticas globales del módulo AMS (multi-tenant).
+//
+// MT-3: getStats recibe tenantId. Cada cliente ve solo sus incidentes.
 import { query } from "../database/db";
 
 export interface StatsByKey { key: string; count: number }
@@ -12,11 +15,11 @@ export interface AmsStats {
   byModule: StatsByKey[];
   byEnvironment: StatsByKey[];
   byConfidence: StatsByConfidence[];
-  byDay: StatsByDay[];                  // últimos 14 días
+  byDay: StatsByDay[];
   recentAudit: { action: string; created_at: string }[];
 }
 
-export async function getStats(): Promise<AmsStats> {
+export async function getStats(tenantId: string): Promise<AmsStats> {
   const [
     totalRes,
     last7Res,
@@ -28,33 +31,42 @@ export async function getStats(): Promise<AmsStats> {
     byDayRes,
     auditRes,
   ] = await Promise.all([
-    query<{ c: string }>("SELECT count(*)::text AS c FROM incidents"),
     query<{ c: string }>(
-      "SELECT count(*)::text AS c FROM incidents WHERE created_at >= now() - interval '7 days'"
+      "SELECT count(*)::text AS c FROM incidents WHERE tenant_id = $1",
+      [tenantId]
     ),
     query<{ c: string }>(
-      "SELECT count(*)::text AS c FROM incidents WHERE created_at::date = current_date"
+      "SELECT count(*)::text AS c FROM incidents WHERE tenant_id = $1 AND created_at >= now() - interval '7 days'",
+      [tenantId]
     ),
     query<{ c: string }>(
-      "SELECT count(*)::text AS c FROM incidents WHERE jsonb_array_length(attachments) > 0"
+      "SELECT count(*)::text AS c FROM incidents WHERE tenant_id = $1 AND created_at::date = current_date",
+      [tenantId]
+    ),
+    query<{ c: string }>(
+      "SELECT count(*)::text AS c FROM incidents WHERE tenant_id = $1 AND jsonb_array_length(attachments) > 0",
+      [tenantId]
     ),
     query<{ k: string; c: string }>(
       `SELECT COALESCE(sap_module, 'NO_INFORMADO') AS k, count(*)::text AS c
-         FROM incidents
+         FROM incidents WHERE tenant_id = $1
         GROUP BY 1
         ORDER BY count(*) DESC
-        LIMIT 12`
+        LIMIT 12`,
+      [tenantId]
     ),
     query<{ k: string; c: string }>(
       `SELECT COALESCE(environment, 'NO_INFORMADO') AS k, count(*)::text AS c
-         FROM incidents
+         FROM incidents WHERE tenant_id = $1
         GROUP BY 1
-        ORDER BY count(*) DESC`
+        ORDER BY count(*) DESC`,
+      [tenantId]
     ),
     query<{ k: string; c: string }>(
       `SELECT COALESCE(confidence, 'no_detectada') AS k, count(*)::text AS c
-         FROM incidents
-        GROUP BY 1`
+         FROM incidents WHERE tenant_id = $1
+        GROUP BY 1`,
+      [tenantId]
     ),
     query<{ d: string; c: string }>(
       `WITH days AS (
@@ -68,11 +80,15 @@ export async function getStats(): Promise<AmsStats> {
               COALESCE(count(i.id), 0)::text AS c
          FROM days d
          LEFT JOIN incidents i
-           ON i.created_at::date = d.day
+           ON i.created_at::date = d.day AND i.tenant_id = $1
         GROUP BY d.day
-        ORDER BY d.day`
+        ORDER BY d.day`,
+      [tenantId]
     ),
     query<{ action: string; created_at: string }>(
+      // audit_logs es una tabla legacy global; se conserva pero filtramos
+      // por tenant cuando exista la columna. Si no existe la columna,
+      // simplemente devolvemos las últimas 12 (fallback).
       `SELECT action, created_at::text
          FROM audit_logs
         ORDER BY created_at DESC

@@ -86,21 +86,24 @@ function mapEval(r: EvalRow): AgentEvaluation {
   };
 }
 
-export async function getSnapshot(): Promise<{ evaluations: AgentEvaluation[] }> {
+export async function getSnapshot(tenantId: string): Promise<{ evaluations: AgentEvaluation[] }> {
   await ensureSchema();
-  const r = await query<EvalRow>("SELECT * FROM agent_evaluations ORDER BY created_at DESC LIMIT 1000");
+  const r = await query<EvalRow>(
+    "SELECT * FROM agent_evaluations WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1000",
+    [tenantId]
+  );
   return { evaluations: r.rows.map(mapEval) };
 }
 
-export async function upsertEvaluation(e: AgentEvaluation): Promise<AgentEvaluation> {
+export async function upsertEvaluation(tenantId: string, e: AgentEvaluation): Promise<AgentEvaluation> {
   await ensureSchema();
   const now = new Date().toISOString();
   const res = await query<EvalRow>(
-    `INSERT INTO agent_evaluations (id,incident_id,response_text,evaluator,role,
+    `INSERT INTO agent_evaluations (id,tenant_id,incident_id,response_text,evaluator,role,
        accuracy_score,usefulness_score,clarity_score,completeness_score,
        hallucination_risk,technical_level_fit,needs_human_review,can_become_knowledge,
        was_useful_for_client,requires_escalation,comments,created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
      ON CONFLICT (id) DO UPDATE SET
        response_text=EXCLUDED.response_text, evaluator=EXCLUDED.evaluator, role=EXCLUDED.role,
        accuracy_score=EXCLUDED.accuracy_score, usefulness_score=EXCLUDED.usefulness_score,
@@ -109,8 +112,9 @@ export async function upsertEvaluation(e: AgentEvaluation): Promise<AgentEvaluat
        needs_human_review=EXCLUDED.needs_human_review, can_become_knowledge=EXCLUDED.can_become_knowledge,
        was_useful_for_client=EXCLUDED.was_useful_for_client, requires_escalation=EXCLUDED.requires_escalation,
        comments=EXCLUDED.comments
+     WHERE agent_evaluations.tenant_id = EXCLUDED.tenant_id
      RETURNING *`,
-    [e.id, e.incidentId, e.responseText, e.evaluator, e.role,
+    [e.id, tenantId, e.incidentId, e.responseText, e.evaluator, e.role,
      e.accuracyScore, e.usefulnessScore, e.clarityScore, e.completenessScore,
      e.hallucinationRisk, e.technicalLevelFit, e.needsHumanReview, e.canBecomeKnowledge,
      e.wasUsefulForClient, e.requiresEscalation, e.comments, e.createdAt || now]
@@ -118,12 +122,12 @@ export async function upsertEvaluation(e: AgentEvaluation): Promise<AgentEvaluat
   return mapEval(res.rows[0]);
 }
 
-export async function deleteEvaluation(id: string): Promise<void> {
+export async function deleteEvaluation(tenantId: string, id: string): Promise<void> {
   await ensureSchema();
-  await query("DELETE FROM agent_evaluations WHERE id = $1", [id]);
+  await query("DELETE FROM agent_evaluations WHERE id = $1 AND tenant_id = $2", [id, tenantId]);
 }
 
-export async function resetDemo(): Promise<void> {
+export async function resetDemo(tenantId: string): Promise<void> {
   await ensureSchema();
-  await query("DELETE FROM agent_evaluations");
+  await query("DELETE FROM agent_evaluations WHERE tenant_id = $1", [tenantId]);
 }

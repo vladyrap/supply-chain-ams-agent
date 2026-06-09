@@ -126,15 +126,15 @@ async function extractStepsWithGemini(transcript: string): Promise<{ steps: Vide
  * Devuelve transcript + pasos sugeridos. NO escribe nada en la DB —
  * el frontend decide si aplicarlos al escenario.
  */
-export async function analyzeVideoEvidence(evidenceId: string, language = "es"): Promise<VideoAnalysisResult> {
-  const ev = await testing.getEvidence(evidenceId);
+export async function analyzeVideoEvidence(tenantId: string, evidenceId: string, language = "es"): Promise<VideoAnalysisResult> {
+  const ev = await testing.getEvidence(tenantId, evidenceId);
   if (!ev) throw new Error("Evidencia no encontrada");
   if (!ev.storagePath) throw new Error("Esta evidencia no tiene archivo (probablemente fallback ObjectURL local)");
   if (ev.type !== "SCREEN_RECORDING" && ev.type !== "UPLOADED_VIDEO") {
     throw new Error(`Tipo de evidencia "${ev.type}" no soporta análisis de video`);
   }
 
-  const buffer = await testing.readEvidenceFile(ev.storagePath);
+  const buffer = await testing.readEvidenceFile(tenantId, ev.storagePath);
   logger.info({ evidenceId, bytes: buffer.length }, "testing video: enviando a Whisper");
 
   const whisper = await callWhisper(buffer, ev.fileName || "video.webm", ev.fileType || "video/webm", language);

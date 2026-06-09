@@ -36,7 +36,7 @@ export interface TimelineResponse {
   drift: DriftReport;
 }
 
-export async function getEvalTimeline(daysBack = 30, driftThreshold = 10): Promise<TimelineResponse> {
+export async function getEvalTimeline(tenantId: string, daysBack = 30, driftThreshold = 10): Promise<TimelineResponse> {
   const safeDays = Math.max(7, Math.min(180, daysBack));
   let points: TimelinePoint[] = [];
   try {
@@ -50,9 +50,10 @@ export async function getEvalTimeline(daysBack = 30, driftThreshold = 10): Promi
               COALESCE(round(avg(CASE WHEN total_qas > 0 THEN passed * 100.0 / total_qas ELSE 0 END), 0)::int, 0)::text AS pass_rate
          FROM qa_eval_runs
         WHERE started_at > now() - ($1 || ' days')::interval
+          AND tenant_id = $2
         GROUP BY date_trunc('day', started_at)
         ORDER BY day ASC`,
-      [String(safeDays)]
+      [String(safeDays), tenantId]
     );
     points = rows.map((r) => ({
       date: r.day,
@@ -83,7 +84,9 @@ export async function getEvalTimeline(daysBack = 30, driftThreshold = 10): Promi
        FROM qa_eval_runs
        WHERE started_at > now() - interval '14 days'
          AND total_qas > 0
-       GROUP BY 1`
+         AND tenant_id = $1
+       GROUP BY 1`,
+      [tenantId]
     );
     for (const r of rows) {
       if (r.window === "current") {

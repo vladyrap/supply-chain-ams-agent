@@ -47,16 +47,25 @@ interface RetrieveFilters {
   client?: string;
 }
 
+/**
+ * MT-3 (multi-tenant): retrieveRelevantChunks recibe tenantId obligatorio.
+ * CRITICAL: el filter por tenant_id va ANTES del ORDER BY pgvector para no
+ * filtrar después de calcular la distancia (eso devolvería 0 resultados si
+ * los top-K son de otros tenants).
+ */
 export async function retrieveRelevantChunks(
+  tenantId: string,
   questionText: string,
   filters: RetrieveFilters = {}
 ): Promise<RetrievedChunk[]> {
   if (!RAG_ENABLED) return [];
   if (!questionText.trim()) return [];
 
-  // ¿Hay items indexados? Evita query vectorial sobre tabla vacía.
+  // ¿Hay items indexados para este tenant? Evita query vectorial sobre tabla vacía.
   const { rows: countRows } = await query<{ c: string }>(
-    `SELECT count(*)::text AS c FROM knowledge_items WHERE status = 'indexed' AND embedding IS NOT NULL`
+    `SELECT count(*)::text AS c FROM knowledge_items
+      WHERE tenant_id = $1 AND status = 'indexed' AND embedding IS NOT NULL`,
+    [tenantId]
   );
   const total = Number(countRows[0]?.c ?? 0);
   if (total === 0) return [];
@@ -69,9 +78,13 @@ export async function retrieveRelevantChunks(
     return [];
   }
 
-  // Filtros opcionales. Usamos cosine distance (1 - similarity).
-  const conds: string[] = ["status = 'indexed'", "embedding IS NOT NULL"];
-  const params: unknown[] = [];
+  // Filtros opcionales. tenant_id PRIMERO en el WHERE (sello duro de aislamiento).
+  const conds: string[] = [
+    "tenant_id = $1",
+    "status = 'indexed'",
+    "embedding IS NOT NULL",
+  ];
+  const params: unknown[] = [tenantId];
   if (filters.module && filters.module !== "NO_INFORMADO") {
     params.push(filters.module);
     conds.push(`(module IS NULL OR module = $${params.length})`);
@@ -85,6 +98,9 @@ export async function retrieveRelevantChunks(
   params.push(TOP_K);
   const limitParam = `$${params.length}`;
 
+  // El WHERE tenant_id se evalúa ANTES del ORDER BY vector — Postgres
+  // aplica los predicados de filtro al index scan, así garantizamos que
+  // los K vecinos elegidos pertenezcan SOLO a este tenant.
   const { rows } = await query<{
     id: string; document_id: string; title: string; source_type: string; source_file: string;
     module: string | null; client: string | null; chunk_index: number; content: string;

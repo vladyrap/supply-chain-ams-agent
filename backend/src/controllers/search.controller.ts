@@ -27,7 +27,7 @@ export async function getSearch(
   const limit = req.query.limit ? parseInt(req.query.limit, 10) : 20;
 
   try {
-    const hits = await semanticSearch({ query: q, limit, types });
+    const hits = await semanticSearch({ tenantId: req.tenantId, query: q, limit, types });
     const grouped: Record<string, typeof hits> = {};
     for (const h of hits) {
       if (!grouped[h.source_type]) grouped[h.source_type] = [];
@@ -46,9 +46,9 @@ export async function postReindex(
 ) {
   const force = req.query.force === "true";
   try {
-    logger.info({ force }, "reindex.start");
-    const stats = await reindexAll({ force });
-    logger.info({ stats }, "reindex.done");
+    logger.info({ tenantId: req.tenantId, force }, "reindex.start");
+    const stats = await reindexAll(req.tenantId, { force });
+    logger.info({ tenantId: req.tenantId, stats }, "reindex.done");
     return reply.send({ success: true, ...stats });
   } catch (err) {
     logger.error({ err }, "reindex fail");
@@ -56,11 +56,12 @@ export async function postReindex(
   }
 }
 
-export async function getSearchStatsRoute(_req: FastifyRequest, reply: FastifyReply) {
+export async function getSearchStatsRoute(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const stats = await getSearchStats();
+    const stats = await getSearchStats(req.tenantId);
     return reply.send({ success: true, ...stats });
   } catch (err) {
+    logger.error({ err }, "search.stats fail");
     return reply.code(500).send({ success: false, error: "Error" });
   }
 }

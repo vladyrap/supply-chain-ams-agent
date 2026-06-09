@@ -109,7 +109,7 @@ export async function postCreateDestination(
   if (!v.ok) return reply.code(400).send({ success: false, error: v.error });
   try {
     const me = await getUserId(req);
-    const d = await createDestination({
+    const d = await createDestination(req.tenantId, {
       name: b.name,
       type: b.type,
       config: v.cfg,
@@ -124,9 +124,9 @@ export async function postCreateDestination(
   }
 }
 
-export async function getDestinations(_req: FastifyRequest, reply: FastifyReply) {
+export async function getDestinations(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const list = await listDestinations();
+    const list = await listDestinations(req.tenantId);
     return reply.send({ success: true, count: list.length, destinations: list });
   } catch (err) {
     logger.error({ err }, "list destinations fail");
@@ -139,7 +139,7 @@ export async function getDestinationDetail(
   reply: FastifyReply
 ) {
   try {
-    const d = await getDestinationById(req.params.id);
+    const d = await getDestinationById(req.tenantId, req.params.id);
     if (!d) return reply.code(404).send({ success: false, error: "no encontrada" });
     return reply.send({ success: true, destination: d });
   } catch (err) {
@@ -159,7 +159,7 @@ export async function patchDestination(
   reply: FastifyReply
 ) {
   try {
-    const existing = await getDestinationById(req.params.id);
+    const existing = await getDestinationById(req.tenantId, req.params.id);
     if (!existing) return reply.code(404).send({ success: false, error: "no encontrada" });
     const b = req.body || {};
     let cfgValidated: DestinationConfig | undefined;
@@ -168,7 +168,7 @@ export async function patchDestination(
       if (!v.ok) return reply.code(400).send({ success: false, error: v.error });
       cfgValidated = v.cfg;
     }
-    const d = await updateDestination(req.params.id, {
+    const d = await updateDestination(req.tenantId, req.params.id, {
       name: b.name,
       config: cfgValidated,
       event_filter: b.event_filter,
@@ -186,7 +186,7 @@ export async function delDestination(
   reply: FastifyReply
 ) {
   try {
-    const ok = await deleteDestination(req.params.id);
+    const ok = await deleteDestination(req.tenantId, req.params.id);
     if (!ok) return reply.code(404).send({ success: false, error: "no encontrada" });
     return reply.send({ success: true });
   } catch (err) {
@@ -199,7 +199,7 @@ export async function postTestDestination(
   reply: FastifyReply
 ) {
   try {
-    const result = await testDestination(req.params.id);
+    const result = await testDestination(req.tenantId, req.params.id);
     return reply.send({ success: true, result });
   } catch (err) {
     logger.error({ err }, "test destination fail");
@@ -221,7 +221,7 @@ export async function getDeliveries(
   reply: FastifyReply
 ) {
   try {
-    const data = await listDeliveries({
+    const data = await listDeliveries(req.tenantId, {
       destinationId: req.query.destinationId,
       status: req.query.status,
       eventType: req.query.eventType,
@@ -245,7 +245,7 @@ export async function postEmit(
   const b = req.body || {};
   if (!b.eventType) return reply.code(400).send({ success: false, error: "eventType obligatorio" });
   try {
-    await emitEvent(b.eventType, b.data ?? {});
+    await emitEvent(req.tenantId, b.eventType, b.data ?? {});
     return reply.send({ success: true });
   } catch (err) {
     logger.error({ err }, "emit fail");

@@ -10,8 +10,11 @@ import { join } from "path";
 import { query } from "../database/db";
 import { logger } from "../utils/logger";
 
+// Multi-tenant: todas las funciones reciben tenantId (Sprint 3 ALTOS).
+// El path de uploads incluye tenantId para que un cliente no pueda predecir
+// paths de otro cliente.
 let schemaEnsured = false;
-let seeded = false;
+const seededTenants = new Set<string>();
 
 // ============================================================================
 // Tipos (mirror del frontend)
@@ -157,9 +160,14 @@ export interface TestingSettings {
 
 const UPLOADS_ROOT = process.env.TESTING_UPLOADS_DIR || "/app/uploads/testing";
 
-async function ensureScenarioDir(scenarioId: string): Promise<string> {
-  const safe = scenarioId.replace(/[^a-zA-Z0-9_-]/g, "_");
-  const dir = join(UPLOADS_ROOT, safe);
+function safeId(raw: string): string {
+  return (raw || "").replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+async function ensureScenarioDir(tenantId: string, scenarioId: string): Promise<string> {
+  // Path layout: {UPLOADS_ROOT}/tenants/{tenantId}/{scenarioId}/
+  // Aislamos por tenantId para que un cliente no pueda predecir el path de otro.
+  const dir = join(UPLOADS_ROOT, "tenants", safeId(tenantId), safeId(scenarioId));
   await fs.mkdir(dir, { recursive: true });
   return dir;
 }
@@ -169,20 +177,27 @@ function safeName(original?: string): string {
   return base.length > 0 ? base : "evidence";
 }
 
-export async function saveUploadedFile(scenarioId: string, fileName: string, buffer: Buffer): Promise<string> {
-  const dir = await ensureScenarioDir(scenarioId);
+export async function saveUploadedFile(tenantId: string, scenarioId: string, fileName: string, buffer: Buffer): Promise<string> {
+  const dir = await ensureScenarioDir(tenantId, scenarioId);
   const safe = safeName(fileName);
   const final = `${Date.now()}_${safe}`;
   const full = join(dir, final);
   await fs.writeFile(full, buffer);
   // Devuelve path relativo respecto a UPLOADS_ROOT para guardar en DB.
-  return `${scenarioId.replace(/[^a-zA-Z0-9_-]/g, "_")}/${final}`;
+  // Formato: tenants/{tenantId}/{scenarioId}/{file}
+  return `tenants/${safeId(tenantId)}/${safeId(scenarioId)}/${final}`;
 }
 
-export async function readEvidenceFile(storagePath: string): Promise<Buffer> {
+export async function readEvidenceFile(tenantId: string, storagePath: string): Promise<Buffer> {
   // Sanitización agresiva: nada de "..", nada de /, sólo subdirectorios y archivos esperados.
   if (!storagePath || storagePath.includes("..") || storagePath.startsWith("/")) {
     throw new Error("invalid storagePath");
+  }
+  // Validar que el path empiece con el prefijo del tenant — defensa profunda
+  // contra paths viejos (pre-multi-tenant) o intentos de cross-tenant access.
+  const expectedPrefix = `tenants/${safeId(tenantId)}/`;
+  if (!storagePath.startsWith(expectedPrefix)) {
+    throw new Error("storagePath no pertenece al tenant");
   }
   const full = join(UPLOADS_ROOT, storagePath);
   return fs.readFile(full);
@@ -308,14 +323,18 @@ async function ensureSchema(): Promise<void> {
     `);
     await query(`CREATE INDEX IF NOT EXISTS idx_test_man_scenario ON testing_manuals(scenario_id);`);
 
+    // Singleton: ahora UNIQUE composite (tenant_id, id) — un row por tenant.
     await query(`
       CREATE TABLE IF NOT EXISTS testing_settings (
-        id      INTEGER PRIMARY KEY DEFAULT 1,
+        id      INTEGER NOT NULL DEFAULT 1,
         payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        CHECK (id = 1)
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
+    try {
+      await query(`ALTER TABLE testing_settings DROP CONSTRAINT IF EXISTS testing_settings_pkey`);
+    } catch { /* ignore */ }
+    await query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_testing_settings_tenant ON testing_settings(tenant_id, id)`);
     schemaEnsured = true;
   } catch (err) {
     logger.warn({ err }, "ensure testing schema failed");
@@ -484,18 +503,22 @@ function seedSettings(): TestingSettings {
   };
 }
 
-async function seedIfEmpty(): Promise<void> {
-  if (seeded) return;
+async function seedIfEmpty(tenantId: string): Promise<void> {
+  if (seededTenants.has(tenantId)) return;
   try {
-    const sc = await query<{ c: string }>("SELECT count(*)::text AS c FROM testing_scenarios");
+    const sc = await query<{ c: string }>(
+      "SELECT count(*)::text AS c FROM testing_scenarios WHERE tenant_id = $1",
+      [tenantId]
+    );
     if (Number(sc.rows[0]?.c || "0") === 0) {
       for (const s of seedScenarios()) {
         await query(
-          `INSERT INTO testing_scenarios (id,title,description,sap_module,process,sub_process,scope_item_ids,
+          `INSERT INTO testing_scenarios (tenant_id,id,title,description,sap_module,process,sub_process,scope_item_ids,
              test_type,environment,status,result,owner,prerequisites,test_data,steps,expected_result,actual_result,
              evidence_ids,defect_ids,generated_script,generated_manual,cloud_alm_ready,tags,created_at,updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
-          [s.id, s.title, s.description, s.sapModule, s.process, s.subProcess || null,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+           ON CONFLICT (id) DO NOTHING`,
+          [tenantId, s.id, s.title, s.description, s.sapModule, s.process, s.subProcess || null,
            s.scopeItemIds, s.testType, s.environment, s.status, s.result || null, s.owner,
            s.prerequisites, s.testData, JSON.stringify(s.steps), s.expectedResult, s.actualResult || null,
            s.evidenceIds, s.defectIds, s.generatedScript || null, s.generatedManual || null,
@@ -503,49 +526,60 @@ async function seedIfEmpty(): Promise<void> {
         );
       }
     }
-    const ev = await query<{ c: string }>("SELECT count(*)::text AS c FROM testing_evidences");
+    const ev = await query<{ c: string }>(
+      "SELECT count(*)::text AS c FROM testing_evidences WHERE tenant_id = $1",
+      [tenantId]
+    );
     if (Number(ev.rows[0]?.c || "0") === 0) {
       for (const e of seedEvidences()) {
         await query(
-          `INSERT INTO testing_evidences (id,scenario_id,step_id,type,title,description,file_name,file_type,
+          `INSERT INTO testing_evidences (tenant_id,id,scenario_id,step_id,type,title,description,file_name,file_type,
              file_size,duration_seconds,storage_path,external_url,note_text,tags,created_at,created_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
-          [e.id, e.scenarioId, e.stepId || null, e.type, e.title, e.description || null,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+           ON CONFLICT (id) DO NOTHING`,
+          [tenantId, e.id, e.scenarioId, e.stepId || null, e.type, e.title, e.description || null,
            e.fileName || null, e.fileType || null, e.fileSize || null, e.durationSeconds || null,
            e.storagePath || null, e.externalUrl || null, e.noteText || null, e.tags,
            e.createdAt, e.createdBy]
         );
       }
     }
-    const df = await query<{ c: string }>("SELECT count(*)::text AS c FROM testing_defects");
+    const df = await query<{ c: string }>(
+      "SELECT count(*)::text AS c FROM testing_defects WHERE tenant_id = $1",
+      [tenantId]
+    );
     if (Number(df.rows[0]?.c || "0") === 0) {
       for (const d of seedDefects()) {
         await query(
-          `INSERT INTO testing_defects (id,scenario_id,title,description,severity,priority,status,assigned_to,
+          `INSERT INTO testing_defects (tenant_id,id,scenario_id,title,description,severity,priority,status,assigned_to,
              evidence_ids,steps_to_reproduce,expected_result,actual_result,jira_ticket_id,cloud_alm_ticket_id,
              converted_to_incident_id,created_at,updated_at,created_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
-          [d.id, d.scenarioId, d.title, d.description, d.severity, d.priority, d.status,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+           ON CONFLICT (id) DO NOTHING`,
+          [tenantId, d.id, d.scenarioId, d.title, d.description, d.severity, d.priority, d.status,
            d.assignedTo || null, d.evidenceIds, d.stepsToReproduce, d.expectedResult, d.actualResult,
            d.jiraTicketId || null, d.cloudAlmTicketId || null, d.convertedToIncidentId || null,
            d.createdAt, d.updatedAt, d.createdBy]
         );
       }
     }
-    const st = await query<{ c: string }>("SELECT count(*)::text AS c FROM testing_settings");
+    const st = await query<{ c: string }>(
+      "SELECT count(*)::text AS c FROM testing_settings WHERE tenant_id = $1",
+      [tenantId]
+    );
     if (Number(st.rows[0]?.c || "0") === 0) {
-      await query(`INSERT INTO testing_settings (id, payload) VALUES (1, $1::jsonb)`,
-        [JSON.stringify(seedSettings())]);
+      await query(`INSERT INTO testing_settings (tenant_id, id, payload) VALUES ($1, 1, $2::jsonb)`,
+        [tenantId, JSON.stringify(seedSettings())]);
     }
-    seeded = true;
+    seededTenants.add(tenantId);
   } catch (err) {
     logger.warn({ err }, "seed testing failed");
   }
 }
 
-async function ready(): Promise<void> {
+async function ready(tenantId: string): Promise<void> {
   await ensureSchema();
-  await seedIfEmpty();
+  await seedIfEmpty(tenantId);
 }
 
 // ============================================================================
@@ -648,20 +682,35 @@ function mapManual(r: ManualRow): GeneratedUserManual {
 // Snapshot
 // ============================================================================
 
-export async function getSnapshot(): Promise<{
+export async function getSnapshot(tenantId: string): Promise<{
   scenarios: TestingScenario[];
   evidences: EvidenceItem[];
   defects: TestDefect[];
   manuals: GeneratedUserManual[];
   settings: TestingSettings;
 }> {
-  await ready();
+  await ready(tenantId);
   const [scR, evR, dfR, mnR, stR] = await Promise.all([
-    query<ScenarioRow>("SELECT * FROM testing_scenarios ORDER BY updated_at DESC"),
-    query<EvidenceRow>("SELECT * FROM testing_evidences ORDER BY created_at DESC LIMIT 1000"),
-    query<DefectRow>("SELECT * FROM testing_defects ORDER BY created_at DESC LIMIT 500"),
-    query<ManualRow>("SELECT * FROM testing_manuals ORDER BY updated_at DESC LIMIT 200"),
-    query<{ payload: TestingSettings }>("SELECT payload FROM testing_settings WHERE id = 1"),
+    query<ScenarioRow>(
+      "SELECT * FROM testing_scenarios WHERE tenant_id = $1 ORDER BY updated_at DESC",
+      [tenantId]
+    ),
+    query<EvidenceRow>(
+      "SELECT * FROM testing_evidences WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1000",
+      [tenantId]
+    ),
+    query<DefectRow>(
+      "SELECT * FROM testing_defects WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 500",
+      [tenantId]
+    ),
+    query<ManualRow>(
+      "SELECT * FROM testing_manuals WHERE tenant_id = $1 ORDER BY updated_at DESC LIMIT 200",
+      [tenantId]
+    ),
+    query<{ payload: TestingSettings }>(
+      "SELECT payload FROM testing_settings WHERE tenant_id = $1 AND id = 1",
+      [tenantId]
+    ),
   ]);
   return {
     scenarios: scR.rows.map(mapScenario),
@@ -676,14 +725,14 @@ export async function getSnapshot(): Promise<{
 // Scenarios CRUD
 // ============================================================================
 
-export async function upsertScenario(s: TestingScenario): Promise<TestingScenario> {
-  await ready();
+export async function upsertScenario(tenantId: string, s: TestingScenario): Promise<TestingScenario> {
+  await ready(tenantId);
   const now = new Date().toISOString();
   const res = await query<ScenarioRow>(
-    `INSERT INTO testing_scenarios (id,title,description,sap_module,process,sub_process,scope_item_ids,
+    `INSERT INTO testing_scenarios (tenant_id,id,title,description,sap_module,process,sub_process,scope_item_ids,
        test_type,environment,status,result,owner,prerequisites,test_data,steps,expected_result,actual_result,
        evidence_ids,defect_ids,generated_script,generated_manual,cloud_alm_ready,tags,created_at,updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
      ON CONFLICT (id) DO UPDATE SET
        title=EXCLUDED.title, description=EXCLUDED.description, sap_module=EXCLUDED.sap_module,
        process=EXCLUDED.process, sub_process=EXCLUDED.sub_process, scope_item_ids=EXCLUDED.scope_item_ids,
@@ -694,8 +743,9 @@ export async function upsertScenario(s: TestingScenario): Promise<TestingScenari
        defect_ids=EXCLUDED.defect_ids, generated_script=EXCLUDED.generated_script,
        generated_manual=EXCLUDED.generated_manual, cloud_alm_ready=EXCLUDED.cloud_alm_ready,
        tags=EXCLUDED.tags, updated_at=EXCLUDED.updated_at
+     WHERE testing_scenarios.tenant_id = $1
      RETURNING *`,
-    [s.id, s.title, s.description, s.sapModule, s.process, s.subProcess || null,
+    [tenantId, s.id, s.title, s.description, s.sapModule, s.process, s.subProcess || null,
      s.scopeItemIds, s.testType, s.environment, s.status, s.result || null, s.owner,
      s.prerequisites, s.testData, JSON.stringify(s.steps || []), s.expectedResult,
      s.actualResult || null, s.evidenceIds || [], s.defectIds || [],
@@ -705,58 +755,68 @@ export async function upsertScenario(s: TestingScenario): Promise<TestingScenari
   return mapScenario(res.rows[0]);
 }
 
-export async function deleteScenario(id: string): Promise<void> {
-  await ready();
+export async function deleteScenario(tenantId: string, id: string): Promise<void> {
+  await ready(tenantId);
   // Borrar archivos físicos asociados a evidencias del escenario
-  const evs = await query<EvidenceRow>("SELECT storage_path FROM testing_evidences WHERE scenario_id = $1", [id]);
+  const evs = await query<EvidenceRow>(
+    "SELECT storage_path FROM testing_evidences WHERE scenario_id = $1 AND tenant_id = $2",
+    [id, tenantId]
+  );
   for (const e of evs.rows) {
     await deleteEvidenceFile(e.storage_path);
   }
-  await query("DELETE FROM testing_scenarios WHERE id = $1", [id]);
+  await query("DELETE FROM testing_scenarios WHERE id = $1 AND tenant_id = $2", [id, tenantId]);
 }
 
 // ============================================================================
 // Evidences CRUD
 // ============================================================================
 
-export async function createEvidence(e: EvidenceItem): Promise<EvidenceItem> {
-  await ready();
+export async function createEvidence(tenantId: string, e: EvidenceItem): Promise<EvidenceItem> {
+  await ready(tenantId);
   const res = await query<EvidenceRow>(
-    `INSERT INTO testing_evidences (id,scenario_id,step_id,type,title,description,file_name,file_type,
+    `INSERT INTO testing_evidences (tenant_id,id,scenario_id,step_id,type,title,description,file_name,file_type,
        file_size,duration_seconds,storage_path,external_url,note_text,tags,created_at,created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
      RETURNING *`,
-    [e.id, e.scenarioId, e.stepId || null, e.type, e.title, e.description || null,
+    [tenantId, e.id, e.scenarioId, e.stepId || null, e.type, e.title, e.description || null,
      e.fileName || null, e.fileType || null, e.fileSize || null,
      e.durationSeconds || null, e.storagePath || null,
      e.externalUrl || null, e.noteText || null, e.tags || [],
      e.createdAt, e.createdBy]
   );
-  // Push al array evidence_ids del scenario
+  // Push al array evidence_ids del scenario (scoped por tenant)
   await query(
     `UPDATE testing_scenarios SET evidence_ids = array_append(evidence_ids, $1), updated_at = now()
-     WHERE id = $2 AND NOT ($1 = ANY(evidence_ids))`,
-    [e.id, e.scenarioId]
+     WHERE id = $2 AND tenant_id = $3 AND NOT ($1 = ANY(evidence_ids))`,
+    [e.id, e.scenarioId, tenantId]
   );
   return mapEvidence(res.rows[0]);
 }
 
-export async function deleteEvidence(id: string): Promise<void> {
-  await ready();
-  const cur = await query<EvidenceRow>("SELECT * FROM testing_evidences WHERE id = $1", [id]);
+export async function deleteEvidence(tenantId: string, id: string): Promise<void> {
+  await ready(tenantId);
+  const cur = await query<EvidenceRow>(
+    "SELECT * FROM testing_evidences WHERE id = $1 AND tenant_id = $2",
+    [id, tenantId]
+  );
   if (cur.rowCount === 0) return;
   const ev = cur.rows[0];
   await deleteEvidenceFile(ev.storage_path);
-  await query("DELETE FROM testing_evidences WHERE id = $1", [id]);
+  await query("DELETE FROM testing_evidences WHERE id = $1 AND tenant_id = $2", [id, tenantId]);
   await query(
-    "UPDATE testing_scenarios SET evidence_ids = array_remove(evidence_ids, $1), updated_at = now() WHERE id = $2",
-    [id, ev.scenario_id]
+    `UPDATE testing_scenarios SET evidence_ids = array_remove(evidence_ids, $1), updated_at = now()
+     WHERE id = $2 AND tenant_id = $3`,
+    [id, ev.scenario_id, tenantId]
   );
 }
 
-export async function getEvidence(id: string): Promise<EvidenceItem | null> {
-  await ready();
-  const r = await query<EvidenceRow>("SELECT * FROM testing_evidences WHERE id = $1", [id]);
+export async function getEvidence(tenantId: string, id: string): Promise<EvidenceItem | null> {
+  await ready(tenantId);
+  const r = await query<EvidenceRow>(
+    "SELECT * FROM testing_evidences WHERE id = $1 AND tenant_id = $2",
+    [id, tenantId]
+  );
   return r.rowCount === 0 ? null : mapEvidence(r.rows[0]);
 }
 
@@ -764,14 +824,14 @@ export async function getEvidence(id: string): Promise<EvidenceItem | null> {
 // Defects CRUD
 // ============================================================================
 
-export async function upsertDefect(d: TestDefect): Promise<TestDefect> {
-  await ready();
+export async function upsertDefect(tenantId: string, d: TestDefect): Promise<TestDefect> {
+  await ready(tenantId);
   const now = new Date().toISOString();
   const res = await query<DefectRow>(
-    `INSERT INTO testing_defects (id,scenario_id,title,description,severity,priority,status,assigned_to,
+    `INSERT INTO testing_defects (tenant_id,id,scenario_id,title,description,severity,priority,status,assigned_to,
        evidence_ids,steps_to_reproduce,expected_result,actual_result,jira_ticket_id,cloud_alm_ticket_id,
        converted_to_incident_id,created_at,updated_at,created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
      ON CONFLICT (id) DO UPDATE SET
        title=EXCLUDED.title, description=EXCLUDED.description, severity=EXCLUDED.severity,
        priority=EXCLUDED.priority, status=EXCLUDED.status, assigned_to=EXCLUDED.assigned_to,
@@ -780,28 +840,33 @@ export async function upsertDefect(d: TestDefect): Promise<TestDefect> {
        jira_ticket_id=EXCLUDED.jira_ticket_id, cloud_alm_ticket_id=EXCLUDED.cloud_alm_ticket_id,
        converted_to_incident_id=EXCLUDED.converted_to_incident_id,
        updated_at=EXCLUDED.updated_at
+     WHERE testing_defects.tenant_id = $1
      RETURNING *`,
-    [d.id, d.scenarioId, d.title, d.description, d.severity, d.priority, d.status,
+    [tenantId, d.id, d.scenarioId, d.title, d.description, d.severity, d.priority, d.status,
      d.assignedTo || null, d.evidenceIds || [], d.stepsToReproduce, d.expectedResult, d.actualResult,
      d.jiraTicketId || null, d.cloudAlmTicketId || null, d.convertedToIncidentId || null,
      d.createdAt || now, now, d.createdBy]
   );
   await query(
     `UPDATE testing_scenarios SET defect_ids = array_append(defect_ids, $1), updated_at = now()
-     WHERE id = $2 AND NOT ($1 = ANY(defect_ids))`,
-    [d.id, d.scenarioId]
+     WHERE id = $2 AND tenant_id = $3 AND NOT ($1 = ANY(defect_ids))`,
+    [d.id, d.scenarioId, tenantId]
   );
   return mapDefect(res.rows[0]);
 }
 
-export async function deleteDefect(id: string): Promise<void> {
-  await ready();
-  const cur = await query<DefectRow>("SELECT * FROM testing_defects WHERE id = $1", [id]);
+export async function deleteDefect(tenantId: string, id: string): Promise<void> {
+  await ready(tenantId);
+  const cur = await query<DefectRow>(
+    "SELECT * FROM testing_defects WHERE id = $1 AND tenant_id = $2",
+    [id, tenantId]
+  );
   if (cur.rowCount === 0) return;
-  await query("DELETE FROM testing_defects WHERE id = $1", [id]);
+  await query("DELETE FROM testing_defects WHERE id = $1 AND tenant_id = $2", [id, tenantId]);
   await query(
-    "UPDATE testing_scenarios SET defect_ids = array_remove(defect_ids, $1), updated_at = now() WHERE id = $2",
-    [id, cur.rows[0].scenario_id]
+    `UPDATE testing_scenarios SET defect_ids = array_remove(defect_ids, $1), updated_at = now()
+     WHERE id = $2 AND tenant_id = $3`,
+    [id, cur.rows[0].scenario_id, tenantId]
   );
 }
 
@@ -809,30 +874,34 @@ export async function deleteDefect(id: string): Promise<void> {
 // Manuals CRUD
 // ============================================================================
 
-export async function upsertManual(m: GeneratedUserManual): Promise<GeneratedUserManual> {
-  await ready();
-  // Política: un manual por escenario. Si ya existe, lo reemplazamos.
-  await query("DELETE FROM testing_manuals WHERE scenario_id = $1 AND id <> $2", [m.scenarioId, m.id]);
+export async function upsertManual(tenantId: string, m: GeneratedUserManual): Promise<GeneratedUserManual> {
+  await ready(tenantId);
+  // Política: un manual por escenario. Si ya existe, lo reemplazamos (scoped por tenant).
+  await query(
+    "DELETE FROM testing_manuals WHERE scenario_id = $1 AND id <> $2 AND tenant_id = $3",
+    [m.scenarioId, m.id, tenantId]
+  );
   const now = new Date().toISOString();
   const res = await query<ManualRow>(
-    `INSERT INTO testing_manuals (id,scenario_id,title,objective,audience,prerequisites,steps,expected_result,
+    `INSERT INTO testing_manuals (tenant_id,id,scenario_id,title,objective,audience,prerequisites,steps,expected_result,
        common_errors,faqs,evidence_ids,support_contact,language,content_markdown,created_at,updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10::jsonb,$11,$12,$13,$14,$15,$16)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17)
      ON CONFLICT (id) DO UPDATE SET
        title=EXCLUDED.title, objective=EXCLUDED.objective, audience=EXCLUDED.audience,
        prerequisites=EXCLUDED.prerequisites, steps=EXCLUDED.steps, expected_result=EXCLUDED.expected_result,
        common_errors=EXCLUDED.common_errors, faqs=EXCLUDED.faqs, evidence_ids=EXCLUDED.evidence_ids,
        support_contact=EXCLUDED.support_contact, language=EXCLUDED.language,
        content_markdown=EXCLUDED.content_markdown, updated_at=EXCLUDED.updated_at
+     WHERE testing_manuals.tenant_id = $1
      RETURNING *`,
-    [m.id, m.scenarioId, m.title, m.objective, m.audience, m.prerequisites,
+    [tenantId, m.id, m.scenarioId, m.title, m.objective, m.audience, m.prerequisites,
      JSON.stringify(m.steps || []), m.expectedResult, m.commonErrors || [],
      JSON.stringify(m.faqs || []), m.evidenceIds || [], m.supportContact,
      m.language, m.contentMarkdown, m.createdAt || now, now]
   );
   await query(
-    "UPDATE testing_scenarios SET generated_manual = $1, updated_at = now() WHERE id = $2",
-    [m.contentMarkdown, m.scenarioId]
+    "UPDATE testing_scenarios SET generated_manual = $1, updated_at = now() WHERE id = $2 AND tenant_id = $3",
+    [m.contentMarkdown, m.scenarioId, tenantId]
   );
   return mapManual(res.rows[0]);
 }
@@ -841,26 +910,38 @@ export async function upsertManual(m: GeneratedUserManual): Promise<GeneratedUse
 // Settings + reset
 // ============================================================================
 
-export async function updateSettings(patch: Partial<TestingSettings>): Promise<TestingSettings> {
-  await ready();
-  const cur = await query<{ payload: TestingSettings }>("SELECT payload FROM testing_settings WHERE id = 1");
+export async function updateSettings(tenantId: string, patch: Partial<TestingSettings>): Promise<TestingSettings> {
+  await ready(tenantId);
+  const cur = await query<{ payload: TestingSettings }>(
+    "SELECT payload FROM testing_settings WHERE tenant_id = $1 AND id = 1",
+    [tenantId]
+  );
   const merged = { ...(cur.rows[0]?.payload || seedSettings()), ...patch };
-  await query("UPDATE testing_settings SET payload = $1::jsonb, updated_at = now() WHERE id = 1",
-    [JSON.stringify(merged)]);
+  await query(
+    `INSERT INTO testing_settings (tenant_id, id, payload)
+     VALUES ($1, 1, $2::jsonb)
+     ON CONFLICT (tenant_id, id) DO UPDATE
+       SET payload = EXCLUDED.payload, updated_at = now()
+       WHERE testing_settings.tenant_id = $1`,
+    [tenantId, JSON.stringify(merged)]
+  );
   return merged;
 }
 
-export async function resetDemo(): Promise<void> {
+export async function resetDemo(tenantId: string): Promise<void> {
   await ensureSchema();
-  // Borrar archivos físicos
-  const evs = await query<EvidenceRow>("SELECT storage_path FROM testing_evidences WHERE storage_path IS NOT NULL");
+  // Borrar archivos físicos (scoped por tenant)
+  const evs = await query<EvidenceRow>(
+    "SELECT storage_path FROM testing_evidences WHERE storage_path IS NOT NULL AND tenant_id = $1",
+    [tenantId]
+  );
   for (const e of evs.rows) await deleteEvidenceFile(e.storage_path);
 
-  await query("DELETE FROM testing_manuals");
-  await query("DELETE FROM testing_defects");
-  await query("DELETE FROM testing_evidences");
-  await query("DELETE FROM testing_scenarios");
-  await query("DELETE FROM testing_settings");
-  seeded = false;
-  await seedIfEmpty();
+  await query("DELETE FROM testing_manuals WHERE tenant_id = $1", [tenantId]);
+  await query("DELETE FROM testing_defects WHERE tenant_id = $1", [tenantId]);
+  await query("DELETE FROM testing_evidences WHERE tenant_id = $1", [tenantId]);
+  await query("DELETE FROM testing_scenarios WHERE tenant_id = $1", [tenantId]);
+  await query("DELETE FROM testing_settings WHERE tenant_id = $1", [tenantId]);
+  seededTenants.delete(tenantId);
+  await seedIfEmpty(tenantId);
 }

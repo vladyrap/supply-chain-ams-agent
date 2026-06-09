@@ -3,6 +3,10 @@
 //
 // Diseñado para fire-and-forget desde el código que emite eventos: NO bloquea
 // el flujo principal si algo falla en una integración externa.
+//
+// MT-3: ahora scoped al tenant. emitEvent y emitEventFireAndForget reciben
+// tenantId como primer parámetro. Para callers que no tienen contexto HTTP
+// (crons, workers) se pasa "default" con TODO MT-6.
 import { query } from "../../database/db";
 import { logger } from "../../utils/logger";
 import {
@@ -14,6 +18,7 @@ import type {
 } from "../../types/integration.types";
 
 async function recordDeliveryRow(
+  tenantId: string,
   destinationId: string | null,
   eventType: string,
   payload: Record<string, unknown>,
@@ -22,9 +27,10 @@ async function recordDeliveryRow(
   try {
     await query(
       `INSERT INTO integration_deliveries
-         (destination_id, event_type, payload, status, http_status, response_excerpt, attempts, last_attempted_at)
-       VALUES ($1, $2, $3::jsonb, $4, $5, $6, 1, now())`,
+         (tenant_id, destination_id, event_type, payload, status, http_status, response_excerpt, attempts, last_attempted_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, 1, now())`,
       [
+        tenantId,
         destinationId,
         eventType,
         JSON.stringify(payload),
@@ -42,20 +48,21 @@ async function recordDeliveryRow(
 // (el código de Mesa de Soporte / meetings no debe quedarse esperando).
 // Devuelve la promise por si el caller quiere awaitarla en tests.
 export async function emitEvent(
+  tenantId: string,
   eventType: string,
   data: Record<string, unknown>
 ): Promise<void> {
   let destinations;
   try {
-    destinations = await listDestinations();
+    destinations = await listDestinations(tenantId);
   } catch (err) {
-    logger.warn({ err, eventType }, "no se pudo listar destinations");
+    logger.warn({ err, eventType, tenantId }, "no se pudo listar destinations");
     return;
   }
   const matching = destinations.filter((d) => destinationMatches(d, eventType));
   if (matching.length === 0) return;
 
-  logger.info({ eventType, count: matching.length }, "integration emit");
+  logger.info({ eventType, tenantId, count: matching.length }, "integration emit");
 
   const payload = {
     event: eventType,
@@ -76,24 +83,36 @@ export async function emitEvent(
       } catch (err) {
         result = { ok: false, error: err instanceof Error ? err.message : "adapter error" };
       }
-      await recordDeliveryRow(d.id, eventType, payload, result);
-      await recordDelivery(d.id, result.ok, result.error);
+      await recordDeliveryRow(tenantId, d.id, eventType, payload, result);
+      await recordDelivery(tenantId, d.id, result.ok, result.error);
     })
   );
 }
 
 // Fire-and-forget para llamar desde código de negocio sin bloquear.
-export function emitEventFireAndForget(eventType: string, data: Record<string, unknown>): void {
-  emitEvent(eventType, data).catch((err) => {
-    logger.warn({ err, eventType }, "emit fire-and-forget unhandled");
+// tenantId es opcional: si no se provee, se usa "default" con warning para forensics.
+// TODO MT-6: ningún caller debería omitir tenantId — cuando todos pasen el suyo,
+// removemos el branch default.
+export function emitEventFireAndForget(
+  tenantId: string | null | undefined,
+  eventType: string,
+  data: Record<string, unknown>,
+): void {
+  let safeTenant = tenantId;
+  if (!safeTenant) {
+    safeTenant = "default";
+    logger.warn({ eventType }, "emitEventFireAndForget sin tenantId → usando 'default' (TODO MT-6 scope)");
+  }
+  emitEvent(safeTenant, eventType, data).catch((err) => {
+    logger.warn({ err, eventType, tenantId: safeTenant }, "emit fire-and-forget unhandled");
   });
 }
 
 // Envío de prueba a una destination específica (sin filtros).
-export async function testDestination(destinationId: string): Promise<DeliveryResult> {
+export async function testDestination(tenantId: string, destinationId: string): Promise<DeliveryResult> {
   const { rows } = await query<{ id: string; type: string; config: unknown }>(
-    `SELECT id, type, config FROM integration_destinations WHERE id = $1`,
-    [destinationId]
+    `SELECT id, type, config FROM integration_destinations WHERE id = $1 AND tenant_id = $2`,
+    [destinationId, tenantId]
   );
   const d = rows[0];
   if (!d) return { ok: false, error: "destination no encontrada" };
@@ -116,12 +135,12 @@ export async function testDestination(destinationId: string): Promise<DeliveryRe
   } catch (err) {
     result = { ok: false, error: err instanceof Error ? err.message : "adapter error" };
   }
-  await recordDeliveryRow(d.id, "test", payload, result);
-  await recordDelivery(d.id, result.ok, result.error);
+  await recordDeliveryRow(tenantId, d.id, "test", payload, result);
+  await recordDelivery(tenantId, d.id, result.ok, result.error);
   return result;
 }
 
-export async function listDeliveries(filters: {
+export async function listDeliveries(tenantId: string, filters: {
   destinationId?: string;
   status?: "pending" | "sent" | "failed";
   eventType?: string;
@@ -129,10 +148,13 @@ export async function listDeliveries(filters: {
 } = {}): Promise<IntegrationDelivery[]> {
   const conds: string[] = [];
   const params: unknown[] = [];
+  // Tenant scoping siempre primero.
+  params.push(tenantId);
+  conds.push(`tenant_id = $${params.length}`);
   if (filters.destinationId) { params.push(filters.destinationId); conds.push(`destination_id = $${params.length}`); }
   if (filters.status)        { params.push(filters.status);         conds.push(`status = $${params.length}`); }
   if (filters.eventType)     { params.push(filters.eventType);      conds.push(`event_type = $${params.length}`); }
-  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const where = `WHERE ${conds.join(" AND ")}`;
   const limit = Math.min(filters.limit ?? 100, 500);
   params.push(limit);
   const { rows } = await query<IntegrationDelivery>(

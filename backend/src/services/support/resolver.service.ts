@@ -143,7 +143,7 @@ export async function resolveWithAi(tenantId: string, input: ResolverContextInpu
   let ragBlock = "";
   if (kbHits.length === 0) {
     try {
-      const chunks = await retrieveRelevantChunks(lastUserMsg, {
+      const chunks = await retrieveRelevantChunks(tenantId, lastUserMsg, {
         module: triage.sap_module,
         client: input.userClient,
       });

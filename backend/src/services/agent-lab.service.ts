@@ -1,13 +1,13 @@
-// Agent Lab — laboratorio de mejora del agente.
+// Agent Lab — laboratorio de mejora del agente (multi-tenant).
+//
+// MT-3: cada función recibe tenantId obligatorio. Las prompt versions son
+// tenant-specific — cada cliente puede tener su propio prompt activo.
 //
 // Dos features:
 //  1) Wizard ticket → KB: toma un ticket resuelto + su conversación y le pide
-//     a Gemini que extraiga un artículo curado (problema / solución / tags).
-//     Solo es un DRAFT — el humano edita y aprueba antes de guardar en kb_articles.
-//
+//     a Gemini que extraiga un artículo curado.
 //  2) Prompt Playground: ejecuta una query contra Gemini con un system prompt
-//     custom y devuelve respuesta + latencia + tokens. Útil para probar
-//     variantes del prompt sin afectar producción.
+//     custom (no toca DB, no requiere scoping).
 
 import { GoogleGenAI } from "@google/genai";
 import { query } from "../database/db";
@@ -42,18 +42,18 @@ export interface ResolvedTicketSummary {
   sap_module: string | null;
 }
 
-/** Lista tickets resueltos o cerrados (candidatos para convertir en KB) */
-export async function listConvertibleTickets(limit = 50): Promise<ResolvedTicketSummary[]> {
+/** Lista tickets resueltos o cerrados (candidatos para convertir en KB), scoped. */
+export async function listConvertibleTickets(tenantId: string, limit = 50): Promise<ResolvedTicketSummary[]> {
   const { rows } = await query<ResolvedTicketSummary>(
     `SELECT
        t.id, t.code, t.title, t.summary, t.status, t.priority,
        t.conversation_id, t.resolved_at, t.client, t.sap_module,
        (t.kb_article_id IS NOT NULL) AS has_kb
      FROM support_tickets t
-     WHERE t.status IN ('resolved','closed')
+     WHERE t.tenant_id = $2 AND t.status IN ('resolved','closed')
      ORDER BY (t.kb_article_id IS NOT NULL) ASC, t.resolved_at DESC NULLS LAST, t.created_at DESC
      LIMIT $1`,
-    [Math.max(1, Math.min(200, limit))]
+    [Math.max(1, Math.min(200, limit)), tenantId]
   );
   return rows;
 }
@@ -82,17 +82,16 @@ export interface DraftFromTicketResult {
 }
 
 /**
- * Lee el ticket + su conversación + los mensajes y pide a Gemini un draft
- * estructurado en JSON. Si Gemini devuelve algo no parseable, hacemos best-effort.
+ * Lee el ticket (scoped) + su conversación + mensajes y pide a Gemini un draft.
  */
-export async function draftKbFromTicket(ticketId: string): Promise<DraftFromTicketResult> {
+export async function draftKbFromTicket(tenantId: string, ticketId: string): Promise<DraftFromTicketResult> {
   const { rows: tk } = await query<{
     id: string; code: string; title: string; summary: string; client: string | null;
     sap_module: string | null; priority: string; conversation_id: string | null;
   }>(
     `SELECT id, code, title, summary, client, sap_module, priority, conversation_id
-     FROM support_tickets WHERE id = $1 LIMIT 1`,
-    [ticketId]
+     FROM support_tickets WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
+    [ticketId, tenantId]
   );
   if (tk.length === 0) throw new ClaudeError(`Ticket ${ticketId} no encontrado`);
   const ticket = tk[0];
@@ -176,7 +175,6 @@ Reglas:
   try {
     parsed = JSON.parse(text);
   } catch {
-    // intentar quitar fences si Gemini los puso
     const m = text.match(/\{[\s\S]*\}/);
     if (m) {
       try { parsed = JSON.parse(m[0]); } catch { /* dejar parsed vacío */ }
@@ -225,6 +223,10 @@ export interface PlaygroundRunResult {
 
 // ============================================================================
 // PROMPT VERSIONING — adoptar variante del Playground como activa
+//
+// MT-3 DECISIÓN: agent_prompt_versions es tenant-specific. Cada cliente
+// puede tener su prompt activo distinto. La columna tenant_id se agrega
+// en ensurePromptSchema de forma idempotente.
 // ============================================================================
 let promptSchemaEnsured = false;
 async function ensurePromptSchema(): Promise<void> {
@@ -233,6 +235,7 @@ async function ensurePromptSchema(): Promise<void> {
     await query(`
       CREATE TABLE IF NOT EXISTS agent_prompt_versions (
         id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id       TEXT NOT NULL DEFAULT 'default',
         label           TEXT NOT NULL,
         system_prompt   TEXT NOT NULL,
         temperature     REAL NOT NULL DEFAULT 0.4,
@@ -243,8 +246,11 @@ async function ensurePromptSchema(): Promise<void> {
         created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
-    await query(`CREATE INDEX IF NOT EXISTS idx_agent_prompt_active  ON agent_prompt_versions(active) WHERE active = true;`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_agent_prompt_created ON agent_prompt_versions(created_at DESC);`);
+    // Migración idempotente: agregar tenant_id si la tabla ya existía.
+    await query(`ALTER TABLE agent_prompt_versions ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_agent_prompt_active   ON agent_prompt_versions(tenant_id, active) WHERE active = true;`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_agent_prompt_tenant   ON agent_prompt_versions(tenant_id, created_at DESC);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_agent_prompt_created  ON agent_prompt_versions(created_at DESC);`);
     promptSchemaEnsured = true;
   } catch (err) {
     logger.warn({ err }, "ensure agent_prompt_versions schema failed");
@@ -253,6 +259,7 @@ async function ensurePromptSchema(): Promise<void> {
 
 export interface PromptVersionRow {
   id: string;
+  tenant_id: string;
   label: string;
   system_prompt: string;
   temperature: number;
@@ -272,15 +279,19 @@ export interface AdoptPromptInput {
   adoptionNotes?: string;
 }
 
-export async function adoptPrompt(input: AdoptPromptInput): Promise<PromptVersionRow> {
+export async function adoptPrompt(tenantId: string, input: AdoptPromptInput): Promise<PromptVersionRow> {
   await ensurePromptSchema();
-  // desactivar la versión activa actual
-  await query(`UPDATE agent_prompt_versions SET active = false WHERE active = true`);
+  // Desactivar la versión activa actual SOLO de este tenant.
+  await query(
+    `UPDATE agent_prompt_versions SET active = false WHERE tenant_id = $1 AND active = true`,
+    [tenantId]
+  );
   const { rows } = await query<PromptVersionRow>(
     `INSERT INTO agent_prompt_versions
-       (label, system_prompt, temperature, max_tokens, active, created_by, adoption_notes)
-     VALUES ($1, $2, $3, $4, true, $5, $6) RETURNING *`,
+       (tenant_id, label, system_prompt, temperature, max_tokens, active, created_by, adoption_notes)
+     VALUES ($1, $2, $3, $4, $5, true, $6, $7) RETURNING *`,
     [
+      tenantId,
       input.label.slice(0, 200),
       input.systemPrompt.slice(0, 16000),
       Math.max(0, Math.min(1.5, input.temperature ?? 0.4)),
@@ -297,28 +308,38 @@ export async function adoptPrompt(input: AdoptPromptInput): Promise<PromptVersio
   return rows[0]!;
 }
 
-export async function getActivePrompt(): Promise<PromptVersionRow | null> {
+export async function getActivePrompt(tenantId: string): Promise<PromptVersionRow | null> {
   await ensurePromptSchema();
   const { rows } = await query<PromptVersionRow>(
-    `SELECT * FROM agent_prompt_versions WHERE active = true ORDER BY created_at DESC LIMIT 1`
+    `SELECT * FROM agent_prompt_versions
+      WHERE tenant_id = $1 AND active = true
+      ORDER BY created_at DESC LIMIT 1`,
+    [tenantId]
   );
   return rows[0] ?? null;
 }
 
-export async function listPromptVersions(limit = 50): Promise<PromptVersionRow[]> {
+export async function listPromptVersions(tenantId: string, limit = 50): Promise<PromptVersionRow[]> {
   await ensurePromptSchema();
   const { rows } = await query<PromptVersionRow>(
-    `SELECT * FROM agent_prompt_versions ORDER BY created_at DESC LIMIT $1`,
-    [Math.max(1, Math.min(200, limit))]
+    `SELECT * FROM agent_prompt_versions
+      WHERE tenant_id = $1
+      ORDER BY created_at DESC LIMIT $2`,
+    [tenantId, Math.max(1, Math.min(200, limit))]
   );
   return rows;
 }
 
-export async function activatePromptVersion(id: string): Promise<PromptVersionRow | null> {
+export async function activatePromptVersion(tenantId: string, id: string): Promise<PromptVersionRow | null> {
   await ensurePromptSchema();
-  await query(`UPDATE agent_prompt_versions SET active = false WHERE active = true`);
+  await query(
+    `UPDATE agent_prompt_versions SET active = false WHERE tenant_id = $1 AND active = true`,
+    [tenantId]
+  );
   const { rows } = await query<PromptVersionRow>(
-    `UPDATE agent_prompt_versions SET active = true WHERE id = $1 RETURNING *`, [id]
+    `UPDATE agent_prompt_versions SET active = true
+      WHERE id = $1 AND tenant_id = $2 RETURNING *`,
+    [id, tenantId]
   );
   try {
     const { invalidateActivePromptCache } = await import("./claude.service");

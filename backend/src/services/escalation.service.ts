@@ -8,8 +8,9 @@
 import { query } from "../database/db";
 import { logger } from "../utils/logger";
 
+// Multi-tenant: todas las funciones reciben tenantId y filtran por él (Sprint 3 ALTOS).
 let schemaEnsured = false;
-let seeded = false;
+const seededTenants = new Set<string>();
 
 // ============================================================================
 // Tipos (mirror de los del frontend)
@@ -289,22 +290,35 @@ async function ensureSchema(): Promise<void> {
     await query(`CREATE INDEX IF NOT EXISTS idx_esc_rec_status   ON escalation_records(status);`);
     await query(`CREATE INDEX IF NOT EXISTS idx_esc_rec_created  ON escalation_records(created_at DESC);`);
 
+    // Singleton tables: ahora composite (tenant_id, id). El CHECK (id = 1)
+    // se mantiene a nivel app (siempre insertamos id=1) y el filtro es por tenant_id.
     await query(`
       CREATE TABLE IF NOT EXISTS itsm_connectors (
-        id      INTEGER PRIMARY KEY DEFAULT 1,
+        id      INTEGER NOT NULL DEFAULT 1,
         payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        CHECK (id = 1)
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
     await query(`
       CREATE TABLE IF NOT EXISTS escalation_settings (
-        id      INTEGER PRIMARY KEY DEFAULT 1,
+        id      INTEGER NOT NULL DEFAULT 1,
         payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        CHECK (id = 1)
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
+    // Migración legacy: borrar PK/UNIQUE viejo en (id) si existe.
+    // Tenant-aware UNIQUE: (tenant_id, id) — un registro por tenant.
+    // Defensivo: las migraciones de DB se hacen en SQL files; esto solo cubre
+    // entornos test/dev donde el service crea tabla en runtime.
+    try {
+      await query(`ALTER TABLE itsm_connectors DROP CONSTRAINT IF EXISTS itsm_connectors_pkey`);
+    } catch { /* ignore */ }
+    try {
+      await query(`ALTER TABLE escalation_settings DROP CONSTRAINT IF EXISTS escalation_settings_pkey`);
+    } catch { /* ignore */ }
+    // Crear UNIQUE compuesto (idempotente)
+    await query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_itsm_connectors_tenant ON itsm_connectors(tenant_id, id)`);
+    await query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_escalation_settings_tenant ON escalation_settings(tenant_id, id)`);
     schemaEnsured = true;
   } catch (err) {
     logger.warn({ err }, "ensure escalation schema failed");
@@ -430,57 +444,71 @@ function seedSettings(): EscalationSettings {
   };
 }
 
-async function seedIfEmpty(): Promise<void> {
-  if (seeded) return;
+async function seedIfEmpty(tenantId: string): Promise<void> {
+  if (seededTenants.has(tenantId)) return;
   try {
-    const rules = await query<{ c: string }>("SELECT count(*)::text AS c FROM escalation_rules");
+    const rules = await query<{ c: string }>(
+      "SELECT count(*)::text AS c FROM escalation_rules WHERE tenant_id = $1",
+      [tenantId]
+    );
     if (Number(rules.rows[0]?.c || "0") === 0) {
       for (const r of seedRules()) {
         await query(
-          `INSERT INTO escalation_rules (id,name,description,enabled,priority,conditions,target_level,
+          `INSERT INTO escalation_rules (tenant_id,id,name,description,enabled,priority,conditions,target_level,
             assignment_strategy,target_team,target_role,target_user_id,channel,sla_minutes,requires_approval,
             created_at,updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
-          [r.id, r.name, r.description, r.enabled, r.priority, JSON.stringify(r.conditions),
+           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+           ON CONFLICT (id) DO NOTHING`,
+          [tenantId, r.id, r.name, r.description, r.enabled, r.priority, JSON.stringify(r.conditions),
            r.targetLevel, r.assignmentStrategy, r.targetTeam || null, r.targetRole || null,
            r.targetUserId || null, r.channel, r.slaMinutes, r.requiresApproval, r.createdAt, r.updatedAt]
         );
       }
     }
-    const resp = await query<{ c: string }>("SELECT count(*)::text AS c FROM n2_responsibles");
+    const resp = await query<{ c: string }>(
+      "SELECT count(*)::text AS c FROM n2_responsibles WHERE tenant_id = $1",
+      [tenantId]
+    );
     if (Number(resp.rows[0]?.c || "0") === 0) {
       for (const r of seedResponsibles()) {
         await query(
-          `INSERT INTO n2_responsibles (id,name,email,role,team,sap_modules,processes,clients,countries,
+          `INSERT INTO n2_responsibles (tenant_id,id,name,email,role,team,sap_modules,processes,clients,countries,
             service_levels,availability_status,working_hours,timezone,max_active_cases,current_active_cases,
             skills,jira_account_id,service_now_user_id,teams_user_id,active,created_at,updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
-          [r.id, r.name, r.email, r.role, r.team, r.sapModules, r.processes, r.clients, r.countries,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+           ON CONFLICT (id) DO NOTHING`,
+          [tenantId, r.id, r.name, r.email, r.role, r.team, r.sapModules, r.processes, r.clients, r.countries,
            r.serviceLevels, r.availabilityStatus, r.workingHours, r.timezone, r.maxActiveCases,
            r.currentActiveCases, r.skills, r.jiraAccountId || null, r.serviceNowUserId || null,
            r.teamsUserId || null, r.active, r.createdAt, r.updatedAt]
         );
       }
     }
-    const conn = await query<{ c: string }>("SELECT count(*)::text AS c FROM itsm_connectors");
+    const conn = await query<{ c: string }>(
+      "SELECT count(*)::text AS c FROM itsm_connectors WHERE tenant_id = $1",
+      [tenantId]
+    );
     if (Number(conn.rows[0]?.c || "0") === 0) {
-      await query(`INSERT INTO itsm_connectors (id, payload) VALUES (1, $1::jsonb)`,
-        [JSON.stringify(seedConnectors())]);
+      await query(`INSERT INTO itsm_connectors (tenant_id, id, payload) VALUES ($1, 1, $2::jsonb)`,
+        [tenantId, JSON.stringify(seedConnectors())]);
     }
-    const set = await query<{ c: string }>("SELECT count(*)::text AS c FROM escalation_settings");
+    const set = await query<{ c: string }>(
+      "SELECT count(*)::text AS c FROM escalation_settings WHERE tenant_id = $1",
+      [tenantId]
+    );
     if (Number(set.rows[0]?.c || "0") === 0) {
-      await query(`INSERT INTO escalation_settings (id, payload) VALUES (1, $1::jsonb)`,
-        [JSON.stringify(seedSettings())]);
+      await query(`INSERT INTO escalation_settings (tenant_id, id, payload) VALUES ($1, 1, $2::jsonb)`,
+        [tenantId, JSON.stringify(seedSettings())]);
     }
-    seeded = true;
+    seededTenants.add(tenantId);
   } catch (err) {
     logger.warn({ err }, "seed escalation failed");
   }
 }
 
-async function ready(): Promise<void> {
+async function ready(tenantId: string): Promise<void> {
   await ensureSchema();
-  await seedIfEmpty();
+  await seedIfEmpty(tenantId);
 }
 
 // ============================================================================
@@ -563,20 +591,35 @@ function mapRecord(r: RecRow): EscalationRecord {
 // Snapshot
 // ============================================================================
 
-export async function getSnapshot(): Promise<{
+export async function getSnapshot(tenantId: string): Promise<{
   rules: EscalationRule[];
   responsibles: N2Responsible[];
   records: EscalationRecord[];
   connectors: ItsmConnectorConfig;
   settings: EscalationSettings;
 }> {
-  await ready();
+  await ready(tenantId);
   const [rR, rsR, recR, conR, setR] = await Promise.all([
-    query<RuleRow>("SELECT * FROM escalation_rules ORDER BY priority, created_at"),
-    query<RespRow>("SELECT * FROM n2_responsibles ORDER BY name"),
-    query<RecRow>("SELECT * FROM escalation_records ORDER BY created_at DESC LIMIT 500"),
-    query<{ payload: ItsmConnectorConfig }>("SELECT payload FROM itsm_connectors WHERE id = 1"),
-    query<{ payload: EscalationSettings }>("SELECT payload FROM escalation_settings WHERE id = 1"),
+    query<RuleRow>(
+      "SELECT * FROM escalation_rules WHERE tenant_id = $1 ORDER BY priority, created_at",
+      [tenantId]
+    ),
+    query<RespRow>(
+      "SELECT * FROM n2_responsibles WHERE tenant_id = $1 ORDER BY name",
+      [tenantId]
+    ),
+    query<RecRow>(
+      "SELECT * FROM escalation_records WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 500",
+      [tenantId]
+    ),
+    query<{ payload: ItsmConnectorConfig }>(
+      "SELECT payload FROM itsm_connectors WHERE tenant_id = $1 AND id = 1",
+      [tenantId]
+    ),
+    query<{ payload: EscalationSettings }>(
+      "SELECT payload FROM escalation_settings WHERE tenant_id = $1 AND id = 1",
+      [tenantId]
+    ),
   ]);
   return {
     rules: rR.rows.map(mapRule),
@@ -591,13 +634,13 @@ export async function getSnapshot(): Promise<{
 // Rules CRUD
 // ============================================================================
 
-export async function upsertRule(r: EscalationRule): Promise<EscalationRule> {
-  await ready();
+export async function upsertRule(tenantId: string, r: EscalationRule): Promise<EscalationRule> {
+  await ready(tenantId);
   const now = new Date().toISOString();
   const res = await query<RuleRow>(
-    `INSERT INTO escalation_rules (id,name,description,enabled,priority,conditions,target_level,
+    `INSERT INTO escalation_rules (tenant_id,id,name,description,enabled,priority,conditions,target_level,
        assignment_strategy,target_team,target_role,target_user_id,channel,sla_minutes,requires_approval,created_at,updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
      ON CONFLICT (id) DO UPDATE SET
        name=EXCLUDED.name, description=EXCLUDED.description, enabled=EXCLUDED.enabled,
        priority=EXCLUDED.priority, conditions=EXCLUDED.conditions, target_level=EXCLUDED.target_level,
@@ -605,8 +648,9 @@ export async function upsertRule(r: EscalationRule): Promise<EscalationRule> {
        target_role=EXCLUDED.target_role, target_user_id=EXCLUDED.target_user_id, channel=EXCLUDED.channel,
        sla_minutes=EXCLUDED.sla_minutes, requires_approval=EXCLUDED.requires_approval,
        updated_at=EXCLUDED.updated_at
+     WHERE escalation_rules.tenant_id = $1
      RETURNING *`,
-    [r.id, r.name, r.description, r.enabled, r.priority, JSON.stringify(r.conditions || {}),
+    [tenantId, r.id, r.name, r.description, r.enabled, r.priority, JSON.stringify(r.conditions || {}),
      r.targetLevel, r.assignmentStrategy, r.targetTeam || null, r.targetRole || null,
      r.targetUserId || null, r.channel, r.slaMinutes, r.requiresApproval,
      r.createdAt || now, now]
@@ -614,23 +658,23 @@ export async function upsertRule(r: EscalationRule): Promise<EscalationRule> {
   return mapRule(res.rows[0]);
 }
 
-export async function deleteRule(id: string): Promise<void> {
-  await ready();
-  await query("DELETE FROM escalation_rules WHERE id = $1", [id]);
+export async function deleteRule(tenantId: string, id: string): Promise<void> {
+  await ready(tenantId);
+  await query("DELETE FROM escalation_rules WHERE id = $1 AND tenant_id = $2", [id, tenantId]);
 }
 
 // ============================================================================
 // Responsibles CRUD
 // ============================================================================
 
-export async function upsertResponsible(r: N2Responsible): Promise<N2Responsible> {
-  await ready();
+export async function upsertResponsible(tenantId: string, r: N2Responsible): Promise<N2Responsible> {
+  await ready(tenantId);
   const now = new Date().toISOString();
   const res = await query<RespRow>(
-    `INSERT INTO n2_responsibles (id,name,email,role,team,sap_modules,processes,clients,countries,service_levels,
+    `INSERT INTO n2_responsibles (tenant_id,id,name,email,role,team,sap_modules,processes,clients,countries,service_levels,
        availability_status,working_hours,timezone,max_active_cases,current_active_cases,skills,
        jira_account_id,service_now_user_id,teams_user_id,active,created_at,updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
      ON CONFLICT (id) DO UPDATE SET
        name=EXCLUDED.name, email=EXCLUDED.email, role=EXCLUDED.role, team=EXCLUDED.team,
        sap_modules=EXCLUDED.sap_modules, processes=EXCLUDED.processes, clients=EXCLUDED.clients,
@@ -640,8 +684,9 @@ export async function upsertResponsible(r: N2Responsible): Promise<N2Responsible
        current_active_cases=EXCLUDED.current_active_cases, skills=EXCLUDED.skills,
        jira_account_id=EXCLUDED.jira_account_id, service_now_user_id=EXCLUDED.service_now_user_id,
        teams_user_id=EXCLUDED.teams_user_id, active=EXCLUDED.active, updated_at=EXCLUDED.updated_at
+     WHERE n2_responsibles.tenant_id = $1
      RETURNING *`,
-    [r.id, r.name, r.email, r.role, r.team, r.sapModules, r.processes, r.clients, r.countries,
+    [tenantId, r.id, r.name, r.email, r.role, r.team, r.sapModules, r.processes, r.clients, r.countries,
      r.serviceLevels, r.availabilityStatus, r.workingHours, r.timezone, r.maxActiveCases,
      r.currentActiveCases, r.skills, r.jiraAccountId || null, r.serviceNowUserId || null,
      r.teamsUserId || null, r.active, r.createdAt || now, now]
@@ -649,17 +694,17 @@ export async function upsertResponsible(r: N2Responsible): Promise<N2Responsible
   return mapResp(res.rows[0]);
 }
 
-export async function deleteResponsible(id: string): Promise<void> {
-  await ready();
-  await query("DELETE FROM n2_responsibles WHERE id = $1", [id]);
+export async function deleteResponsible(tenantId: string, id: string): Promise<void> {
+  await ready(tenantId);
+  await query("DELETE FROM n2_responsibles WHERE id = $1 AND tenant_id = $2", [id, tenantId]);
 }
 
 // ============================================================================
 // Records CRUD
 // ============================================================================
 
-export async function createRecord(r: EscalationRecord): Promise<EscalationRecord> {
-  await ready();
+export async function createRecord(tenantId: string, r: EscalationRecord): Promise<EscalationRecord> {
+  await ready(tenantId);
 
   // Copiar la estimación del incidente al payload del record si existe.
   // Esto deja la estimación adjunta al escalation para que la UI N2 pueda
@@ -667,8 +712,8 @@ export async function createRecord(r: EscalationRecord): Promise<EscalationRecor
   let payloadOut = r.payload as Record<string, unknown> | null | undefined;
   try {
     const incEst = await query<{ estimated_resolution: unknown }>(
-      "SELECT estimated_resolution FROM incidents WHERE id = $1",
-      [r.incidentId]
+      "SELECT estimated_resolution FROM incidents WHERE id = $1 AND tenant_id = $2",
+      [r.incidentId, tenantId]
     );
     const est = incEst.rows[0]?.estimated_resolution;
     if (est) {
@@ -681,13 +726,13 @@ export async function createRecord(r: EscalationRecord): Promise<EscalationRecor
   } catch { /* tabla incidents puede no existir en tests aislados */ }
 
   const res = await query<RecRow>(
-    `INSERT INTO escalation_records (id,incident_id,escalation_number,from_level,to_level,reason,summary,
+    `INSERT INTO escalation_records (tenant_id,id,incident_id,escalation_number,from_level,to_level,reason,summary,
        client_summary,assigned_to,assigned_to_name,assigned_team,channel,rule_id,external_ticket_id,
        external_ticket_url,status,sla_target,sla_minutes,created_by,approved_by,approved_at,requires_approval,
        mode,payload,events,created_at,updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24::jsonb,$25::jsonb,$26,$27)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25::jsonb,$26::jsonb,$27,$28)
      RETURNING *`,
-    [r.id, r.incidentId, r.escalationNumber, r.fromLevel, r.toLevel, r.reason, r.summary,
+    [tenantId, r.id, r.incidentId, r.escalationNumber, r.fromLevel, r.toLevel, r.reason, r.summary,
      r.clientSummary || null, r.assignedTo || null, r.assignedToName || null, r.assignedTeam || null,
      r.channel, r.ruleId || null, r.externalTicketId || null, r.externalTicketUrl || null,
      r.status, r.slaTarget, r.slaMinutes, r.createdBy, r.approvedBy || null, r.approvedAt || null,
@@ -697,18 +742,21 @@ export async function createRecord(r: EscalationRecord): Promise<EscalationRecor
   return mapRecord(res.rows[0]);
 }
 
-export async function updateRecord(id: string, patch: Partial<EscalationRecord>): Promise<EscalationRecord | null> {
-  await ready();
-  const cur = await query<RecRow>("SELECT * FROM escalation_records WHERE id = $1", [id]);
+export async function updateRecord(tenantId: string, id: string, patch: Partial<EscalationRecord>): Promise<EscalationRecord | null> {
+  await ready(tenantId);
+  const cur = await query<RecRow>(
+    "SELECT * FROM escalation_records WHERE id = $1 AND tenant_id = $2",
+    [id, tenantId]
+  );
   if (cur.rowCount === 0) return null;
   const merged = { ...mapRecord(cur.rows[0]), ...patch, updatedAt: new Date().toISOString() } as EscalationRecord;
   const res = await query<RecRow>(
     `UPDATE escalation_records SET
-       status=$2, reason=$3, summary=$4, client_summary=$5, assigned_to=$6, assigned_to_name=$7,
-       assigned_team=$8, channel=$9, external_ticket_id=$10, external_ticket_url=$11,
-       approved_by=$12, approved_at=$13, payload=$14::jsonb, events=$15::jsonb, updated_at=$16
-     WHERE id=$1 RETURNING *`,
-    [id, merged.status, merged.reason, merged.summary, merged.clientSummary || null,
+       status=$3, reason=$4, summary=$5, client_summary=$6, assigned_to=$7, assigned_to_name=$8,
+       assigned_team=$9, channel=$10, external_ticket_id=$11, external_ticket_url=$12,
+       approved_by=$13, approved_at=$14, payload=$15::jsonb, events=$16::jsonb, updated_at=$17
+     WHERE id=$1 AND tenant_id=$2 RETURNING *`,
+    [id, tenantId, merged.status, merged.reason, merged.summary, merged.clientSummary || null,
      merged.assignedTo || null, merged.assignedToName || null, merged.assignedTeam || null,
      merged.channel, merged.externalTicketId || null, merged.externalTicketUrl || null,
      merged.approvedBy || null, merged.approvedAt || null,
@@ -722,21 +770,40 @@ export async function updateRecord(id: string, patch: Partial<EscalationRecord>)
 // Connectors + Settings
 // ============================================================================
 
-export async function updateConnectors(patch: Partial<ItsmConnectorConfig>): Promise<ItsmConnectorConfig> {
-  await ready();
-  const cur = await query<{ payload: ItsmConnectorConfig }>("SELECT payload FROM itsm_connectors WHERE id = 1");
+export async function updateConnectors(tenantId: string, patch: Partial<ItsmConnectorConfig>): Promise<ItsmConnectorConfig> {
+  await ready(tenantId);
+  const cur = await query<{ payload: ItsmConnectorConfig }>(
+    "SELECT payload FROM itsm_connectors WHERE tenant_id = $1 AND id = 1",
+    [tenantId]
+  );
   const merged = { ...(cur.rows[0]?.payload || seedConnectors()), ...patch };
-  await query("UPDATE itsm_connectors SET payload = $1::jsonb, updated_at = now() WHERE id = 1",
-    [JSON.stringify(merged)]);
+  // UPSERT idempotente — si no había fila para el tenant, la creamos.
+  await query(
+    `INSERT INTO itsm_connectors (tenant_id, id, payload)
+     VALUES ($1, 1, $2::jsonb)
+     ON CONFLICT (tenant_id, id) DO UPDATE
+       SET payload = EXCLUDED.payload, updated_at = now()
+       WHERE itsm_connectors.tenant_id = $1`,
+    [tenantId, JSON.stringify(merged)]
+  );
   return merged;
 }
 
-export async function updateSettings(patch: Partial<EscalationSettings>): Promise<EscalationSettings> {
-  await ready();
-  const cur = await query<{ payload: EscalationSettings }>("SELECT payload FROM escalation_settings WHERE id = 1");
+export async function updateSettings(tenantId: string, patch: Partial<EscalationSettings>): Promise<EscalationSettings> {
+  await ready(tenantId);
+  const cur = await query<{ payload: EscalationSettings }>(
+    "SELECT payload FROM escalation_settings WHERE tenant_id = $1 AND id = 1",
+    [tenantId]
+  );
   const merged = { ...(cur.rows[0]?.payload || seedSettings()), ...patch };
-  await query("UPDATE escalation_settings SET payload = $1::jsonb, updated_at = now() WHERE id = 1",
-    [JSON.stringify(merged)]);
+  await query(
+    `INSERT INTO escalation_settings (tenant_id, id, payload)
+     VALUES ($1, 1, $2::jsonb)
+     ON CONFLICT (tenant_id, id) DO UPDATE
+       SET payload = EXCLUDED.payload, updated_at = now()
+       WHERE escalation_settings.tenant_id = $1`,
+    [tenantId, JSON.stringify(merged)]
+  );
   return merged;
 }
 
@@ -744,13 +811,13 @@ export async function updateSettings(patch: Partial<EscalationSettings>): Promis
 // Reset demo data
 // ============================================================================
 
-export async function resetDemoData(): Promise<void> {
+export async function resetDemoData(tenantId: string): Promise<void> {
   await ensureSchema();
-  await query("DELETE FROM escalation_records");
-  await query("DELETE FROM escalation_rules");
-  await query("DELETE FROM n2_responsibles");
-  await query("DELETE FROM itsm_connectors");
-  await query("DELETE FROM escalation_settings");
-  seeded = false;
-  await seedIfEmpty();
+  await query("DELETE FROM escalation_records WHERE tenant_id = $1", [tenantId]);
+  await query("DELETE FROM escalation_rules WHERE tenant_id = $1", [tenantId]);
+  await query("DELETE FROM n2_responsibles WHERE tenant_id = $1", [tenantId]);
+  await query("DELETE FROM itsm_connectors WHERE tenant_id = $1", [tenantId]);
+  await query("DELETE FROM escalation_settings WHERE tenant_id = $1", [tenantId]);
+  seededTenants.delete(tenantId);
+  await seedIfEmpty(tenantId);
 }

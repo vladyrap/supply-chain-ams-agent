@@ -236,7 +236,7 @@ export async function postSearch(
     return reply.code(400).send({ success: false, error: "query debe tener al menos 3 caracteres" });
   }
   try {
-    const chunks = await retrieveRelevantChunks(b.query.trim(), {
+    const chunks = await retrieveRelevantChunks(req.tenantId, b.query.trim(), {
       module: b.module || undefined,
       client: b.client || undefined,
     });

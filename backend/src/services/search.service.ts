@@ -1,13 +1,13 @@
 // =============================================================
-// Búsqueda semántica unificada
+// Búsqueda semántica unificada (multi-tenant).
 // =============================================================
 // Mantiene una tabla search_index que consolida entidades de varios
 // tipos. Se actualiza vía:
-//   - reindexAll(): pasa por todas las entidades, indexa lo que falta
-//   - upsertOne(): cuando se crea/edita una entidad
+//   - reindexAll(tenantId): pasa por todas las entidades del tenant, indexa
+//   - upsertOne(tenantId, item): cuando se crea/edita una entidad
 //
-// Las queries usan embedding del texto del usuario y devuelven top-K
-// con score (1 - cosine distance).
+// MT-3: search_index tiene columna tenant_id (migration 005). Todas las
+// queries filtran por tenant para aislar los corpus entre clientes.
 // =============================================================
 import { GoogleGenAI } from "@google/genai";
 import { query } from "../database/db";
@@ -55,7 +55,7 @@ export interface UpsertSearchItem {
   metadata?: Record<string, unknown>;
 }
 
-export async function upsertSearch(item: UpsertSearchItem): Promise<void> {
+export async function upsertSearch(tenantId: string, item: UpsertSearchItem): Promise<void> {
   const textToEmbed = `${item.title}\n${item.excerpt}`.slice(0, 4000);
   if (!textToEmbed.trim()) return;
   let vec: number[];
@@ -67,9 +67,9 @@ export async function upsertSearch(item: UpsertSearchItem): Promise<void> {
   }
   await query(
     `INSERT INTO search_index
-       (source_type, source_id, title, excerpt, href, metadata, embedding, indexed_at)
-     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::vector, now())
-     ON CONFLICT (source_type, source_id) DO UPDATE
+       (tenant_id, source_type, source_id, title, excerpt, href, metadata, embedding, indexed_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::vector, now())
+     ON CONFLICT (tenant_id, source_type, source_id) DO UPDATE
        SET title = EXCLUDED.title,
            excerpt = EXCLUDED.excerpt,
            href = EXCLUDED.href,
@@ -77,6 +77,7 @@ export async function upsertSearch(item: UpsertSearchItem): Promise<void> {
            embedding = EXCLUDED.embedding,
            indexed_at = now()`,
     [
+      tenantId,
       item.source_type,
       item.source_id,
       item.title,
@@ -89,14 +90,14 @@ export async function upsertSearch(item: UpsertSearchItem): Promise<void> {
 }
 
 // Fire-and-forget para usar desde los flujos de negocio sin bloquear
-export function upsertSearchFireAndForget(item: UpsertSearchItem): void {
-  upsertSearch(item).catch((err) => {
+export function upsertSearchFireAndForget(tenantId: string, item: UpsertSearchItem): void {
+  upsertSearch(tenantId, item).catch((err) => {
     logger.warn({ err }, "search.upsert fire-and-forget unhandled");
   });
 }
 
 // ============================================================
-// Reindex completo: pasa por todas las entidades y las upserte
+// Reindex completo: pasa por todas las entidades del tenant y las upserte
 // ============================================================
 export interface ReindexResult {
   ok: number;
@@ -104,17 +105,18 @@ export interface ReindexResult {
   byType: Record<SearchSourceType, number>;
 }
 
-export async function reindexAll(opts: { force?: boolean } = {}): Promise<ReindexResult> {
+export async function reindexAll(tenantId: string, opts: { force?: boolean } = {}): Promise<ReindexResult> {
   const stats: ReindexResult = {
     ok: 0, failed: 0,
     byType: { incident: 0, ticket: 0, conversation: 0, kb: 0, meeting: 0, inbound: 0 },
   };
   const tryUpsert = async (item: UpsertSearchItem) => {
     if (!opts.force) {
-      // Skip si ya está indexado y es reciente (< 7 días)
+      // Skip si ya está indexado y es reciente (< 7 días) — scoped al tenant
       const existing = await query<{ indexed_at: string }>(
-        `SELECT indexed_at FROM search_index WHERE source_type = $1 AND source_id = $2`,
-        [item.source_type, item.source_id]
+        `SELECT indexed_at FROM search_index
+           WHERE tenant_id = $1 AND source_type = $2 AND source_id = $3`,
+        [tenantId, item.source_type, item.source_id]
       );
       if (existing.rows[0]) {
         const age = Date.now() - new Date(existing.rows[0].indexed_at).getTime();
@@ -122,7 +124,7 @@ export async function reindexAll(opts: { force?: boolean } = {}): Promise<Reinde
       }
     }
     try {
-      await upsertSearch(item);
+      await upsertSearch(tenantId, item);
       stats.ok++;
       stats.byType[item.source_type]++;
     } catch (err) {
@@ -131,10 +133,11 @@ export async function reindexAll(opts: { force?: boolean } = {}): Promise<Reinde
     }
   };
 
-  // === incidents ===
+  // === incidents (scoped) ===
   const incidents = await query<{ id: string; message: string; response: string | null; sap_module: string | null; client_name: string | null; confidence: string | null }>(
     `SELECT id, message, response, sap_module, client_name, confidence
-       FROM incidents ORDER BY created_at DESC LIMIT 500`
+       FROM incidents WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 500`,
+    [tenantId]
   );
   for (const r of incidents.rows) {
     await tryUpsert({
@@ -147,10 +150,11 @@ export async function reindexAll(opts: { force?: boolean } = {}): Promise<Reinde
     });
   }
 
-  // === tickets de mesa ===
+  // === tickets de mesa (scoped) ===
   const tickets = await query<{ id: string; code: string; title: string; summary: string; system_affected: string | null; priority: string; status: string }>(
     `SELECT id, code, title, summary, system_affected, priority, status
-       FROM support_tickets ORDER BY created_at DESC LIMIT 500`
+       FROM support_tickets WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 500`,
+    [tenantId]
   );
   for (const r of tickets.rows) {
     await tryUpsert({
@@ -163,12 +167,13 @@ export async function reindexAll(opts: { force?: boolean } = {}): Promise<Reinde
     });
   }
 
-  // === conversations (Mesa) ===
+  // === conversations (Mesa) (scoped) ===
   const convs = await query<{ id: string; sap_module: string | null; summary: string | null; user_name: string | null; channel: string; status: string }>(
     `SELECT id, sap_module, summary, user_name, channel, status
        FROM support_conversations
-       WHERE summary IS NOT NULL
-       ORDER BY updated_at DESC LIMIT 500`
+       WHERE tenant_id = $1 AND summary IS NOT NULL
+       ORDER BY updated_at DESC LIMIT 500`,
+    [tenantId]
   );
   for (const r of convs.rows) {
     await tryUpsert({
@@ -181,10 +186,12 @@ export async function reindexAll(opts: { force?: boolean } = {}): Promise<Reinde
     });
   }
 
-  // === KB articles ===
+  // === KB articles (scoped) ===
   const kbs = await query<{ id: string; title: string; problem: string; solution: string; system: string | null; category: string | null; status: string }>(
     `SELECT id, title, problem, solution, system, category, status
-       FROM kb_articles WHERE status = 'approved' ORDER BY created_at DESC LIMIT 500`
+       FROM kb_articles WHERE tenant_id = $1 AND status = 'approved'
+       ORDER BY created_at DESC LIMIT 500`,
+    [tenantId]
   );
   for (const r of kbs.rows) {
     await tryUpsert({
@@ -197,10 +204,12 @@ export async function reindexAll(opts: { force?: boolean } = {}): Promise<Reinde
     });
   }
 
-  // === meetings ===
+  // === meetings (scoped) ===
   const meetings = await query<{ id: string; title: string; summary: string | null; client: string | null }>(
     `SELECT id, title, summary, client
-       FROM meetings WHERE status = 'done' ORDER BY created_at DESC LIMIT 200`
+       FROM meetings WHERE tenant_id = $1 AND status = 'done'
+       ORDER BY created_at DESC LIMIT 200`,
+    [tenantId]
   );
   for (const r of meetings.rows) {
     await tryUpsert({
@@ -213,10 +222,12 @@ export async function reindexAll(opts: { force?: boolean } = {}): Promise<Reinde
     });
   }
 
-  // === SAP inbound ===
+  // === SAP inbound (scoped) ===
   const inb = await query<{ id: string; title: string; summary: string | null; source: string; sap_system: string | null }>(
     `SELECT id, title, summary, source, sap_system
-       FROM sap_inbound_events ORDER BY created_at DESC LIMIT 200`
+       FROM sap_inbound_events WHERE tenant_id = $1
+       ORDER BY created_at DESC LIMIT 200`,
+    [tenantId]
   );
   for (const r of inb.rows) {
     await tryUpsert({
@@ -246,6 +257,7 @@ export interface SearchHit {
 }
 
 export async function semanticSearch(opts: {
+  tenantId: string;
   query: string;
   limit?: number;
   types?: SearchSourceType[];
@@ -254,9 +266,11 @@ export async function semanticSearch(opts: {
   if (!q) return [];
   const limit = Math.min(opts.limit ?? 20, 50);
 
-  // ¿Hay items indexados?
+  // ¿Hay items indexados para este tenant?
   const { rows: cntRows } = await query<{ c: string }>(
-    "SELECT count(*)::text AS c FROM search_index WHERE embedding IS NOT NULL"
+    `SELECT count(*)::text AS c FROM search_index
+      WHERE tenant_id = $1 AND embedding IS NOT NULL`,
+    [opts.tenantId]
   );
   if (Number(cntRows[0]?.c ?? 0) === 0) return [];
 
@@ -268,8 +282,8 @@ export async function semanticSearch(opts: {
     return [];
   }
 
-  const conds: string[] = ["embedding IS NOT NULL"];
-  const params: unknown[] = [];
+  const conds: string[] = ["tenant_id = $1", "embedding IS NOT NULL"];
+  const params: unknown[] = [opts.tenantId];
   if (opts.types && opts.types.length > 0) {
     params.push(opts.types);
     conds.push(`source_type = ANY($${params.length}::text[])`);
@@ -303,12 +317,19 @@ export async function semanticSearch(opts: {
   })).filter((h) => h.score > 0.1);  // descartar matches débiles
 }
 
-export async function getSearchStats(): Promise<{ total: number; byType: Record<string, number>; lastIndexed: string | null }> {
-  const { rows: total } = await query<{ c: string }>("SELECT count(*)::text AS c FROM search_index");
-  const { rows: byType } = await query<{ source_type: string; c: string }>(
-    "SELECT source_type, count(*)::text AS c FROM search_index GROUP BY source_type"
+export async function getSearchStats(tenantId: string): Promise<{ total: number; byType: Record<string, number>; lastIndexed: string | null }> {
+  const { rows: total } = await query<{ c: string }>(
+    "SELECT count(*)::text AS c FROM search_index WHERE tenant_id = $1",
+    [tenantId]
   );
-  const { rows: latest } = await query<{ d: string }>("SELECT max(indexed_at)::text AS d FROM search_index");
+  const { rows: byType } = await query<{ source_type: string; c: string }>(
+    "SELECT source_type, count(*)::text AS c FROM search_index WHERE tenant_id = $1 GROUP BY source_type",
+    [tenantId]
+  );
+  const { rows: latest } = await query<{ d: string }>(
+    "SELECT max(indexed_at)::text AS d FROM search_index WHERE tenant_id = $1",
+    [tenantId]
+  );
   const byTypeMap: Record<string, number> = {};
   for (const r of byType) byTypeMap[r.source_type] = Number(r.c);
   return {

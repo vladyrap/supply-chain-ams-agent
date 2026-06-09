@@ -29,47 +29,49 @@ function getClient(): GoogleGenAI {
   return cachedClient;
 }
 
-// Cache del prompt activo de DB (TTL 60s para no pegarle a Postgres en cada
-// request, pero reaccionar rápido a un "Adoptar" del Playground).
-let cachedActivePrompt: { text: string; label: string; expiresAt: number } | null = null;
+// Cache del prompt activo de DB (TTL 60s, por tenant — MT-3).
+// Cada tenant puede tener su prompt activo, así que el cache también
+// se segmenta por tenant.
+const cachedActivePromptByTenant = new Map<string, { text: string; label: string; expiresAt: number }>();
 const ACTIVE_PROMPT_TTL_MS = 60_000;
 
-async function getActiveOverride(): Promise<{ text: string; label: string } | null> {
-  if (cachedActivePrompt && cachedActivePrompt.expiresAt > Date.now()) {
-    return { text: cachedActivePrompt.text, label: cachedActivePrompt.label };
+async function getActiveOverride(tenantId: string): Promise<{ text: string; label: string } | null> {
+  const cached = cachedActivePromptByTenant.get(tenantId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.text ? { text: cached.text, label: cached.label } : null;
   }
   try {
     // Import dinámico para evitar ciclo (agent-lab también importa cosas del agente).
     const { getActivePrompt } = await import("./agent-lab.service");
-    const row = await getActivePrompt();
+    const row = await getActivePrompt(tenantId);
     if (row && row.system_prompt) {
-      cachedActivePrompt = {
+      cachedActivePromptByTenant.set(tenantId, {
         text: row.system_prompt,
         label: row.label,
         expiresAt: Date.now() + ACTIVE_PROMPT_TTL_MS,
-      };
+      });
       return { text: row.system_prompt, label: row.label };
     }
-    cachedActivePrompt = { text: "", label: "", expiresAt: Date.now() + ACTIVE_PROMPT_TTL_MS };
+    cachedActivePromptByTenant.set(tenantId, { text: "", label: "", expiresAt: Date.now() + ACTIVE_PROMPT_TTL_MS });
     return null;
   } catch (err) {
     // Si la tabla no existe todavía (primer arranque sin Playground usado),
     // simplemente no hay override.
-    logger.debug({ err }, "agent_prompt_versions no disponible — fallback a archivo");
+    logger.debug({ err, tenantId }, "agent_prompt_versions no disponible — fallback a archivo");
     return null;
   }
 }
 
 /** Permite invalidar el cache desde otros lugares (p.ej. tras adoptar). */
 export function invalidateActivePromptCache(): void {
-  cachedActivePrompt = null;
+  cachedActivePromptByTenant.clear();
 }
 
-async function loadSystemPrompt(): Promise<string> {
-  // 1) Si hay un prompt adoptado activo en DB, ese gana.
-  const override = await getActiveOverride();
+async function loadSystemPrompt(tenantId: string): Promise<string> {
+  // 1) Si hay un prompt adoptado activo en DB para este tenant, ese gana.
+  const override = await getActiveOverride(tenantId);
   if (override) {
-    logger.info({ active: override.label }, "agente usa prompt adoptado del Playground");
+    logger.info({ active: override.label, tenantId }, "agente usa prompt adoptado del Playground");
     return override.text;
   }
   // 2) Fallback al prompt del archivo (cache eterno tras el primer load).
@@ -141,7 +143,10 @@ interface PreparedRequest {
 
 async function prepareRequest(input: ClaudeChatInput): Promise<PreparedRequest> {
   const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
-  const baseSystemPrompt = await loadSystemPrompt();
+  // MT-3: prompt activo es per-tenant. Si no viene tenantId (path interno),
+  // se usa "default" — mismo fallback que few-shot / RAG.
+  const promptTenantId = input.tenantId ?? "default";
+  const baseSystemPrompt = await loadSystemPrompt(promptTenantId);
 
   // Few-shot dinámico: Q&A aprobadas + KB items publicados que matchean
   // léxicamente la query del usuario. Se concatena al system prompt si hay
@@ -161,7 +166,10 @@ async function prepareRequest(input: ClaudeChatInput): Promise<PreparedRequest> 
     ? `${baseSystemPrompt}\n${fewShot.block}`
     : baseSystemPrompt;
 
-  const ragChunks = await retrieveRelevantChunks(input.userMessage, {
+  // MT-3: RAG aislado por tenant. Mismo fallback que few-shot ("default")
+  // mientras callers internos (eval, tests) migran a pasar su tenantId.
+  const ragTenantId = input.tenantId ?? "default";
+  const ragChunks = await retrieveRelevantChunks(ragTenantId, input.userMessage, {
     module: input.module,
     client: input.client,
   }).catch((err) => {
@@ -274,11 +282,12 @@ export async function chatWithAgent(input: ClaudeChatInput): Promise<ClaudeChatR
       logger.debug({ err }, "provenance.record fail (continuo)");
     }
 
-    // Hallucination check fire-and-forget — no bloquea la respuesta
+    // Hallucination check fire-and-forget — no bloquea la respuesta (scoped MT-3)
+    const hallucTenantId = input.tenantId ?? "default";
     (async () => {
       try {
         const { checkHallucinations } = await import("./hallucination-detector.service");
-        await checkHallucinations({
+        await checkHallucinations(hallucTenantId, {
           responseId,
           userQuery: input.userMessage,
           responseText: text,

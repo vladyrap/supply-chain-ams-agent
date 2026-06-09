@@ -1,15 +1,12 @@
-// Dashboard avanzado: consolida métricas de incidents, tickets de mesa,
-// reuniones, KB y entrega un solo payload listo para los gráficos.
+// Dashboard avanzado + ejecutivo (multi-tenant).
+//
+// MT-3: getDashboardAdvanced y getDashboardExecutive reciben tenantId
+// obligatorio. Cada cliente ve solo sus KPIs.
 import { query } from "../database/db";
 
-// Costo estimado por interacción del agente. La cifra es muy aproximada:
-// gemini-2.5-flash-lite ≈ $0.10/1M tokens input + $0.40/1M output. Asumiendo
-// 2500 in + 1500 out por respuesta da ≈ $0.00085 USD. Lo dejamos configurable
-// por ENV para que el usuario pueda afinar según el modelo real que use.
 const EST_USD_PER_INCIDENT = Number(process.env.EST_USD_PER_INCIDENT ?? 0.001);
 
 export interface DashboardAdvanced {
-  // KPIs
   totals: {
     incidents: number;
     incidentsToday: number;
@@ -23,30 +20,17 @@ export interface DashboardAdvanced {
     meetingsDone: number;
     kbApproved: number;
   };
-  // Heatmap actividad: cada celda { dayOfWeek 0-6 (0=Lun), hour 0-23, value }
-  // Combina incidents + tickets + meetings creados.
   heatmap: { day: number; hour: number; value: number }[];
-  // Distribución por módulo SAP
   byModule: { key: string; count: number }[];
-  // Distribución por confianza del agente (sobre incidents)
   byConfidence: { key: string; count: number }[];
-  // Distribución por urgencia (mesa de soporte tickets)
   byUrgency: { key: string; count: number }[];
-  // SLA: para gauge animado
-  sla: {
-    inSla: number;      // tickets activos dentro de SLA
-    breaching: number;  // activos vencidos
-    okPct: number;      // 0-100
-  };
-  // Top usuarios por incidentes creados
+  sla: { inSla: number; breaching: number; okPct: number };
   topUsers: { name: string; count: number }[];
-  // Top sistemas con más tickets de mesa
   topSystems: { key: string; count: number }[];
-  // Timeline último 14 días (incidents + tickets + meetings)
   timeline: { day: string; incidents: number; tickets: number; meetings: number }[];
 }
 
-export async function getDashboardAdvanced(): Promise<DashboardAdvanced> {
+export async function getDashboardAdvanced(tenantId: string): Promise<DashboardAdvanced> {
   const [
     incTotal, incToday, inc7d, incAttach,
     convTotal, convOpen, aiResRow, tktActive, slaBreach,
@@ -54,72 +38,81 @@ export async function getDashboardAdvanced(): Promise<DashboardAdvanced> {
     heatmapRows, byModuleRows, byConfRows, byUrgRows,
     slaInRow, slaOutRow, topUsersRows, topSystemsRows, timelineRows,
   ] = await Promise.all([
-    query<{ c: string }>("SELECT count(*)::text AS c FROM incidents"),
-    query<{ c: string }>("SELECT count(*)::text AS c FROM incidents WHERE created_at::date = current_date"),
-    query<{ c: string }>("SELECT count(*)::text AS c FROM incidents WHERE created_at >= now() - interval '7 days'"),
-    query<{ c: string }>("SELECT count(*)::text AS c FROM incidents WHERE jsonb_array_length(attachments) > 0"),
+    query<{ c: string }>("SELECT count(*)::text AS c FROM incidents WHERE tenant_id = $1", [tenantId]),
+    query<{ c: string }>("SELECT count(*)::text AS c FROM incidents WHERE tenant_id = $1 AND created_at::date = current_date", [tenantId]),
+    query<{ c: string }>("SELECT count(*)::text AS c FROM incidents WHERE tenant_id = $1 AND created_at >= now() - interval '7 days'", [tenantId]),
+    query<{ c: string }>("SELECT count(*)::text AS c FROM incidents WHERE tenant_id = $1 AND jsonb_array_length(attachments) > 0", [tenantId]),
 
-    query<{ c: string }>("SELECT count(*)::text AS c FROM support_conversations"),
-    query<{ c: string }>("SELECT count(*)::text AS c FROM support_conversations WHERE status IN ('open','ai_handling','waiting_user')"),
+    query<{ c: string }>("SELECT count(*)::text AS c FROM support_conversations WHERE tenant_id = $1", [tenantId]),
+    query<{ c: string }>("SELECT count(*)::text AS c FROM support_conversations WHERE tenant_id = $1 AND status IN ('open','ai_handling','waiting_user')", [tenantId]),
     query<{ closed: string; resolved: string }>(
       `SELECT count(*) FILTER (WHERE status IN ('resolved','closed'))::text AS closed,
               count(*) FILTER (WHERE ai_resolved = true)::text AS resolved
-         FROM support_conversations`
+         FROM support_conversations WHERE tenant_id = $1`,
+      [tenantId]
     ),
-    query<{ c: string }>("SELECT count(*)::text AS c FROM support_tickets WHERE status IN ('new','in_progress','waiting_customer')"),
-    query<{ c: string }>("SELECT count(*)::text AS c FROM support_tickets WHERE sla_due_at IS NOT NULL AND sla_due_at < now() AND status NOT IN ('resolved','closed')"),
-    query<{ c: string }>("SELECT count(*)::text AS c FROM meetings WHERE status='done'"),
-    query<{ c: string }>("SELECT count(*)::text AS c FROM kb_articles WHERE status='approved'"),
+    query<{ c: string }>("SELECT count(*)::text AS c FROM support_tickets WHERE tenant_id = $1 AND status IN ('new','in_progress','waiting_customer')", [tenantId]),
+    query<{ c: string }>("SELECT count(*)::text AS c FROM support_tickets WHERE tenant_id = $1 AND sla_due_at IS NOT NULL AND sla_due_at < now() AND status NOT IN ('resolved','closed')", [tenantId]),
+    query<{ c: string }>("SELECT count(*)::text AS c FROM meetings WHERE tenant_id = $1 AND status='done'", [tenantId]),
+    query<{ c: string }>("SELECT count(*)::text AS c FROM kb_articles WHERE tenant_id = $1 AND status='approved'", [tenantId]),
 
-    // Heatmap (últimos 14 días: incidents + tickets + meetings agrupados por dow + hour)
     query<{ dow: string; hr: string; cnt: string }>(
       `WITH combined AS (
-         SELECT created_at FROM incidents WHERE created_at >= now() - interval '14 days'
+         SELECT created_at FROM incidents WHERE tenant_id = $1 AND created_at >= now() - interval '14 days'
          UNION ALL
-         SELECT created_at FROM support_tickets WHERE created_at >= now() - interval '14 days'
+         SELECT created_at FROM support_tickets WHERE tenant_id = $1 AND created_at >= now() - interval '14 days'
          UNION ALL
-         SELECT created_at FROM meetings WHERE created_at >= now() - interval '14 days'
+         SELECT created_at FROM meetings WHERE tenant_id = $1 AND created_at >= now() - interval '14 days'
        )
        SELECT
          ((EXTRACT(DOW FROM created_at)::int + 6) % 7)::text AS dow,
          EXTRACT(HOUR FROM created_at)::text AS hr,
          count(*)::text AS cnt
        FROM combined
-       GROUP BY dow, hr`
+       GROUP BY dow, hr`,
+      [tenantId]
     ),
 
     query<{ k: string; c: string }>(
       `SELECT COALESCE(sap_module, 'NO_INFORMADO') AS k, count(*)::text AS c
-         FROM incidents GROUP BY 1 ORDER BY count(*) DESC LIMIT 8`
+         FROM incidents WHERE tenant_id = $1 GROUP BY 1 ORDER BY count(*) DESC LIMIT 8`,
+      [tenantId]
     ),
     query<{ k: string; c: string }>(
       `SELECT COALESCE(confidence, 'no_detectada') AS k, count(*)::text AS c
-         FROM incidents GROUP BY 1`
+         FROM incidents WHERE tenant_id = $1 GROUP BY 1`,
+      [tenantId]
     ),
     query<{ k: string; c: string }>(
       `SELECT COALESCE(urgency, 'media') AS k, count(*)::text AS c
-         FROM support_conversations WHERE urgency IS NOT NULL GROUP BY 1`
+         FROM support_conversations WHERE tenant_id = $1 AND urgency IS NOT NULL GROUP BY 1`,
+      [tenantId]
     ),
 
     query<{ c: string }>(
       `SELECT count(*)::text AS c FROM support_tickets
-        WHERE sla_due_at IS NOT NULL AND sla_due_at >= now() AND status NOT IN ('resolved','closed')`
+        WHERE tenant_id = $1 AND sla_due_at IS NOT NULL AND sla_due_at >= now() AND status NOT IN ('resolved','closed')`,
+      [tenantId]
     ),
     query<{ c: string }>(
       `SELECT count(*)::text AS c FROM support_tickets
-        WHERE sla_due_at IS NOT NULL AND sla_due_at < now() AND status NOT IN ('resolved','closed')`
+        WHERE tenant_id = $1 AND sla_due_at IS NOT NULL AND sla_due_at < now() AND status NOT IN ('resolved','closed')`,
+      [tenantId]
     ),
 
     query<{ name: string; c: string }>(
       `SELECT COALESCE(user_name, 'anonymous') AS name, count(*)::text AS c
          FROM incidents
-        WHERE user_name IS NOT NULL
-        GROUP BY user_name ORDER BY count(*) DESC LIMIT 5`
+        WHERE tenant_id = $1 AND user_name IS NOT NULL
+        GROUP BY user_name ORDER BY count(*) DESC LIMIT 5`,
+      [tenantId]
     ),
     query<{ k: string; c: string }>(
       `SELECT COALESCE(system_affected, 'NO_INFORMADO') AS k, count(*)::text AS c
          FROM support_tickets
-        GROUP BY 1 ORDER BY count(*) DESC LIMIT 5`
+        WHERE tenant_id = $1
+        GROUP BY 1 ORDER BY count(*) DESC LIMIT 5`,
+      [tenantId]
     ),
 
     query<{ d: string; incidents: string; tickets: string; meetings: string }>(
@@ -129,10 +122,11 @@ export async function getDashboardAdvanced(): Promise<DashboardAdvanced> {
          )::date AS day
        )
        SELECT d.day::text AS d,
-              COALESCE((SELECT count(*) FROM incidents       WHERE created_at::date = d.day), 0)::text AS incidents,
-              COALESCE((SELECT count(*) FROM support_tickets WHERE created_at::date = d.day), 0)::text AS tickets,
-              COALESCE((SELECT count(*) FROM meetings        WHERE created_at::date = d.day), 0)::text AS meetings
-         FROM days d ORDER BY d.day`
+              COALESCE((SELECT count(*) FROM incidents       WHERE tenant_id = $1 AND created_at::date = d.day), 0)::text AS incidents,
+              COALESCE((SELECT count(*) FROM support_tickets WHERE tenant_id = $1 AND created_at::date = d.day), 0)::text AS tickets,
+              COALESCE((SELECT count(*) FROM meetings        WHERE tenant_id = $1 AND created_at::date = d.day), 0)::text AS meetings
+         FROM days d ORDER BY d.day`,
+      [tenantId]
     ),
   ]);
 
@@ -178,28 +172,28 @@ export async function getDashboardAdvanced(): Promise<DashboardAdvanced> {
 }
 
 // ============================================================
-// Dashboard ejecutivo: KPIs comerciales para C-level / cliente
+// Dashboard ejecutivo: KPIs comerciales para C-level / cliente (scoped)
 // ============================================================
 export interface DashboardExecutive {
   period: { from: string; to: string; days: number };
   kpis: {
-    totalInteractions: number;     // incidents + conversations en el periodo
+    totalInteractions: number;
     incidentsMonth: number;
     ticketsResolvedMonth: number;
-    aiResolutionRate: number;      // % conversaciones cerradas resueltas por IA
-    slaCompliancePct: number;      // % tickets cerrados que cumplieron SLA
-    avgResponseTimeMin: number;    // tiempo prom. ticket → resolved (min)
-    kbArticlesCreated: number;     // KB articles approved creados en el periodo
-    estimatedCostUsd: number;      // costo Gemini estimado
-    costPerInteractionUsd: number; // factor usado
+    aiResolutionRate: number;
+    slaCompliancePct: number;
+    avgResponseTimeMin: number;
+    kbArticlesCreated: number;
+    estimatedCostUsd: number;
+    costPerInteractionUsd: number;
   };
   byClient: { name: string; incidents: number; tickets: number; total: number }[];
   byModule: { key: string; count: number }[];
   trend: { day: string; interactions: number }[];
-  topAgents: { name: string; resolved: number }[]; // humanos que resolvieron más tickets
+  topAgents: { name: string; resolved: number }[];
 }
 
-export async function getDashboardExecutive(days = 30): Promise<DashboardExecutive> {
+export async function getDashboardExecutive(tenantId: string, days = 30): Promise<DashboardExecutive> {
   const safeDays = Math.max(1, Math.min(days, 365));
   const interval = `${safeDays} days`;
 
@@ -208,51 +202,71 @@ export async function getDashboardExecutive(days = 30): Promise<DashboardExecuti
     kbCreated, byClientIncRows, byClientConvRows, byModuleRows, trendRows, topAgentsRows,
   ] = await Promise.all([
     query<{ c: string }>(
-      `SELECT count(*)::text AS c FROM incidents WHERE created_at >= now() - interval '${interval}'`
+      `SELECT count(*)::text AS c FROM incidents
+        WHERE tenant_id = $1 AND created_at >= now() - interval '${interval}'`,
+      [tenantId]
     ),
     query<{ c: string }>(
       `SELECT count(*)::text AS c FROM support_tickets
-        WHERE status IN ('resolved','closed') AND resolved_at >= now() - interval '${interval}'`
+        WHERE tenant_id = $1
+          AND status IN ('resolved','closed')
+          AND resolved_at >= now() - interval '${interval}'`,
+      [tenantId]
     ),
     query<{ closed: string; ai: string }>(
       `SELECT count(*) FILTER (WHERE status IN ('resolved','closed'))::text AS closed,
               count(*) FILTER (WHERE ai_resolved = true)::text AS ai
          FROM support_conversations
-        WHERE created_at >= now() - interval '${interval}'`
+        WHERE tenant_id = $1 AND created_at >= now() - interval '${interval}'`,
+      [tenantId]
     ),
     query<{ ok: string; bad: string }>(
       `SELECT count(*) FILTER (WHERE resolved_at IS NOT NULL AND sla_due_at IS NOT NULL AND resolved_at <= sla_due_at)::text AS ok,
               count(*) FILTER (WHERE resolved_at IS NOT NULL AND sla_due_at IS NOT NULL AND resolved_at >  sla_due_at)::text AS bad
          FROM support_tickets
-        WHERE resolved_at >= now() - interval '${interval}'`
+        WHERE tenant_id = $1 AND resolved_at >= now() - interval '${interval}'`,
+      [tenantId]
     ),
     query<{ avg_min: string | null }>(
       `SELECT (EXTRACT(EPOCH FROM AVG(resolved_at - created_at)) / 60)::text AS avg_min
          FROM support_tickets
-        WHERE resolved_at IS NOT NULL AND resolved_at >= now() - interval '${interval}'`
+        WHERE tenant_id = $1
+          AND resolved_at IS NOT NULL
+          AND resolved_at >= now() - interval '${interval}'`,
+      [tenantId]
     ),
     query<{ c: string }>(
       `SELECT count(*)::text AS c FROM kb_articles
-        WHERE status='approved' AND created_at >= now() - interval '${interval}'`
+        WHERE tenant_id = $1
+          AND status='approved'
+          AND created_at >= now() - interval '${interval}'`,
+      [tenantId]
     ),
     query<{ k: string; c: string }>(
       `SELECT COALESCE(NULLIF(client_name,''), 'NO_INFORMADO') AS k, count(*)::text AS c
-         FROM incidents WHERE created_at >= now() - interval '${interval}'
-        GROUP BY 1 ORDER BY count(*) DESC LIMIT 10`
+         FROM incidents
+        WHERE tenant_id = $1
+          AND created_at >= now() - interval '${interval}'
+        GROUP BY 1 ORDER BY count(*) DESC LIMIT 10`,
+      [tenantId]
     ),
     query<{ k: string; c: string }>(
       `SELECT COALESCE(NULLIF(client,''), 'NO_INFORMADO') AS k, count(*)::text AS c
-         FROM support_conversations WHERE created_at >= now() - interval '${interval}'
-        GROUP BY 1 ORDER BY count(*) DESC LIMIT 10`
+         FROM support_conversations
+        WHERE tenant_id = $1
+          AND created_at >= now() - interval '${interval}'
+        GROUP BY 1 ORDER BY count(*) DESC LIMIT 10`,
+      [tenantId]
     ),
     query<{ k: string; c: string }>(
       `WITH combined AS (
-         SELECT sap_module FROM incidents WHERE created_at >= now() - interval '${interval}'
+         SELECT sap_module FROM incidents             WHERE tenant_id = $1 AND created_at >= now() - interval '${interval}'
          UNION ALL
-         SELECT sap_module FROM support_conversations WHERE created_at >= now() - interval '${interval}'
+         SELECT sap_module FROM support_conversations WHERE tenant_id = $1 AND created_at >= now() - interval '${interval}'
        )
        SELECT COALESCE(NULLIF(sap_module,''), 'NO_INFORMADO') AS k, count(*)::text AS c
-         FROM combined GROUP BY 1 ORDER BY count(*) DESC LIMIT 8`
+         FROM combined GROUP BY 1 ORDER BY count(*) DESC LIMIT 8`,
+      [tenantId]
     ),
     query<{ d: string; n: string }>(
       `WITH days AS (
@@ -262,18 +276,21 @@ export async function getDashboardExecutive(days = 30): Promise<DashboardExecuti
        )
        SELECT d.day::text AS d,
               (
-                COALESCE((SELECT count(*) FROM incidents             WHERE created_at::date = d.day), 0) +
-                COALESCE((SELECT count(*) FROM support_conversations WHERE created_at::date = d.day), 0)
+                COALESCE((SELECT count(*) FROM incidents             WHERE tenant_id = $1 AND created_at::date = d.day), 0) +
+                COALESCE((SELECT count(*) FROM support_conversations WHERE tenant_id = $1 AND created_at::date = d.day), 0)
               )::text AS n
-         FROM days d ORDER BY d.day`
+         FROM days d ORDER BY d.day`,
+      [tenantId]
     ),
     query<{ name: string; c: string }>(
       `SELECT COALESCE(u.name, 'sin asignar') AS name, count(*)::text AS c
          FROM support_tickets t
          LEFT JOIN users u ON u.id = t.assigned_to
-        WHERE t.resolved_at IS NOT NULL AND t.resolved_at >= now() - interval '${interval}'
+        WHERE t.tenant_id = $1
+          AND t.resolved_at IS NOT NULL AND t.resolved_at >= now() - interval '${interval}'
           AND t.assigned_to IS NOT NULL
-        GROUP BY u.name ORDER BY count(*) DESC LIMIT 5`
+        GROUP BY u.name ORDER BY count(*) DESC LIMIT 5`,
+      [tenantId]
     ),
   ]);
 
@@ -288,7 +305,6 @@ export async function getDashboardExecutive(days = 30): Promise<DashboardExecuti
   const slaPct = slaTotal > 0 ? Math.round((slaOk / slaTotal) * 100) : 100;
   const avgMin = avgResp.rows[0]?.avg_min ? Math.round(Number(avgResp.rows[0].avg_min)) : 0;
 
-  // Merge clientes incidents + conversations
   const clientMap = new Map<string, { incidents: number; tickets: number }>();
   for (const r of byClientIncRows.rows) clientMap.set(r.k, { incidents: Number(r.c), tickets: 0 });
   for (const r of byClientConvRows.rows) {

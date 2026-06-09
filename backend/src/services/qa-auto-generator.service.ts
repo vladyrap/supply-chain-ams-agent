@@ -1,13 +1,14 @@
-// Auto-generador de Q&A para items que no las tienen.
+// Auto-generador de Q&A para items que no las tienen (multi-tenant).
+//
+// MT-3: autoGenerateQasForItems recibe tenantId obligatorio y scopea
+// el SELECT/INSERT por tenant. El cron passes el tenantId desde el
+// worker (uno por tenant activo).
 //
 // Para cada KnowledgeItem en estado PUBLISHED o VALIDATED que no tenga
-// Q&A asociadas, genera 3 Q&A usando un algoritmo determinístico basado
-// en title/summary/content/tags + módulo. Las marca approved=true para
-// que estén disponibles inmediatamente como few-shot del agente.
-//
-// El algoritmo es plantilla: se generan preguntas plausibles a partir
-// del título/módulo y la summary del item se usa como base de respuesta.
-// Es suficiente para entrenamiento inicial y rellenar el corpus.
+// Q&A asociadas (del mismo tenant), genera 3 Q&A usando un algoritmo
+// determinístico basado en title/summary/content/tags + módulo. Las
+// marca approved=true para que estén disponibles inmediatamente como
+// few-shot del agente.
 
 import { query } from "../database/db";
 import { logger } from "../utils/logger";
@@ -62,9 +63,10 @@ function buildQasForItem(item: ItemRow): { question: string; expectedAnswer: str
   return templates.slice(0, 3);
 }
 
-export async function autoGenerateQasForItems(opts: { limit?: number } = {}): Promise<AutoQaReport> {
-  // MT-2: cron sin contexto HTTP, usamos "default". TODO MT-6: parametrizar tenantId.
-  const tenantId = "default";
+export async function autoGenerateQasForItems(
+  tenantId: string,
+  opts: { limit?: number } = {},
+): Promise<AutoQaReport> {
   await training.getSnapshot(tenantId).catch(() => null);
   const limit = Math.max(1, Math.min(200, opts.limit ?? 100));
 
@@ -112,11 +114,11 @@ export async function autoGenerateQasForItems(opts: { limit?: number } = {}): Pr
       cur.qas += created.length;
       moduleAcc.set(item.module, cur);
     } catch (err) {
-      logger.warn({ err, itemId: item.id }, "autoGenerateQas item fail");
+      logger.warn({ err, itemId: item.id, tenantId }, "autoGenerateQas item fail");
       report.itemsSkipped++;
     }
   }
   report.byModule = Array.from(moduleAcc.entries()).map(([module, v]) => ({ module, items: v.items, qas: v.qas }));
-  logger.info(report, "auto-Q&A generation completed");
+  logger.info({ ...report, tenantId }, "auto-Q&A generation completed");
   return report;
 }

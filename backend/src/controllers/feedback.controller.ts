@@ -55,7 +55,7 @@ export async function postFeedback(
   }
   try {
     const userId = await getUserId(req);
-    const row = await createFeedback({
+    const row = await createFeedback(req.tenantId, {
       source: b.source as FeedbackSource,
       kind: b.kind as FeedbackKind,
       reason: b.reason?.trim() || null,
@@ -101,7 +101,7 @@ export async function getFeedbackList(
 ) {
   try {
     const q = req.query || {};
-    const rows = await listFeedback({
+    const rows = await listFeedback(req.tenantId, {
       source: VALID_SOURCES.includes(q.source as FeedbackSource) ? (q.source as FeedbackSource) : undefined,
       kind:   VALID_KINDS.includes(q.kind as FeedbackKind) ? (q.kind as FeedbackKind) : undefined,
       conversationId: q.conversationId,
@@ -117,9 +117,9 @@ export async function getFeedbackList(
 // =====================================================
 // GET /api/agent-lab/feedback/stats
 // =====================================================
-export async function getFeedbackStatsRoute(_req: FastifyRequest, reply: FastifyReply) {
+export async function getFeedbackStatsRoute(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const stats = await getFeedbackStats();
+    const stats = await getFeedbackStats(req.tenantId);
     return reply.send({ success: true, stats });
   } catch (err) {
     logger.error({ err }, "feedback.stats fail");
@@ -153,7 +153,7 @@ export async function getConversationTrace(
       `SELECT * FROM support_messages WHERE conversation_id = $1 ORDER BY created_at ASC`,
       [id]
     );
-    const feedback = await listFeedback({ conversationId: id, limit: 200 });
+    const feedback = await listFeedback(req.tenantId, { conversationId: id, limit: 200 });
     let ticket = null;
     if (conv.escalated_to_ticket) {
       const { rows: tk } = await query(
@@ -180,9 +180,9 @@ export async function getConversationTrace(
 // WIZARD: ticket → KB draft
 // =====================================================
 
-export async function getConvertibleTickets(_req: FastifyRequest, reply: FastifyReply) {
+export async function getConvertibleTickets(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const tickets = await listConvertibleTickets(80);
+    const tickets = await listConvertibleTickets(req.tenantId, 80);
     return reply.send({ success: true, count: tickets.length, tickets });
   } catch (err) {
     logger.error({ err }, "wizard.listTickets fail");
@@ -201,7 +201,7 @@ export async function postWizardDraft(
     return reply.code(400).send({ success: false, error: "ID inválido" });
   }
   try {
-    const result = await draftKbFromTicket(id);
+    const result = await draftKbFromTicket(req.tenantId, id);
     return reply.send({ success: true, ...result });
   } catch (err) {
     logger.error({ err, id }, "wizard.draft fail");
@@ -303,7 +303,7 @@ export async function postAdoptPrompt(
   }
   try {
     const userId = await getUserId(req);
-    const row = await adoptPrompt({
+    const row = await adoptPrompt(req.tenantId, {
       label: b.label,
       systemPrompt: b.systemPrompt,
       temperature: b.temperature,
@@ -318,9 +318,9 @@ export async function postAdoptPrompt(
   }
 }
 
-export async function getActivePromptRoute(_req: FastifyRequest, reply: FastifyReply) {
+export async function getActivePromptRoute(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const row = await getActivePrompt();
+    const row = await getActivePrompt(req.tenantId);
     return reply.send({ success: true, version: row });
   } catch (err) {
     logger.error({ err }, "prompt.active fail");
@@ -328,9 +328,9 @@ export async function getActivePromptRoute(_req: FastifyRequest, reply: FastifyR
   }
 }
 
-export async function listPromptVersionsRoute(_req: FastifyRequest, reply: FastifyReply) {
+export async function listPromptVersionsRoute(req: FastifyRequest, reply: FastifyReply) {
   try {
-    const rows = await listPromptVersions(50);
+    const rows = await listPromptVersions(req.tenantId, 50);
     return reply.send({ success: true, count: rows.length, versions: rows });
   } catch (err) {
     logger.error({ err }, "prompt.list fail");
@@ -345,7 +345,7 @@ export async function postActivatePromptVersion(
   const { id } = req.params;
   if (!UUID_RX.test(id)) return reply.code(400).send({ success: false, error: "ID inválido" });
   try {
-    const row = await activatePromptVersion(id);
+    const row = await activatePromptVersion(req.tenantId, id);
     if (!row) return reply.code(404).send({ success: false, error: "Versión no encontrada" });
     return reply.send({ success: true, version: row });
   } catch (err) {
