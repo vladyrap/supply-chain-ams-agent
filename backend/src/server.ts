@@ -1,5 +1,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import helmet from "@fastify/helmet";
+import rateLimit from "@fastify/rate-limit";
 import { initSentry, captureException } from "./utils/sentry";
 
 // Inicializa Sentry ANTES de Fastify (recomendado).
@@ -74,6 +76,29 @@ export function buildServer() {
   const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS ||
     "http://localhost:6700,http://localhost:6600,http://127.0.0.1:6700,http://127.0.0.1:6600")
     .split(",").map((s) => s.trim()).filter(Boolean);
+  // v0.12.8 — Helmet: headers de seguridad recomendados (XSS, clickjacking, etc).
+  // contentSecurityPolicy desactivado porque el frontend está en otro origen
+  // y CSP estricta rompería los recursos cross-origin esperados.
+  app.register(helmet, {
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  });
+
+  // v0.12.8 — Rate limit global por IP. 200 req/min default.
+  // Excepciones: /health (sin rate limit), /metrics (sin rate limit).
+  app.register(rateLimit, {
+    max: Number(process.env.RATE_LIMIT_MAX_PER_MIN ?? 200),
+    timeWindow: "1 minute",
+    allowList: ["127.0.0.1", "::1"],
+    skipOnError: true,
+    keyGenerator: (req) => {
+      // Si hay X-Forwarded-For (proxy), usar primera IP. Si no, IP directa.
+      const fwd = req.headers["x-forwarded-for"];
+      const ip = Array.isArray(fwd) ? fwd[0] : (fwd?.split(",")[0]?.trim() ?? req.ip);
+      return ip ?? "unknown";
+    },
+  });
+
   app.register(cors, {
     origin: (origin, cb) => {
       if (!origin || ALLOWED_ORIGINS.includes(origin)) cb(null, true);
