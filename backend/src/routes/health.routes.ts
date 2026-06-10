@@ -14,6 +14,19 @@ export async function healthRoutes(app: FastifyInstance) {
     });
   });
 
+  // v1.2.7-prod — /api/version: tag git + commit + buildAt (set por CI/Docker)
+  app.get("/api/version", async (_req, reply) => {
+    return reply.send({
+      success: true,
+      service: "ams-backend",
+      version: process.env.APP_VERSION || "dev",
+      gitSha: process.env.GIT_SHA || "unknown",
+      buildAt: process.env.BUILD_AT || null,
+      nodeEnv: process.env.NODE_ENV || "development",
+      timestamp: new Date().toISOString(),
+    });
+  });
+
   app.get("/health/deep", async (_req, reply) => {
     const dbOk = await ping();
     return reply.send({
