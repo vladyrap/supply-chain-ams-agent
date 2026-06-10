@@ -12,7 +12,11 @@ import {
   deleteSession,
   listUsers,
   updateUserRole,
+  createPasswordResetToken,
+  validatePasswordResetToken,
+  resetPasswordWithToken,
 } from "../services/auth.service";
+import { sendPasswordReset } from "../services/email.service";
 import { logger } from "../utils/logger";
 import type { Role } from "../types/auth.types";
 
@@ -243,6 +247,107 @@ export async function patchUserRole(
     return reply.code(400).send({
       success: false,
       error: err instanceof Error ? err.message : "Error",
+    });
+  }
+}
+
+// =============================================================================
+// v1.2.5-prod: Olvidé mi contraseña
+// =============================================================================
+
+/**
+ * POST /api/auth/forgot-password
+ * Body: { email }
+ * Siempre devuelve 200 OK (independiente de si el email existe) para no
+ * permitir enumeration. Si existe, envía email con link de reset.
+ */
+export async function postForgotPassword(req: FastifyRequest, reply: FastifyReply) {
+  const b = (req.body || {}) as { email?: string };
+  if (!b.email || typeof b.email !== "string") {
+    return reply.code(400).send({ success: false, error: "email es obligatorio" });
+  }
+  try {
+    const issued = await createPasswordResetToken(b.email, meta(req));
+    if (issued) {
+      // Construir link público al frontend
+      const baseUrl = (process.env.PUBLIC_BASE_URL || "https://ams.roccoai.cl").replace(/\/+$/, "");
+      const resetUrl = `${baseUrl}/reset-password?token=${encodeURIComponent(issued.token)}`;
+      sendPasswordReset({
+        to: issued.email,
+        name: issued.email.split("@")[0] ?? "Usuario",
+        resetUrl,
+        expiresInMinutes: 120,
+      }).catch((e: unknown) => {
+        logger.warn({ err: e, email: issued.email }, "sendPasswordReset failed (non-blocking)");
+      });
+    }
+    // Respuesta genérica e idempotente
+    return reply.send({
+      success: true,
+      message: "Si el email existe en el sistema, vas a recibir un link de reset en los próximos minutos.",
+    });
+  } catch (err) {
+    logger.error({ err }, "Fallo en /api/auth/forgot-password");
+    return reply.code(500).send({
+      success: false,
+      error: "Error procesando la solicitud. Intentá de nuevo o contactá al administrador.",
+    });
+  }
+}
+
+/**
+ * GET /api/auth/reset-password?token=XXX
+ * Validar un token sin hacer el cambio. Útil para que la UI muestre el form
+ * solo si el token es válido (en vez de "Inválido" recién al submit).
+ */
+export async function getValidateResetToken(req: FastifyRequest, reply: FastifyReply) {
+  const q = (req.query || {}) as { token?: string };
+  if (!q.token) {
+    return reply.code(400).send({ success: false, error: "token requerido" });
+  }
+  const v = await validatePasswordResetToken(q.token);
+  if (!v.valid) {
+    return reply.code(400).send({
+      success: false,
+      error: v.reason === "expired" ? "Este link expiró (válido por 2 horas)."
+           : v.reason === "already_used" ? "Este link ya fue usado. Pedí uno nuevo."
+           : "Link inválido. Pedí uno nuevo en 'Olvidé mi contraseña'.",
+    });
+  }
+  return reply.send({ success: true, email: v.email });
+}
+
+/**
+ * POST /api/auth/reset-password
+ * Body: { token, newPassword }
+ * Cambia la pass usando el token. Revoca sesiones existentes.
+ */
+export async function postResetPassword(req: FastifyRequest, reply: FastifyReply) {
+  const b = (req.body || {}) as { token?: string; newPassword?: string };
+  if (!b.token || !b.newPassword) {
+    return reply.code(400).send({ success: false, error: "token y newPassword son obligatorios" });
+  }
+  if (b.newPassword.length < 8) {
+    return reply.code(400).send({ success: false, error: "La contraseña debe tener al menos 8 caracteres" });
+  }
+  try {
+    const r = await resetPasswordWithToken(b.token, b.newPassword, meta(req));
+    if (!r.ok) {
+      const msg = r.reason === "expired" ? "Este link expiró. Pedí uno nuevo."
+                : r.reason === "already_used" ? "Este link ya fue usado."
+                : r.reason === "not_found" ? "Link inválido. Pedí uno nuevo."
+                : r.reason;
+      return reply.code(400).send({ success: false, error: msg });
+    }
+    return reply.send({
+      success: true,
+      message: "Contraseña actualizada. Ya podés ingresar con tu nueva contraseña.",
+    });
+  } catch (err) {
+    logger.error({ err }, "Fallo en /api/auth/reset-password");
+    return reply.code(500).send({
+      success: false,
+      error: "Error procesando el cambio de contraseña. Intentá de nuevo.",
     });
   }
 }

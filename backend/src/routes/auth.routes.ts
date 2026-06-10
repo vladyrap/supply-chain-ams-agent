@@ -9,6 +9,9 @@ import {
   getMe,
   getUsers,
   patchUserRole,
+  postForgotPassword,
+  getValidateResetToken,
+  postResetPassword,
 } from "../controllers/auth.controller";
 import type { Role } from "../types/auth.types";
 
@@ -43,4 +46,9 @@ export async function authRoutes(app: FastifyInstance) {
     "/api/auth/users/:id/role",
     patchUserRole
   );
+
+  // v1.2.5-prod: olvidé contraseña
+  app.post("/api/auth/forgot-password", AUTH_STRICT_RL, postForgotPassword);
+  app.get("/api/auth/reset-password", getValidateResetToken);
+  app.post("/api/auth/reset-password", AUTH_STRICT_RL, postResetPassword);
 }

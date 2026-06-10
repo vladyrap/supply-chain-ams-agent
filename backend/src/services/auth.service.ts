@@ -65,7 +65,7 @@ async function ensureHardenedSchema(): Promise<void> {
 
 export async function recordAuthEvent(
   tenantId: string,
-  event: "LOGIN_SUCCESS" | "LOGIN_FAIL" | "LOGOUT" | "REFRESH" | "REVOKE_ALL" | "SIGNUP",
+  event: "LOGIN_SUCCESS" | "LOGIN_FAIL" | "LOGOUT" | "REFRESH" | "REVOKE_ALL" | "SIGNUP" | "PASSWORD_RESET_REQUESTED" | "PASSWORD_RESET_COMPLETED",
   userId: string | null,
   meta: { ip?: string; userAgent?: string; details?: Record<string, unknown> } = {}
 ): Promise<void> {
@@ -287,6 +287,165 @@ export async function updateUserRole(tenantId: string, userId: string, role: Rol
     [role, userId, tenantId]
   );
   return rows[0] ?? null;
+}
+
+// =============================================================================
+// Password reset flow (v1.2.5-prod feature "olvidé contraseña")
+// =============================================================================
+// 1. createPasswordResetToken(email)   → genera token, lo guarda, retorna el token
+//    (silencioso si email no existe — no revelar enumeration)
+// 2. validatePasswordResetToken(token) → ¿es válido? ¿expirado? ¿usado? → user
+// 3. resetPasswordWithToken(token, newPassword) → cambia pass + invalida token +
+//    revoca todas las sesiones del user
+// =============================================================================
+
+const PASSWORD_RESET_TTL_HOURS = 2;
+
+export interface PasswordResetTokenIssue {
+  token: string;     // opaco, mandar por email en el link
+  userId: string;
+  email: string;
+  expiresAt: string; // ISO
+}
+
+/**
+ * Crea un token de reset si el email existe en algún tenant.
+ * Retorna el token (para que el caller envíe el email) o null si no encontró
+ * usuario — el caller NO debe revelar al cliente si el email existió o no.
+ */
+export async function createPasswordResetToken(
+  email: string,
+  meta: { ip?: string; userAgent?: string } = {},
+): Promise<PasswordResetTokenIssue | null> {
+  await ensureHardenedSchema();
+  // Crear tabla si no existe (defensivo, también está en migration 009)
+  await query(`
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      id           TEXT PRIMARY KEY,
+      user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      tenant_id    TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      email        TEXT NOT NULL,
+      expires_at   TIMESTAMPTZ NOT NULL,
+      used_at      TIMESTAMPTZ,
+      ip_address   TEXT,
+      user_agent   TEXT,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `).catch(() => null);
+
+  // Buscar user en CUALQUIER tenant (sin filtro tenant_id porque el user
+  // simplemente tipea su email; el tenant se infiere del row encontrado).
+  const { rows } = await query<{ id: string; tenant_id: string; email: string }>(
+    `SELECT id, tenant_id, email FROM users
+      WHERE LOWER(email) = LOWER($1) AND active = true
+      LIMIT 1`,
+    [email]
+  );
+  const user = rows[0];
+  if (!user) {
+    // Silencio intencional — no revelar enumeration.
+    return null;
+  }
+
+  const token = crypto.randomBytes(32).toString("hex"); // 64 chars
+  const expiresAt = new Date(Date.now() + PASSWORD_RESET_TTL_HOURS * 60 * 60 * 1000);
+  await query(
+    `INSERT INTO password_reset_tokens (id, user_id, tenant_id, email, expires_at, ip_address, user_agent)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [token, user.id, user.tenant_id, user.email, expiresAt.toISOString(), meta.ip ?? null, meta.userAgent ?? null]
+  );
+  await recordAuthEvent(user.tenant_id, "PASSWORD_RESET_REQUESTED", user.id, {
+    ip: meta.ip, userAgent: meta.userAgent, details: { email: user.email },
+  });
+  return {
+    token,
+    userId: user.id,
+    email: user.email,
+    expiresAt: expiresAt.toISOString(),
+  };
+}
+
+export interface ResetTokenValidation {
+  valid: boolean;
+  reason?: "not_found" | "expired" | "already_used";
+  userId?: string;
+  tenantId?: string;
+  email?: string;
+}
+
+/** Valida que el token exista, no esté usado y no expirado. */
+export async function validatePasswordResetToken(token: string): Promise<ResetTokenValidation> {
+  if (!token || typeof token !== "string" || token.length < 16) {
+    return { valid: false, reason: "not_found" };
+  }
+  const { rows } = await query<{
+    user_id: string; tenant_id: string; email: string; expires_at: string; used_at: string | null;
+  }>(
+    `SELECT user_id, tenant_id, email, expires_at, used_at
+       FROM password_reset_tokens WHERE id = $1`,
+    [token]
+  );
+  const r = rows[0];
+  if (!r) return { valid: false, reason: "not_found" };
+  if (r.used_at) return { valid: false, reason: "already_used" };
+  if (new Date(r.expires_at).getTime() < Date.now()) {
+    return { valid: false, reason: "expired" };
+  }
+  return {
+    valid: true,
+    userId: r.user_id,
+    tenantId: r.tenant_id,
+    email: r.email,
+  };
+}
+
+/**
+ * Cambia la contraseña usando un token válido. Marca el token como usado +
+ * revoca todas las sesiones activas del usuario por seguridad.
+ */
+export async function resetPasswordWithToken(
+  token: string,
+  newPassword: string,
+  meta: { ip?: string; userAgent?: string } = {},
+): Promise<{ ok: true; userId: string; email: string } | { ok: false; reason: string }> {
+  if (!newPassword || newPassword.length < 8) {
+    return { ok: false, reason: "Password debe tener al menos 8 caracteres" };
+  }
+  const validation = await validatePasswordResetToken(token);
+  if (!validation.valid) {
+    return { ok: false, reason: validation.reason ?? "Token inválido" };
+  }
+  const hash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+
+  // Transacción: update password + mark token used + revoke sessions
+  await query("BEGIN");
+  try {
+    await query(
+      `UPDATE users SET password_hash = $1, updated_at = now()
+        WHERE id = $2 AND tenant_id = $3`,
+      [hash, validation.userId, validation.tenantId]
+    );
+    await query(
+      `UPDATE password_reset_tokens SET used_at = now() WHERE id = $1`,
+      [token]
+    );
+    await query(
+      `UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL AND tenant_id = $2`,
+      [validation.userId, validation.tenantId]
+    );
+    await query(
+      `UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL AND tenant_id = $2`,
+      [validation.userId, validation.tenantId]
+    );
+    await query("COMMIT");
+  } catch (err) {
+    await query("ROLLBACK").catch(() => null);
+    throw err;
+  }
+  await recordAuthEvent(validation.tenantId!, "PASSWORD_RESET_COMPLETED", validation.userId!, {
+    ip: meta.ip, userAgent: meta.userAgent, details: { email: validation.email },
+  });
+  return { ok: true, userId: validation.userId!, email: validation.email! };
 }
 
 // Bootstrap: si no hay usuarios, crear admin por defecto desde env vars.
