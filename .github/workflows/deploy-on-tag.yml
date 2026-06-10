@@ -1,33 +1,37 @@
 name: Deploy on tag
 
 # =============================================================================
-# v1.1.1-hotfix — Deploy automático al VPS cuando se pushea un tag vX.Y.Z
+# v1.2.5-prod — Deploy automático al VPS cuando se pushea un tag *-prod
 # =============================================================================
-# FIX C8 (audit v1.1.0):
-#   - Validar formato del TAG con regex ANTES de pasar al VPS (shell injection)
-#   - Pasar el script remoto vía bash -s -- "$TAG" stdin (no string interpolation)
-#   - `set -euo pipefail` ahora SÍ aplica al script remoto
-#   - ssh-keyscan pin con VPS_HOST_FINGERPRINT secret (no MITM en primer deploy)
+# Convención de tags (v1.2.5-qas):
+#   - v1.2.5-qas-*      → solo CI, NO deploya (QAS local del dev)
+#   - v1.2.5-prod       → CI + deploy en VPS (release productivo)
+#   - v1.2.5-rc.1       → CI + deploy en staging si existe
+#   - v1.2.5-hotfix-XX  → CI + deploy si termina en -prod
+#
+# Solo tags con sufijo `-prod` disparan deploy real. Esto previene deploys
+# accidentales con tags de prueba.
+#
+# FIX C8 (audit v1.1.0): regex validation, bash -s stdin, set -euo pipefail.
 #
 # Requiere secrets configurados en el repo (Settings → Secrets):
-#   - VPS_HOST              (ej: 49.13.x.x)
-#   - VPS_USER              (ej: ams)
+#   - VPS_HOST              (ej: 82.223.196.65)
+#   - VPS_USER              (ej: root o ams)
 #   - VPS_SSH_KEY           (clave SSH privada, formato OpenSSH)
-#   - VPS_DEPLOY_PATH       (ej: /opt/supply-chain-ams-stack)
+#   - VPS_DEPLOY_PATH       (ej: /opt/ams/supply-chain-ams-stack)
 #   - VPS_HOST_FINGERPRINT  (output de: ssh-keyscan -t ed25519 IP)
-#   - AMS_DOMAIN            (ej: ams.tudominio.cl) — para smoke test
-#
-# El workflow se dispara SOLO en tags con formato v*.*.* (ej: v1.1.0)
+#   - AMS_DOMAIN            (ej: ams.roccoai.cl) — para smoke test
 # =============================================================================
 
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "v*-prod"          # v1.2.5-prod
+      - "v*-hotfix-*-prod" # v1.2.5-hotfix-abc-prod
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag a desplegar (ej: v1.1.0)"
+        description: "Tag a desplegar (debe terminar en -prod)"
         required: true
 
 jobs:
@@ -44,13 +48,19 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${INPUT_TAG:-$REF_TAG}"
-          # FIX C8: validar formato estricto vX.Y.Z[-suffix] — bloquea injection.
+          # Validar formato estricto vX.Y.Z[-suffix] — bloquea injection.
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
             echo "::error::Tag inválido: '$TAG'. Esperado: vX.Y.Z o vX.Y.Z-suffix"
             exit 1
           fi
+          # NUEVO: validar que termina en -prod (releases productivos).
+          if [[ "$TAG" != *-prod ]]; then
+            echo "::error::Tag '$TAG' no termina en -prod. Solo tags productivos disparan deploy."
+            echo "::error::Para QAS local usar -qas-X. Para deploy prod usar v1.2.5-prod."
+            exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Desplegando tag validado: $TAG"
+          echo "Desplegando tag productivo: $TAG"
 
       - name: Verify required secrets
         env:
