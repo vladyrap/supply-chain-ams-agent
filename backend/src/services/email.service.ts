@@ -10,11 +10,35 @@
 // =============================================================================
 
 import { Resend } from "resend";
+import nodemailer from "nodemailer";
+import type { Transporter } from "nodemailer";
 import { logger } from "../utils/logger";
 
 const FROM = process.env.EMAIL_FROM ?? "AMS Platform <noreply@tuempresa.cl>";
 let cachedClient: Resend | null = null;
+let cachedSmtp: Transporter | null = null;
 let warned = false;
+
+/**
+ * v1.2.5-prod: usar SMTP si está configurado (Gmail App Password, sendgrid, etc).
+ * Cae back a Resend si SMTP_HOST no está seteado.
+ */
+function getSmtpTransporter(): Transporter | null {
+  if (!process.env.SMTP_HOST) return null;
+  if (cachedSmtp) return cachedSmtp;
+  cachedSmtp = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT ?? 587),
+    secure: process.env.SMTP_USE_TLS === "true" && Number(process.env.SMTP_PORT ?? 587) === 465,
+    requireTLS: process.env.SMTP_USE_TLS === "true",
+    auth: process.env.SMTP_USER && process.env.SMTP_PASSWORD
+      ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD }
+      : undefined,
+    pool: true,
+    maxConnections: 3,
+  });
+  return cachedSmtp;
+}
 
 /** Escape HTML para evitar XSS al interpolar input no-trusted en templates. */
 function esc(input: string | undefined | null): string {
@@ -66,19 +90,38 @@ export async function sendEmail(opts: {
   text?: string;
   replyTo?: string;
 }): Promise<EmailResult> {
+  // v1.2.5-prod: prefer SMTP (compatible con Gmail App Password de Calmar).
+  // Fallback a Resend si SMTP no configurado.
+  const smtp = getSmtpTransporter();
+  if (smtp) {
+    try {
+      const info = await smtp.sendMail({
+        from: FROM,
+        to: Array.isArray(opts.to) ? opts.to.join(", ") : opts.to,
+        subject: stripCrlf(opts.subject),
+        html: opts.html,
+        text: opts.text,
+        replyTo: opts.replyTo,
+      });
+      return { sent: true, id: info.messageId };
+    } catch (err) {
+      logger.error({ err, to: opts.to }, "email.send SMTP failed");
+      return { sent: false, reason: (err as Error).message };
+    }
+  }
   const client = getClient();
-  if (!client) return { sent: false, reason: "RESEND_API_KEY no configurado" };
+  if (!client) return { sent: false, reason: "Email no configurado (ni SMTP ni Resend)" };
   try {
     const { data, error } = await client.emails.send({
       from: FROM,
       to: opts.to,
-      subject: stripCrlf(opts.subject), // FIX C11: header injection
+      subject: stripCrlf(opts.subject),
       html: opts.html,
       text: opts.text,
       replyTo: opts.replyTo,
     });
     if (error) {
-      logger.error({ err: error, to: opts.to }, "email.send failed");
+      logger.error({ err: error, to: opts.to }, "email.send Resend failed");
       return { sent: false, reason: error.message };
     }
     return { sent: true, id: data?.id };
