@@ -34,6 +34,8 @@ import { customerResponseRoutes } from "./routes/customer-response.routes";
 import { testingRoutes } from "./routes/testing.routes";
 import { amsModulesRoutes } from "./routes/ams-modules.routes";
 import { rbacRoutes } from "./routes/rbac.routes";
+// v1.2.8-prod — Admin invita usuarios reales (crea cuenta auth + email bienvenida)
+import { adminUsersRoutes } from "./routes/admin-users.routes";
 // DH v0.9 — Audit Trail backend rico
 import { auditEventsRoutes } from "./routes/audit-events.routes";
 // v0.12.4 — Admin usage panel (costos Gemini visibles en /admin/costs)
@@ -233,6 +235,7 @@ export function buildServer() {
   app.register(testingRoutes);
   app.register(amsModulesRoutes);
   app.register(rbacRoutes);
+  app.register(adminUsersRoutes);
   // DH v0.9 — nuevo audit_events backend
   app.register(auditEventsRoutes);
   // v0.12.4 — admin usage / cost panel
