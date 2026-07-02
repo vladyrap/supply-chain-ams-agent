@@ -262,10 +262,24 @@ export async function getAgent(tenantId: string, id: string): Promise<CustomAgen
   return rows[0] ? mapAgent(rows[0]) : null;
 }
 
+export const MAX_AGENTS_PER_TENANT = 50;
+export const MAX_INSTRUCTIONS_LENGTH = 6000;
+
 export async function createAgent(tenantId: string, input: CreateAgentInput): Promise<CustomAgent> {
   await ready(tenantId);
   if (!input.name?.trim()) throw new Error("name es obligatorio");
   if (!input.instructions?.trim()) throw new Error("instructions es obligatorio");
+  if (input.instructions.length > MAX_INSTRUCTIONS_LENGTH) {
+    throw new Error(`Las instrucciones superan ${MAX_INSTRUCTIONS_LENGTH} caracteres`);
+  }
+  // Límite anti-abuso: agentes activos por tenant
+  const { rows: cnt } = await query<{ c: string }>(
+    `SELECT count(*)::text AS c FROM custom_agents WHERE tenant_id = $1 AND status = 'active'`,
+    [tenantId],
+  );
+  if (Number(cnt[0]?.c ?? 0) >= MAX_AGENTS_PER_TENANT) {
+    throw new Error(`Límite de ${MAX_AGENTS_PER_TENANT} agentes por tenant alcanzado. Archivá alguno primero.`);
+  }
   const { rows } = await query<AgentRow>(
     `INSERT INTO custom_agents
        (tenant_id, name, category, description, instructions, kb_modules, icon, visibility, created_by)

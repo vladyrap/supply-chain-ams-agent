@@ -5,6 +5,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { requirePermission } from "../middleware/requirePermission";
 import * as svc from "../services/agentic-apps.service";
+import { recordAudit } from "../services/audit.service";
 import { logger } from "../utils/logger";
 
 type Req = FastifyRequest & { tenantId: string };
@@ -50,6 +51,21 @@ export async function agenticAppsRoutes(app: FastifyInstance) {
       }
     });
 
+  // Duplicar app como plantilla propia
+  app.post<{ Params: { id: string } }>("/api/apps/:id/duplicate",
+    { preHandler: requirePermission("agente_ams", "create") },
+    async (req, reply) => {
+      const r = req as unknown as Req;
+      const b = (req.body || {}) as { user?: string };
+      try {
+        const copy = await svc.duplicateApp(r.tenantId, req.params.id, b.user ?? null);
+        return reply.code(201).send({ success: true, app: copy });
+      } catch (err) {
+        logger.error({ err }, "apps.duplicate fail");
+        return reply.code(400).send({ success: false, error: (err as Error).message });
+      }
+    });
+
   app.delete<{ Params: { id: string } }>("/api/apps/:id",
     { preHandler: requirePermission("agente_ams", "delete") },
     async (req, reply) => {
@@ -75,6 +91,10 @@ export async function agenticAppsRoutes(app: FastifyInstance) {
       }
       try {
         const run = await svc.startRun(r.tenantId, req.params.id, b.input, b.user ?? null);
+        await recordAudit(r.tenantId, "AGENTIC_APP_RUN_STARTED", {
+          appId: req.params.id, runId: run.id, user: b.user ?? null,
+          inputLength: b.input.length,
+        }).catch(() => null);
         return reply.code(202).send({ success: true, run });
       } catch (err) {
         logger.error({ err }, "apps.run fail");

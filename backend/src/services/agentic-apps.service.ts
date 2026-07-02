@@ -11,10 +11,25 @@
 // =============================================================================
 
 import { query } from "../database/db";
-import { chatWithCustomAgent, getAgent } from "./custom-agents.service";
+import { chatWithCustomAgent, getAgent, listAgents as listCustomAgents } from "./custom-agents.service";
 import { logger } from "../utils/logger";
 
 export const MAX_STEPS = 4;
+// ── Hardening v1.3 onda 3 ──
+export const MAX_APPS_PER_TENANT = 20;
+export const MAX_CONCURRENT_RUNS = 3;      // runs simultáneos por tenant
+export const STEP_TIMEOUT_MS = 120_000;    // 2 min por paso
+export const MAX_INPUT_LENGTH = 12_000;    // caracteres del input inicial
+
+/** Promise con timeout — si el paso excede STEP_TIMEOUT_MS, falla el run. */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} superó el timeout de ${ms / 1000}s`)), ms),
+    ),
+  ]);
+}
 
 export interface AppStep {
   agentId: string;
@@ -169,8 +184,69 @@ async function validateSteps(tenantId: string, steps: AppStep[]): Promise<void> 
   }
 }
 
+// ── Seed: 3 apps de fábrica que usan los especialistas verified ──
+// Se crean una sola vez por tenant (created_by='system'). Sirven como
+// ejemplos funcionales para que el usuario vea el patrón pipeline.
+const seededTenants = new Set<string>();
+async function seedVerifiedApps(tenantId: string): Promise<void> {
+  if (seededTenants.has(tenantId)) return;
+  const { rows } = await query<{ c: string }>(
+    `SELECT count(*)::text AS c FROM agentic_apps WHERE tenant_id = $1 AND created_by = 'system'`,
+    [tenantId],
+  );
+  if (Number(rows[0]?.c ?? 0) > 0) { seededTenants.add(tenantId); return; }
+
+  // Garantizar que los especialistas verified existen (dispara su seed)
+  const agents = await listCustomAgents(tenantId, { verifiedOnly: true });
+  const byName = new Map(agents.map((a) => [a.name, a.id]));
+  const general = byName.get("Asistente AMS General");
+  const mm = byName.get("Especialista MM");
+  const fi = byName.get("Especialista FI");
+  if (!general || !mm || !fi) return; // los agentes seed todavía no existen
+
+  const seedApps: CreateAppInput[] = [
+    {
+      name: "Diagnóstico + Respuesta al Cliente",
+      description: "Analiza un incidente SAP y redacta la respuesta formal lista para enviar al cliente.",
+      icon: "🎯",
+      createdBy: "system",
+      steps: [
+        { agentId: general, name: "Diagnóstico", instruction: "Analizá este incidente: identificá módulo SAP, causa raíz probable y pasos de resolución." },
+        { agentId: general, name: "Respuesta al cliente", instruction: "Con este análisis, redactá una respuesta formal al cliente en español, sin tecnicismos, con próximos pasos claros." },
+      ],
+    },
+    {
+      name: "Análisis MM + Validación FI",
+      description: "Diagnostica un problema de compras/inventario y valida el impacto contable.",
+      icon: "🔄",
+      createdBy: "system",
+      steps: [
+        { agentId: mm, name: "Análisis MM", instruction: "Diagnosticá este problema de MM: transacciones involucradas, causa raíz y corrección propuesta." },
+        { agentId: fi, name: "Impacto FI", instruction: "Evaluá el impacto contable de esta corrección: cuentas afectadas, período y riesgos de cierre." },
+      ],
+    },
+    {
+      name: "Resumen Ejecutivo de Incidente",
+      description: "Convierte el detalle técnico de un caso en un resumen de 5 líneas para management.",
+      icon: "📈",
+      createdBy: "system",
+      steps: [
+        { agentId: general, name: "Resumen ejecutivo", instruction: "Resumí este caso en máximo 5 líneas para un gerente no técnico: qué pasó, impacto al negocio, estado y próximo paso." },
+      ],
+    },
+  ];
+
+  for (const app of seedApps) {
+    await createApp(tenantId, app).catch((err) =>
+      logger.debug({ err, app: app.name }, "seed app fail (non-blocking)"));
+  }
+  seededTenants.add(tenantId);
+  logger.info({ tenantId }, "agentic-apps: verified seed OK");
+}
+
 export async function listApps(tenantId: string): Promise<AgenticApp[]> {
   await ensureSchema();
+  await seedVerifiedApps(tenantId).catch(() => null);
   const { rows } = await query<AppRow>(
     `SELECT * FROM agentic_apps WHERE tenant_id = $1 AND status = 'active' ORDER BY created_at DESC`,
     [tenantId],
@@ -190,6 +266,14 @@ export async function getApp(tenantId: string, id: string): Promise<AgenticApp |
 export async function createApp(tenantId: string, input: CreateAppInput): Promise<AgenticApp> {
   await ensureSchema();
   if (!input.name?.trim()) throw new Error("name es obligatorio");
+  // Límite anti-abuso: apps activas por tenant
+  const { rows: cnt } = await query<{ c: string }>(
+    `SELECT count(*)::text AS c FROM agentic_apps WHERE tenant_id = $1 AND status = 'active'`,
+    [tenantId],
+  );
+  if (Number(cnt[0]?.c ?? 0) >= MAX_APPS_PER_TENANT) {
+    throw new Error(`Límite de ${MAX_APPS_PER_TENANT} apps por tenant alcanzado. Eliminá alguna primero.`);
+  }
   await validateSteps(tenantId, input.steps);
   const { rows } = await query<AppRow>(
     `INSERT INTO agentic_apps (tenant_id, name, category, description, objective, steps, icon, created_by)
@@ -201,6 +285,23 @@ export async function createApp(tenantId: string, input: CreateAppInput): Promis
     ],
   );
   return mapApp(rows[0]!);
+}
+
+/** Duplica una app como plantilla editable del usuario. */
+export async function duplicateApp(
+  tenantId: string, id: string, createdBy: string | null,
+): Promise<AgenticApp> {
+  const original = await getApp(tenantId, id);
+  if (!original) throw new Error("App no encontrada");
+  return createApp(tenantId, {
+    name: `${original.name} (copia)`,
+    category: original.category,
+    description: original.description,
+    objective: original.objective,
+    steps: original.steps,
+    icon: original.icon,
+    createdBy,
+  });
 }
 
 export async function deleteApp(tenantId: string, id: string): Promise<boolean> {
@@ -224,6 +325,20 @@ export async function startRun(
   if (!app) throw new Error("App no encontrada");
   if (app.status !== "active") throw new Error("La app está archivada");
   if (!input.trim()) throw new Error("input es obligatorio");
+  if (input.length > MAX_INPUT_LENGTH) {
+    throw new Error(`El input supera ${MAX_INPUT_LENGTH} caracteres`);
+  }
+  // Límite de concurrencia: evita que un tenant sature Gemini con pipelines
+  // paralelos. Los runs colgados > 15 min se consideran muertos.
+  const { rows: running } = await query<{ c: string }>(
+    `SELECT count(*)::text AS c FROM agentic_app_runs
+      WHERE tenant_id = $1 AND status = 'running'
+        AND created_at > now() - interval '15 minutes'`,
+    [tenantId],
+  );
+  if (Number(running[0]?.c ?? 0) >= MAX_CONCURRENT_RUNS) {
+    throw new Error(`Hay ${MAX_CONCURRENT_RUNS} pipelines en ejecución. Esperá que termine alguno.`);
+  }
 
   const initialSteps: StepOutput[] = app.steps.map((s, i) => ({
     stepIndex: i,
@@ -282,10 +397,14 @@ async function executeRun(
         ? `${stepDef.instruction.trim()}\n\nINPUT DEL PASO ANTERIOR:\n${currentInput}`
         : currentInput;
 
-      const { result } = await chatWithCustomAgent(tenantId, stepDef.agentId, {
-        message,
-        user: `app:${app.name}:${user}`,
-      });
+      const { result } = await withTimeout(
+        chatWithCustomAgent(tenantId, stepDef.agentId, {
+          message,
+          user: `app:${app.name}:${user}`,
+        }),
+        STEP_TIMEOUT_MS,
+        `Paso ${i + 1} (${steps[i]!.stepName})`,
+      );
 
       steps[i]!.status = "done";
       steps[i]!.output = result.text;

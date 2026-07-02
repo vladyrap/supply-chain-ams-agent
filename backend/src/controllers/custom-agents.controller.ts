@@ -4,6 +4,7 @@
 
 import type { FastifyReply, FastifyRequest } from "fastify";
 import * as svc from "../services/custom-agents.service";
+import { recordAudit } from "../services/audit.service";
 import { logger } from "../utils/logger";
 
 type Req = FastifyRequest & { tenantId: string };
@@ -65,6 +66,10 @@ export async function postAgent(req: FastifyRequest, reply: FastifyReply) {
       visibility: b.visibility,
       createdBy: b.createdBy ?? null,
     });
+    await recordAudit(r.tenantId, "CUSTOM_AGENT_CREATED", {
+      agentId: agent.id, name: agent.name, category: agent.category,
+      createdBy: agent.createdBy,
+    }).catch(() => null);
     return reply.code(201).send({ success: true, agent });
   } catch (err) {
     logger.error({ err }, "agents.create fail");
@@ -101,6 +106,7 @@ export async function deleteAgentById(
   try {
     const ok = await svc.deleteAgent(r.tenantId, req.params.id);
     if (!ok) return reply.code(404).send({ success: false, error: "Agente no encontrado" });
+    await recordAudit(r.tenantId, "CUSTOM_AGENT_DELETED", { agentId: req.params.id }).catch(() => null);
     return reply.send({ success: true });
   } catch (err) {
     const msg = (err as Error).message;
