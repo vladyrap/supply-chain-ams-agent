@@ -124,6 +124,12 @@ export interface ClaudeChatInput {
    * Los controllers HTTP deberían pasar req.tenantId siempre.
    */
   tenantId?: string;
+  /**
+   * v1.3 Agent Hub — instrucciones de un agente custom. Si viene, reemplaza
+   * el system prompt base del tenant. Few-shot + RAG siguen aplicando igual,
+   * scoped al módulo del agente.
+   */
+  systemPromptOverride?: string;
 }
 
 // Tipos Part compatibles con @google/genai
@@ -146,7 +152,10 @@ async function prepareRequest(input: ClaudeChatInput): Promise<PreparedRequest> 
   // MT-3: prompt activo es per-tenant. Si no viene tenantId (path interno),
   // se usa "default" — mismo fallback que few-shot / RAG.
   const promptTenantId = input.tenantId ?? "default";
-  const baseSystemPrompt = await loadSystemPrompt(promptTenantId);
+  // v1.3 Agent Hub: un agente custom trae sus propias instrucciones.
+  const baseSystemPrompt = input.systemPromptOverride?.trim()
+    ? input.systemPromptOverride.trim()
+    : await loadSystemPrompt(promptTenantId);
 
   // Few-shot dinámico: Q&A aprobadas + KB items publicados que matchean
   // léxicamente la query del usuario. Se concatena al system prompt si hay
