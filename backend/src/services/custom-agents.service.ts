@@ -349,24 +349,46 @@ export async function rateAgent(tenantId: string, id: string, stars: number): Pr
 }
 
 // ============================================================
-// Chat con un agente custom
+// Chat con un agente custom (multi-turn persistente)
 // ============================================================
 
 export async function chatWithCustomAgent(
   tenantId: string,
   agentId: string,
-  input: { message: string; user: string; client?: string; environment?: string },
-): Promise<{ agent: CustomAgent; result: ClaudeChatResult }> {
+  input: {
+    message: string;
+    user: string;
+    client?: string;
+    environment?: string;
+    /** Si viene, continúa esa conversación (historial + persistencia). */
+    conversationId?: string;
+  },
+): Promise<{ agent: CustomAgent; result: ClaudeChatResult; conversationId: string }> {
   const agent = await getAgent(tenantId, agentId);
   if (!agent) throw new Error("Agente no encontrado");
   if (agent.status !== "active") throw new Error("El agente está archivado");
+
+  const conv = await import("./agent-conversations.service");
+
+  // Conversación: continuar o crear nueva
+  let conversationId = input.conversationId ?? "";
+  let historyBlock = "";
+  if (conversationId) {
+    historyBlock = await conv.buildHistoryBlock(tenantId, conversationId).catch(() => "");
+  } else {
+    const created = await conv.createConversation(tenantId, agentId, input.user, input.message);
+    conversationId = created.id;
+  }
+
+  await conv.appendMessage(tenantId, conversationId, "user", input.message).catch((err) =>
+    logger.debug({ err }, "append user msg fail (non-blocking)"));
 
   // El módulo del agente scoped el RAG. Si el agente cubre varios módulos KB,
   // usamos el primero como filtro primario (el RAG hace fallback a global).
   const module = agent.kbModules[0] ?? agent.category;
 
   const result = await chatWithAgent({
-    userMessage: input.message,
+    userMessage: historyBlock ? `${historyBlock}${input.message}` : input.message,
     user: input.user,
     module: module === "GENERAL" ? "NO_INFORMADO" : module,
     client: input.client ?? "NO_INFORMADO",
@@ -375,11 +397,17 @@ export async function chatWithCustomAgent(
     systemPromptOverride: agent.instructions,
   });
 
+  await conv.appendMessage(tenantId, conversationId, "agent", result.text, {
+    model: result.model,
+    confidence: result.confidence,
+    ragCount: result.ragSources?.length ?? 0,
+  }).catch((err) => logger.debug({ err }, "append agent msg fail (non-blocking)"));
+
   // Fire-and-forget: contador de uso
   query(
     `UPDATE custom_agents SET chat_count = chat_count + 1 WHERE id = $1 AND tenant_id = $2`,
     [agentId, tenantId],
   ).catch((err) => logger.debug({ err }, "chat_count update fail (non-blocking)"));
 
-  return { agent, result };
+  return { agent, result, conversationId };
 }

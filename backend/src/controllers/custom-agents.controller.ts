@@ -140,6 +140,7 @@ export async function postAgentChat(
     user?: string;
     client?: string;
     environment?: string;
+    conversationId?: string;
   };
   const message = (b.message ?? "").trim();
   if (!message) {
@@ -149,16 +150,18 @@ export async function postAgentChat(
     return reply.code(400).send({ success: false, error: "message supera 8000 caracteres" });
   }
   try {
-    const { agent, result } = await svc.chatWithCustomAgent(r.tenantId, req.params.id, {
+    const { agent, result, conversationId } = await svc.chatWithCustomAgent(r.tenantId, req.params.id, {
       message,
       user: (b.user ?? "anonymous").toString(),
       client: b.client,
       environment: b.environment,
+      conversationId: b.conversationId,
     });
     return reply.send({
       success: true,
       agent: { id: agent.id, name: agent.name, category: agent.category, icon: agent.icon },
       response: result.text,
+      conversationId,
       metadata: {
         model: result.model,
         confidence: result.confidence,
@@ -171,5 +174,59 @@ export async function postAgentChat(
     const code = /no encontrado/.test(msg) ? 404 : /archivado/.test(msg) ? 409 : 500;
     logger.error({ err, agentId: req.params.id }, "agents.chat fail");
     return reply.code(code).send({ success: false, error: msg });
+  }
+}
+
+// ============================================================
+// Conversaciones
+// ============================================================
+
+export async function getAgentConversations(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+) {
+  const r = req as unknown as Req;
+  const q = (req.query || {}) as { user?: string };
+  const userId = (q.user ?? "anonymous").toString();
+  try {
+    const conv = await import("../services/agent-conversations.service");
+    const conversations = await conv.listConversations(r.tenantId, req.params.id, userId);
+    return reply.send({ success: true, conversations });
+  } catch (err) {
+    logger.error({ err }, "agents.conversations fail");
+    return reply.code(500).send({ success: false, error: "Error listando conversaciones" });
+  }
+}
+
+export async function getConversationById(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+) {
+  const r = req as unknown as Req;
+  try {
+    const conv = await import("../services/agent-conversations.service");
+    const data = await conv.getConversation(r.tenantId, req.params.id);
+    if (!data) return reply.code(404).send({ success: false, error: "Conversación no encontrada" });
+    return reply.send({ success: true, ...data });
+  } catch (err) {
+    logger.error({ err }, "conversations.get fail");
+    return reply.code(500).send({ success: false, error: "Error obteniendo conversación" });
+  }
+}
+
+export async function deleteConversationById(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+) {
+  const r = req as unknown as Req;
+  const q = (req.query || {}) as { user?: string };
+  try {
+    const conv = await import("../services/agent-conversations.service");
+    const ok = await conv.deleteConversation(r.tenantId, req.params.id, (q.user ?? "anonymous").toString());
+    if (!ok) return reply.code(404).send({ success: false, error: "Conversación no encontrada" });
+    return reply.send({ success: true });
+  } catch (err) {
+    logger.error({ err }, "conversations.delete fail");
+    return reply.code(500).send({ success: false, error: "Error eliminando conversación" });
   }
 }

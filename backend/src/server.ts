@@ -38,6 +38,8 @@ import { rbacRoutes } from "./routes/rbac.routes";
 import { adminUsersRoutes } from "./routes/admin-users.routes";
 // v1.3 Agent Hub — agentes custom estilo IBM Consulting Advantage
 import { customAgentsRoutes } from "./routes/custom-agents.routes";
+// v1.3 Agent Hub — apps agénticas (pipeline multi-agente)
+import { agenticAppsRoutes } from "./routes/agentic-apps.routes";
 // DH v0.9 — Audit Trail backend rico
 import { auditEventsRoutes } from "./routes/audit-events.routes";
 // v0.12.4 — Admin usage panel (costos Gemini visibles en /admin/costs)
@@ -240,6 +242,7 @@ export function buildServer() {
   app.register(adminUsersRoutes);
   // v1.3 Agent Hub
   app.register(customAgentsRoutes);
+  app.register(agenticAppsRoutes);
   // DH v0.9 — nuevo audit_events backend
   app.register(auditEventsRoutes);
   // v0.12.4 — admin usage / cost panel

@@ -40,4 +40,17 @@ export async function customAgentsRoutes(app: FastifyInstance) {
   app.post<{ Params: { id: string } }>("/api/agents/:id/chat",
     { preHandler: requirePermission("agente_ams", "view") },
     ctrl.postAgentChat);
+
+  // Conversaciones persistentes (v1.3 F6)
+  app.get<{ Params: { id: string } }>("/api/agents/:id/conversations",
+    { preHandler: requirePermission("agente_ams", "view") },
+    ctrl.getAgentConversations);
+
+  app.get<{ Params: { id: string } }>("/api/agent-conversations/:id",
+    { preHandler: requirePermission("agente_ams", "view") },
+    ctrl.getConversationById);
+
+  app.delete<{ Params: { id: string } }>("/api/agent-conversations/:id",
+    { preHandler: requirePermission("agente_ams", "view") },
+    ctrl.deleteConversationById);
 }
