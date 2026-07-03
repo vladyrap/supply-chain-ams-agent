@@ -22,6 +22,11 @@ export async function customAgentsRoutes(app: FastifyInstance) {
     { preHandler: requirePermission("agente_ams", "view") },
     ctrl.getModels);
 
+  // Onda 7 — export masivo de respaldo (el controller exige admin de sesión)
+  app.get("/api/agents/export",
+    { preHandler: requirePermission("agente_ams", "view") },
+    ctrl.getAgentsExport);
+
   app.get<{ Params: { id: string } }>("/api/agents/:id",
     { preHandler: requirePermission("agente_ams", "view") },
     ctrl.getAgentById);

@@ -71,6 +71,29 @@ export async function getAgentById(
   }
 }
 
+// ── Onda 7: export masivo de respaldo (solo admin) ──
+
+export async function getAgentsExport(req: FastifyRequest, reply: FastifyReply) {
+  const r = req as Req;
+  const actor = actorFrom(req);
+  if (!actor.isAdmin) {
+    return reply.code(403).send({ success: false, error: "Solo un admin puede exportar el respaldo completo de agentes" });
+  }
+  try {
+    const agents = await svc.exportAgents(r.tenantId);
+    return reply.send({
+      success: true,
+      exportedAt: new Date().toISOString(),
+      exportedBy: actor.email,
+      count: agents.length,
+      agents,
+    });
+  } catch (err) {
+    logger.error({ err }, "agents.export fail");
+    return reply.code(500).send({ success: false, error: "Error exportando agentes" });
+  }
+}
+
 // ── Onda 5: catálogo de modelos, duplicar, versiones, comparador ──
 
 export async function getModels(_req: FastifyRequest, reply: FastifyReply) {
@@ -270,6 +293,7 @@ export async function putAgent(
   } catch (err) {
     const msg = (err as Error).message;
     const code = /verificados|Solo el creador/.test(msg) ? 403
+      : /Conflicto de edición/.test(msg) ? 409
       : /no permitido|secreto/.test(msg) ? 400 : 500;
     logger.error({ err }, "agents.update fail");
     return reply.code(code).send({ success: false, error: msg });
@@ -361,7 +385,8 @@ export async function postAgentChat(
     const msg = (err as Error).message;
     const code = /no encontrado/.test(msg) ? 404
       : /archivado/.test(msg) ? 409
-      : /borrador privado/.test(msg) ? 403 : 500;
+      : /borrador privado/.test(msg) ? 403
+      : /límite de \d+ mensajes/.test(msg) ? 429 : 500;
     logger.error({ err, agentId: req.params.id }, "agents.chat fail");
     return reply.code(code).send({ success: false, error: msg });
   }

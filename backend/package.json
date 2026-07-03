@@ -9,11 +9,12 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test:smoke": "tsx scripts/smoke-health.ts && tsx scripts/smoke-rbac.ts && tsx scripts/smoke-audit.ts && tsx scripts/smoke-tickets.ts",
+    "test:smoke": "tsx scripts/smoke-health.ts && tsx scripts/smoke-rbac.ts && tsx scripts/smoke-audit.ts && tsx scripts/smoke-tickets.ts && tsx scripts/smoke-agents.ts",
     "test:smoke:health": "tsx scripts/smoke-health.ts",
     "test:smoke:rbac": "tsx scripts/smoke-rbac.ts",
     "test:smoke:audit": "tsx scripts/smoke-audit.ts",
-    "test:smoke:tickets": "tsx scripts/smoke-tickets.ts"
+    "test:smoke:tickets": "tsx scripts/smoke-tickets.ts",
+    "test:smoke:agents": "tsx scripts/smoke-agents.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^9.4.0",
