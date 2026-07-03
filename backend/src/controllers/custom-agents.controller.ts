@@ -16,6 +16,7 @@ export async function getAgents(req: FastifyRequest, reply: FastifyReply) {
     createdBy?: string;
     verified?: string;
     search?: string;
+    forUser?: string;
   };
   try {
     const agents = await svc.listAgents(r.tenantId, {
@@ -23,6 +24,7 @@ export async function getAgents(req: FastifyRequest, reply: FastifyReply) {
       createdBy: q.createdBy,
       verifiedOnly: q.verified === "true",
       search: q.search,
+      forUser: q.forUser,
     });
     return reply.send({ success: true, count: agents.length, agents });
   } catch (err) {
@@ -36,13 +38,73 @@ export async function getAgentById(
   reply: FastifyReply,
 ) {
   const r = req as unknown as Req;
+  const q = (req.query || {}) as { forUser?: string };
   try {
     const agent = await svc.getAgent(r.tenantId, req.params.id);
     if (!agent) return reply.code(404).send({ success: false, error: "Agente no encontrado" });
+    // Un borrador ajeno no se expone (mismas señales que un id inexistente).
+    if (
+      !agent.isVerified &&
+      agent.visibility === "private" &&
+      agent.createdBy &&
+      q.forUser !== undefined &&
+      agent.createdBy !== q.forUser
+    ) {
+      return reply.code(404).send({ success: false, error: "Agente no encontrado" });
+    }
     return reply.send({ success: true, agent });
   } catch (err) {
     logger.error({ err }, "agents.get fail");
     return reply.code(500).send({ success: false, error: "Error obteniendo agente" });
+  }
+}
+
+// ── Publicación (onda 4) ──
+
+export async function postAgentPublish(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+) {
+  const r = req as unknown as Req;
+  const b = (req.body || {}) as { user?: string };
+  const user = (b.user ?? "").toString().trim();
+  if (!user) return reply.code(400).send({ success: false, error: "user es obligatorio" });
+  try {
+    const agent = await svc.publishAgent(r.tenantId, req.params.id, user);
+    await recordAudit(r.tenantId, "CUSTOM_AGENT_PUBLISHED", {
+      agentId: agent.id, name: agent.name, publishedBy: user,
+    }).catch(() => null);
+    return reply.send({ success: true, agent });
+  } catch (err) {
+    const msg = (err as Error).message;
+    const code = /no encontrado/.test(msg) ? 404
+      : /Solo el creador|verificados/.test(msg) ? 403
+      : /instrucciones|descripción/.test(msg) ? 400 : 500;
+    logger.error({ err }, "agents.publish fail");
+    return reply.code(code).send({ success: false, error: msg });
+  }
+}
+
+export async function postAgentUnpublish(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+) {
+  const r = req as unknown as Req;
+  const b = (req.body || {}) as { user?: string };
+  const user = (b.user ?? "").toString().trim();
+  if (!user) return reply.code(400).send({ success: false, error: "user es obligatorio" });
+  try {
+    const agent = await svc.unpublishAgent(r.tenantId, req.params.id, user);
+    await recordAudit(r.tenantId, "CUSTOM_AGENT_UNPUBLISHED", {
+      agentId: agent.id, name: agent.name, unpublishedBy: user,
+    }).catch(() => null);
+    return reply.send({ success: true, agent });
+  } catch (err) {
+    const msg = (err as Error).message;
+    const code = /no encontrado/.test(msg) ? 404
+      : /Solo el creador|verificados/.test(msg) ? 403 : 500;
+    logger.error({ err }, "agents.unpublish fail");
+    return reply.code(code).send({ success: false, error: msg });
   }
 }
 
@@ -177,7 +239,9 @@ export async function postAgentChat(
     });
   } catch (err) {
     const msg = (err as Error).message;
-    const code = /no encontrado/.test(msg) ? 404 : /archivado/.test(msg) ? 409 : 500;
+    const code = /no encontrado/.test(msg) ? 404
+      : /archivado/.test(msg) ? 409
+      : /borrador privado/.test(msg) ? 403 : 500;
     logger.error({ err, agentId: req.params.id }, "agents.chat fail");
     return reply.code(code).send({ success: false, error: msg });
   }

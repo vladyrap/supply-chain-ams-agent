@@ -37,6 +37,15 @@ export async function customAgentsRoutes(app: FastifyInstance) {
     { preHandler: requirePermission("agente_ams", "view") },
     ctrl.postAgentRating);
 
+  // Publicación al equipo (onda 4) — solo el creador; permiso edit
+  app.post<{ Params: { id: string } }>("/api/agents/:id/publish",
+    { preHandler: requirePermission("agente_ams", "edit") },
+    ctrl.postAgentPublish);
+
+  app.post<{ Params: { id: string } }>("/api/agents/:id/unpublish",
+    { preHandler: requirePermission("agente_ams", "edit") },
+    ctrl.postAgentUnpublish);
+
   app.post<{ Params: { id: string } }>("/api/agents/:id/chat",
     { preHandler: requirePermission("agente_ams", "view") },
     ctrl.postAgentChat);

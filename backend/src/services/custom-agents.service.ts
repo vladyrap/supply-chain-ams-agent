@@ -22,6 +22,7 @@ export interface CustomAgent {
   instructions: string;
   kbModules: string[];
   icon: string;
+  /** private = borrador (solo el creador lo ve) · team = publicado al equipo · public = sistema */
   visibility: "private" | "team" | "public";
   isVerified: boolean;
   status: "active" | "archived";
@@ -29,6 +30,8 @@ export interface CustomAgent {
   ratingCount: number;
   chatCount: number;
   createdBy: string | null;
+  publishedAt: string | null;
+  publishedBy: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -79,6 +82,9 @@ async function ensureSchema(): Promise<void> {
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_custom_agents_tenant ON custom_agents(tenant_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_custom_agents_category ON custom_agents(tenant_id, category)`);
+  // Onda 4 — publicación al equipo
+  await query(`ALTER TABLE custom_agents ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ`);
+  await query(`ALTER TABLE custom_agents ADD COLUMN IF NOT EXISTS published_by TEXT`);
   schemaEnsured = true;
 }
 
@@ -195,6 +201,8 @@ interface AgentRow {
   rating_count: number;
   chat_count: number;
   created_by: string | null;
+  published_at: string | null;
+  published_by: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -216,6 +224,8 @@ function mapAgent(r: AgentRow): CustomAgent {
     ratingCount: r.rating_count,
     chatCount: r.chat_count,
     createdBy: r.created_by,
+    publishedAt: r.published_at,
+    publishedBy: r.published_by,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -227,11 +237,25 @@ function mapAgent(r: AgentRow): CustomAgent {
 
 export async function listAgents(
   tenantId: string,
-  filters: { category?: string; createdBy?: string; verifiedOnly?: boolean; search?: string } = {},
+  filters: {
+    category?: string;
+    createdBy?: string;
+    verifiedOnly?: boolean;
+    search?: string;
+    /** Usuario que consulta: ve publicados (team/public) + sus propios borradores. Sin forUser → solo publicados. */
+    forUser?: string;
+  } = {},
 ): Promise<CustomAgent[]> {
   await ready(tenantId);
   const conds: string[] = [`tenant_id = $1`, `status = 'active'`];
   const params: unknown[] = [tenantId];
+  // Publicación: los borradores (visibility='private') solo los ve su creador.
+  if (filters.forUser) {
+    params.push(filters.forUser);
+    conds.push(`(visibility IN ('team','public') OR is_verified = true OR created_by = $${params.length})`);
+  } else {
+    conds.push(`(visibility IN ('team','public') OR is_verified = true)`);
+  }
   if (filters.category) {
     params.push(filters.category);
     conds.push(`category = $${params.length}`);
@@ -347,6 +371,60 @@ export async function deleteAgent(tenantId: string, id: string): Promise<boolean
   return true;
 }
 
+// ============================================================
+// Publicación (onda 4) — borrador privado → publicado al equipo
+// ============================================================
+
+export async function publishAgent(
+  tenantId: string,
+  id: string,
+  user: string,
+): Promise<CustomAgent> {
+  await ready(tenantId);
+  const existing = await getAgent(tenantId, id);
+  if (!existing) throw new Error("Agente no encontrado");
+  if (existing.isVerified) throw new Error("Los agentes verificados del sistema ya son públicos");
+  if (existing.createdBy && existing.createdBy !== user) {
+    throw new Error("Solo el creador puede publicar este agente");
+  }
+  if (!existing.instructions?.trim() || existing.instructions.trim().length < 30) {
+    throw new Error("El agente necesita instrucciones (mínimo 30 caracteres) antes de publicarse");
+  }
+  if (!existing.description?.trim()) {
+    throw new Error("Agregá una descripción corta antes de publicar: es lo que ve el equipo en la biblioteca");
+  }
+  const { rows } = await query<AgentRow>(
+    `UPDATE custom_agents
+        SET visibility = 'team', published_at = now(), published_by = $3, updated_at = now()
+      WHERE id = $1 AND tenant_id = $2
+      RETURNING *`,
+    [id, tenantId, user],
+  );
+  return mapAgent(rows[0]!);
+}
+
+export async function unpublishAgent(
+  tenantId: string,
+  id: string,
+  user: string,
+): Promise<CustomAgent> {
+  await ready(tenantId);
+  const existing = await getAgent(tenantId, id);
+  if (!existing) throw new Error("Agente no encontrado");
+  if (existing.isVerified) throw new Error("Los agentes verificados del sistema no se pueden despublicar");
+  if (existing.createdBy && existing.createdBy !== user) {
+    throw new Error("Solo el creador puede despublicar este agente");
+  }
+  const { rows } = await query<AgentRow>(
+    `UPDATE custom_agents
+        SET visibility = 'private', published_at = NULL, published_by = NULL, updated_at = now()
+      WHERE id = $1 AND tenant_id = $2
+      RETURNING *`,
+    [id, tenantId],
+  );
+  return mapAgent(rows[0]!);
+}
+
 export async function rateAgent(tenantId: string, id: string, stars: number): Promise<CustomAgent | null> {
   await ready(tenantId);
   const s = Math.max(1, Math.min(5, Math.round(stars)));
@@ -381,6 +459,15 @@ export async function chatWithCustomAgent(
   const agent = await getAgent(tenantId, agentId);
   if (!agent) throw new Error("Agente no encontrado");
   if (agent.status !== "active") throw new Error("El agente está archivado");
+  // Un borrador (private) solo lo puede probar su creador — playground del builder.
+  if (
+    !agent.isVerified &&
+    agent.visibility === "private" &&
+    agent.createdBy &&
+    agent.createdBy !== input.user
+  ) {
+    throw new Error("Este agente es un borrador privado: solo su creador puede chatear hasta que lo publique");
+  }
 
   const conv = await import("./agent-conversations.service");
 
