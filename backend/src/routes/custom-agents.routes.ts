@@ -51,6 +51,11 @@ export async function customAgentsRoutes(app: FastifyInstance) {
     { preHandler: requirePermission("agente_ams", "edit") },
     ctrl.postAgentUnpublish);
 
+  // Onda 6 — estadísticas de uso por agente
+  app.get<{ Params: { id: string } }>("/api/agents/:id/stats",
+    { preHandler: requirePermission("agente_ams", "view") },
+    ctrl.getAgentStatsById);
+
   // Onda 5 — duplicar / versiones / comparador
   app.post<{ Params: { id: string } }>("/api/agents/:id/duplicate",
     { preHandler: requirePermission("agente_ams", "create") },

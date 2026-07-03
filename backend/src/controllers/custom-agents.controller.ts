@@ -9,6 +9,15 @@ import { logger } from "../utils/logger";
 
 type Req = FastifyRequest & { tenantId: string };
 
+// Onda 6 — identidad REAL desde la sesión (req.user, inyectado por requireAuth).
+// Nunca se confía en user/createdBy/forUser del body o query para ownership.
+function actorFrom(req: FastifyRequest): svc.AgentActor {
+  return {
+    email: req.user?.email ?? "anonymous",
+    isAdmin: req.user?.role === "admin",
+  };
+}
+
 export async function getAgents(req: FastifyRequest, reply: FastifyReply) {
   const r = req as Req;
   const q = (req.query || {}) as {
@@ -16,7 +25,7 @@ export async function getAgents(req: FastifyRequest, reply: FastifyReply) {
     createdBy?: string;
     verified?: string;
     search?: string;
-    forUser?: string;
+    status?: string;
   };
   try {
     const agents = await svc.listAgents(r.tenantId, {
@@ -24,7 +33,9 @@ export async function getAgents(req: FastifyRequest, reply: FastifyReply) {
       createdBy: q.createdBy,
       verifiedOnly: q.verified === "true",
       search: q.search,
-      forUser: q.forUser,
+      // Onda 6: identidad de sesión — ya no se acepta forUser del cliente
+      forUser: req.user?.email,
+      status: q.status === "archived" ? "archived" : "active",
     });
     return reply.send({ success: true, count: agents.length, agents });
   } catch (err) {
@@ -38,17 +49,18 @@ export async function getAgentById(
   reply: FastifyReply,
 ) {
   const r = req as unknown as Req;
-  const q = (req.query || {}) as { forUser?: string };
   try {
     const agent = await svc.getAgent(r.tenantId, req.params.id);
     if (!agent) return reply.code(404).send({ success: false, error: "Agente no encontrado" });
     // Un borrador ajeno no se expone (mismas señales que un id inexistente).
+    // Onda 6: chequeo SIEMPRE con identidad de sesión; admin ve todo.
+    const actor = actorFrom(req);
     if (
       !agent.isVerified &&
       agent.visibility === "private" &&
       agent.createdBy &&
-      q.forUser !== undefined &&
-      agent.createdBy !== q.forUser
+      agent.createdBy !== actor.email &&
+      !actor.isAdmin
     ) {
       return reply.code(404).send({ success: false, error: "Agente no encontrado" });
     }
@@ -70,13 +82,11 @@ export async function postAgentDuplicate(
   reply: FastifyReply,
 ) {
   const r = req as unknown as Req;
-  const b = (req.body || {}) as { user?: string };
-  const user = (b.user ?? "").toString().trim();
-  if (!user) return reply.code(400).send({ success: false, error: "user es obligatorio" });
+  const actor = actorFrom(req);
   try {
-    const agent = await svc.duplicateAgent(r.tenantId, req.params.id, user);
+    const agent = await svc.duplicateAgent(r.tenantId, req.params.id, actor);
     await recordAudit(r.tenantId, "CUSTOM_AGENT_DUPLICATED", {
-      sourceAgentId: req.params.id, newAgentId: agent.id, duplicatedBy: user,
+      sourceAgentId: req.params.id, newAgentId: agent.id, duplicatedBy: actor.email,
     }).catch(() => null);
     return reply.code(201).send({ success: true, agent });
   } catch (err) {
@@ -84,6 +94,20 @@ export async function postAgentDuplicate(
     const code = /no encontrado/.test(msg) ? 404 : /Límite/.test(msg) ? 409 : 500;
     logger.error({ err }, "agents.duplicate fail");
     return reply.code(code).send({ success: false, error: msg });
+  }
+}
+
+export async function getAgentStatsById(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+) {
+  const r = req as unknown as Req;
+  try {
+    const stats = await svc.getAgentStats(r.tenantId, req.params.id);
+    return reply.send({ success: true, stats });
+  } catch (err) {
+    logger.error({ err }, "agents.stats fail");
+    return reply.code(500).send({ success: false, error: "Error obteniendo estadísticas" });
   }
 }
 
@@ -106,13 +130,11 @@ export async function postAgentRestore(
   reply: FastifyReply,
 ) {
   const r = req as unknown as Req;
-  const b = (req.body || {}) as { user?: string };
-  const user = (b.user ?? "").toString().trim();
-  if (!user) return reply.code(400).send({ success: false, error: "user es obligatorio" });
+  const actor = actorFrom(req);
   try {
-    const agent = await svc.restoreVersion(r.tenantId, req.params.id, req.params.versionId, user);
+    const agent = await svc.restoreVersion(r.tenantId, req.params.id, req.params.versionId, actor);
     await recordAudit(r.tenantId, "CUSTOM_AGENT_VERSION_RESTORED", {
-      agentId: agent.id, versionId: req.params.versionId, restoredBy: user,
+      agentId: agent.id, versionId: req.params.versionId, restoredBy: actor.email, asAdmin: actor.isAdmin,
     }).catch(() => null);
     return reply.send({ success: true, agent });
   } catch (err) {
@@ -128,18 +150,17 @@ export async function postAgentCompare(
   reply: FastifyReply,
 ) {
   const r = req as unknown as Req;
-  const b = (req.body || {}) as { message?: string; models?: string[]; user?: string };
+  const b = (req.body || {}) as { message?: string; models?: string[] };
   const message = (b.message ?? "").trim();
-  const user = (b.user ?? "").toString().trim();
   if (!message) return reply.code(400).send({ success: false, error: "message es obligatorio" });
   if (message.length > 4000) return reply.code(400).send({ success: false, error: "message supera 4000 caracteres" });
-  if (!user) return reply.code(400).send({ success: false, error: "user es obligatorio" });
   if (!Array.isArray(b.models) || b.models.length !== 2) {
     return reply.code(400).send({ success: false, error: "models debe ser un array de 2 modelos" });
   }
   try {
+    const actor = actorFrom(req);
     const results = await svc.compareModels(r.tenantId, req.params.id, {
-      message, models: b.models, user,
+      message, models: b.models, user: actor.email, isAdmin: actor.isAdmin,
     });
     return reply.send({ success: true, results });
   } catch (err) {
@@ -159,13 +180,11 @@ export async function postAgentPublish(
   reply: FastifyReply,
 ) {
   const r = req as unknown as Req;
-  const b = (req.body || {}) as { user?: string };
-  const user = (b.user ?? "").toString().trim();
-  if (!user) return reply.code(400).send({ success: false, error: "user es obligatorio" });
+  const actor = actorFrom(req);
   try {
-    const agent = await svc.publishAgent(r.tenantId, req.params.id, user);
+    const agent = await svc.publishAgent(r.tenantId, req.params.id, actor);
     await recordAudit(r.tenantId, "CUSTOM_AGENT_PUBLISHED", {
-      agentId: agent.id, name: agent.name, publishedBy: user,
+      agentId: agent.id, name: agent.name, publishedBy: actor.email, asAdmin: actor.isAdmin,
     }).catch(() => null);
     return reply.send({ success: true, agent });
   } catch (err) {
@@ -183,13 +202,11 @@ export async function postAgentUnpublish(
   reply: FastifyReply,
 ) {
   const r = req as unknown as Req;
-  const b = (req.body || {}) as { user?: string };
-  const user = (b.user ?? "").toString().trim();
-  if (!user) return reply.code(400).send({ success: false, error: "user es obligatorio" });
+  const actor = actorFrom(req);
   try {
-    const agent = await svc.unpublishAgent(r.tenantId, req.params.id, user);
+    const agent = await svc.unpublishAgent(r.tenantId, req.params.id, actor);
     await recordAudit(r.tenantId, "CUSTOM_AGENT_UNPUBLISHED", {
-      agentId: agent.id, name: agent.name, unpublishedBy: user,
+      agentId: agent.id, name: agent.name, unpublishedBy: actor.email, asAdmin: actor.isAdmin,
     }).catch(() => null);
     return reply.send({ success: true, agent });
   } catch (err) {
@@ -220,7 +237,8 @@ export async function postAgent(req: FastifyRequest, reply: FastifyReply) {
       icon: b.icon,
       model: b.model,
       visibility: b.visibility,
-      createdBy: b.createdBy ?? null,
+      // Onda 6: el dueño es SIEMPRE el usuario de la sesión
+      createdBy: actorFrom(req).email,
     });
     await recordAudit(r.tenantId, "CUSTOM_AGENT_CREATED", {
       agentId: agent.id, name: agent.name, category: agent.category,
@@ -229,7 +247,7 @@ export async function postAgent(req: FastifyRequest, reply: FastifyReply) {
     return reply.code(201).send({ success: true, agent });
   } catch (err) {
     const msg = (err as Error).message;
-    const code = /no permitido/.test(msg) ? 400 : 500;
+    const code = /no permitido|secreto/.test(msg) ? 400 : 500;
     logger.error({ err }, "agents.create fail");
     return reply.code(code).send({ success: false, error: msg });
   }
@@ -244,13 +262,15 @@ export async function putAgent(
     const agent = await svc.updateAgent(
       r.tenantId,
       req.params.id,
-      (req.body || {}) as Partial<svc.CreateAgentInput>,
+      (req.body || {}) as Partial<svc.CreateAgentInput> & { status?: "active" | "archived" },
+      actorFrom(req),
     );
     if (!agent) return reply.code(404).send({ success: false, error: "Agente no encontrado" });
     return reply.send({ success: true, agent });
   } catch (err) {
     const msg = (err as Error).message;
-    const code = /verificados/.test(msg) ? 403 : /no permitido/.test(msg) ? 400 : 500;
+    const code = /verificados|Solo el creador/.test(msg) ? 403
+      : /no permitido|secreto/.test(msg) ? 400 : 500;
     logger.error({ err }, "agents.update fail");
     return reply.code(code).send({ success: false, error: msg });
   }
@@ -262,13 +282,16 @@ export async function deleteAgentById(
 ) {
   const r = req as unknown as Req;
   try {
-    const ok = await svc.deleteAgent(r.tenantId, req.params.id);
+    const actor = actorFrom(req);
+    const ok = await svc.deleteAgent(r.tenantId, req.params.id, actor);
     if (!ok) return reply.code(404).send({ success: false, error: "Agente no encontrado" });
-    await recordAudit(r.tenantId, "CUSTOM_AGENT_DELETED", { agentId: req.params.id }).catch(() => null);
+    await recordAudit(r.tenantId, "CUSTOM_AGENT_DELETED", {
+      agentId: req.params.id, deletedBy: actor.email, asAdmin: actor.isAdmin,
+    }).catch(() => null);
     return reply.send({ success: true });
   } catch (err) {
     const msg = (err as Error).message;
-    const code = /verificados/.test(msg) ? 403 : 500;
+    const code = /verificados|Solo el creador/.test(msg) ? 403 : 500;
     logger.error({ err }, "agents.delete fail");
     return reply.code(code).send({ success: false, error: msg });
   }
@@ -314,9 +337,10 @@ export async function postAgentChat(
     return reply.code(400).send({ success: false, error: "message supera 8000 caracteres" });
   }
   try {
+    // Onda 6: la identidad del chat es la de la sesión (b.user queda ignorado)
     const { agent, result, conversationId } = await svc.chatWithCustomAgent(r.tenantId, req.params.id, {
       message,
-      user: (b.user ?? "anonymous").toString(),
+      user: actorFrom(req).email,
       client: b.client,
       environment: b.environment,
       conversationId: b.conversationId,
@@ -352,8 +376,8 @@ export async function getAgentConversations(
   reply: FastifyReply,
 ) {
   const r = req as unknown as Req;
-  const q = (req.query || {}) as { user?: string };
-  const userId = (q.user ?? "anonymous").toString();
+  // Onda 6: cada uno lista SUS conversaciones (identidad de sesión)
+  const userId = actorFrom(req).email;
   try {
     const conv = await import("../services/agent-conversations.service");
     const conversations = await conv.listConversations(r.tenantId, req.params.id, userId);
@@ -385,10 +409,10 @@ export async function deleteConversationById(
   reply: FastifyReply,
 ) {
   const r = req as unknown as Req;
-  const q = (req.query || {}) as { user?: string };
   try {
     const conv = await import("../services/agent-conversations.service");
-    const ok = await conv.deleteConversation(r.tenantId, req.params.id, (q.user ?? "anonymous").toString());
+    // Onda 6: solo se pueden borrar conversaciones propias (sesión)
+    const ok = await conv.deleteConversation(r.tenantId, req.params.id, actorFrom(req).email);
     if (!ok) return reply.code(404).send({ success: false, error: "Conversación no encontrada" });
     return reply.send({ success: true });
   } catch (err) {

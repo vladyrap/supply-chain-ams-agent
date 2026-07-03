@@ -78,6 +78,47 @@ function normalizeModel(model: string | undefined): string {
 }
 
 // ============================================================
+// Onda 6 — actor de sesión + guardrails
+// ============================================================
+
+/** Identidad REAL del solicitante, derivada de la sesión (req.user) en el
+ *  controller — nunca del body. isAdmin habilita gestionar agentes ajenos. */
+export interface AgentActor {
+  email: string;
+  isAdmin: boolean;
+}
+
+/** ¿Puede este actor gestionar (editar/publicar/borrar/restaurar) el agente? */
+function canManage(agent: CustomAgent, actor: AgentActor): boolean {
+  if (agent.isVerified) return false;
+  if (actor.isAdmin) return true;
+  return !agent.createdBy || agent.createdBy === actor.email;
+}
+
+// Guardrail anti-secretos: nadie debería guardar credenciales dentro de las
+// instrucciones de un agente (quedan visibles para todo el equipo al publicar).
+const SECRET_PATTERNS: Array<{ label: string; re: RegExp }> = [
+  { label: "Google API key",      re: /AIza[0-9A-Za-z\-_]{20,}/ },
+  { label: "Anthropic API key",   re: /sk-ant-[A-Za-z0-9\-_]{10,}/ },
+  { label: "OpenAI/genérica sk-", re: /\bsk-[A-Za-z0-9]{20,}/ },
+  { label: "GitHub token",        re: /\bgh[pousr]_[A-Za-z0-9]{20,}/ },
+  { label: "Slack token",         re: /\bxox[baprs]-[A-Za-z0-9-]{10,}/ },
+  { label: "clave privada PEM",   re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
+  { label: "password/secret inline", re: /\b(password|contraseña|passwd|api[_-]?key|secret[_-]?key|token)\s*[:=]\s*["']?[^\s"']{12,}/i },
+];
+
+function assertNoSecrets(text: string, field: string): void {
+  for (const p of SECRET_PATTERNS) {
+    if (p.re.test(text)) {
+      throw new Error(
+        `${field} parece contener un secreto (${p.label}). Nunca guardes credenciales en un agente: ` +
+        `quedan visibles para todo el equipo. Usá variables de entorno del backend.`,
+      );
+    }
+  }
+}
+
+// ============================================================
 // Schema
 // ============================================================
 
@@ -291,13 +332,24 @@ export async function listAgents(
     search?: string;
     /** Usuario que consulta: ve publicados (team/public) + sus propios borradores. Sin forUser → solo publicados. */
     forUser?: string;
+    /** Onda 6 — "archived" lista solo los archivados propios de forUser. Default "active". */
+    status?: "active" | "archived";
   } = {},
 ): Promise<CustomAgent[]> {
   await ready(tenantId);
-  const conds: string[] = [`tenant_id = $1`, `status = 'active'`];
+  const status = filters.status === "archived" ? "archived" : "active";
+  const conds: string[] = [`tenant_id = $1`, `status = '${status}'`];
   const params: unknown[] = [tenantId];
+  // Los archivados solo se listan para su dueño (o no se listan sin forUser)
+  if (status === "archived") {
+    if (!filters.forUser) return [];
+    params.push(filters.forUser);
+    conds.push(`created_by = $${params.length}`);
+  }
   // Publicación: los borradores (visibility='private') solo los ve su creador.
-  if (filters.forUser) {
+  if (status === "archived") {
+    // ya filtrado por dueño arriba — sin filtro extra de visibility
+  } else if (filters.forUser) {
     params.push(filters.forUser);
     conds.push(`(visibility IN ('team','public') OR is_verified = true OR created_by = $${params.length})`);
   } else {
@@ -343,6 +395,9 @@ export async function createAgent(tenantId: string, input: CreateAgentInput): Pr
   if (input.instructions.length > MAX_INSTRUCTIONS_LENGTH) {
     throw new Error(`Las instrucciones superan ${MAX_INSTRUCTIONS_LENGTH} caracteres`);
   }
+  // Onda 6 — guardrail: nada de credenciales dentro del agente
+  assertNoSecrets(input.instructions, "Las instrucciones");
+  if (input.description) assertNoSecrets(input.description, "La descripción");
   // Límite anti-abuso: agentes activos por tenant
   const { rows: cnt } = await query<{ c: string }>(
     `SELECT count(*)::text AS c FROM custom_agents WHERE tenant_id = $1 AND status = 'active'`,
@@ -402,11 +457,19 @@ export async function updateAgent(
   tenantId: string,
   id: string,
   input: Partial<CreateAgentInput> & { status?: "active" | "archived" },
+  /** Onda 6 — si viene, se exige creador-o-admin (identidad de sesión). */
+  actor?: AgentActor,
 ): Promise<CustomAgent | null> {
   await ready(tenantId);
   const existing = await getAgent(tenantId, id);
   if (!existing) return null;
   if (existing.isVerified) throw new Error("Los agentes verificados del sistema no se pueden editar");
+  if (actor && !canManage(existing, actor)) {
+    throw new Error("Solo el creador o un admin puede editar este agente");
+  }
+  // Onda 6 — guardrail anti-secretos también al editar
+  if (input.instructions) assertNoSecrets(input.instructions, "Las instrucciones");
+  if (input.description) assertNoSecrets(input.description, "La descripción");
 
   // Onda 5 — si cambia el contenido del agente, snapshot del estado previo
   const contentKeys: Array<keyof CreateAgentInput> = [
@@ -446,12 +509,21 @@ export async function updateAgent(
   return rows[0] ? mapAgent(rows[0]) : null;
 }
 
-export async function deleteAgent(tenantId: string, id: string): Promise<boolean> {
+export async function deleteAgent(
+  tenantId: string,
+  id: string,
+  actor?: AgentActor,
+): Promise<boolean> {
   await ready(tenantId);
   const existing = await getAgent(tenantId, id);
   if (!existing) return false;
   if (existing.isVerified) throw new Error("Los agentes verificados del sistema no se pueden eliminar");
+  if (actor && !canManage(existing, actor)) {
+    throw new Error("Solo el creador o un admin puede eliminar este agente");
+  }
   await query(`DELETE FROM custom_agents WHERE id = $1 AND tenant_id = $2`, [id, tenantId]);
+  await query(`DELETE FROM custom_agent_versions WHERE agent_id = $1 AND tenant_id = $2`, [id, tenantId])
+    .catch(() => null);
   return true;
 }
 
@@ -462,14 +534,14 @@ export async function deleteAgent(tenantId: string, id: string): Promise<boolean
 export async function publishAgent(
   tenantId: string,
   id: string,
-  user: string,
+  actor: AgentActor,
 ): Promise<CustomAgent> {
   await ready(tenantId);
   const existing = await getAgent(tenantId, id);
   if (!existing) throw new Error("Agente no encontrado");
   if (existing.isVerified) throw new Error("Los agentes verificados del sistema ya son públicos");
-  if (existing.createdBy && existing.createdBy !== user) {
-    throw new Error("Solo el creador puede publicar este agente");
+  if (!canManage(existing, actor)) {
+    throw new Error("Solo el creador o un admin puede publicar este agente");
   }
   if (!existing.instructions?.trim() || existing.instructions.trim().length < 30) {
     throw new Error("El agente necesita instrucciones (mínimo 30 caracteres) antes de publicarse");
@@ -482,7 +554,7 @@ export async function publishAgent(
         SET visibility = 'team', published_at = now(), published_by = $3, updated_at = now()
       WHERE id = $1 AND tenant_id = $2
       RETURNING *`,
-    [id, tenantId, user],
+    [id, tenantId, actor.email],
   );
   return mapAgent(rows[0]!);
 }
@@ -490,14 +562,14 @@ export async function publishAgent(
 export async function unpublishAgent(
   tenantId: string,
   id: string,
-  user: string,
+  actor: AgentActor,
 ): Promise<CustomAgent> {
   await ready(tenantId);
   const existing = await getAgent(tenantId, id);
   if (!existing) throw new Error("Agente no encontrado");
   if (existing.isVerified) throw new Error("Los agentes verificados del sistema no se pueden despublicar");
-  if (existing.createdBy && existing.createdBy !== user) {
-    throw new Error("Solo el creador puede despublicar este agente");
+  if (!canManage(existing, actor)) {
+    throw new Error("Solo el creador o un admin puede despublicar este agente");
   }
   const { rows } = await query<AgentRow>(
     `UPDATE custom_agents
@@ -565,14 +637,14 @@ export async function restoreVersion(
   tenantId: string,
   agentId: string,
   versionId: string,
-  user: string,
+  actor: AgentActor,
 ): Promise<CustomAgent> {
   await ready(tenantId);
   const agent = await getAgent(tenantId, agentId);
   if (!agent) throw new Error("Agente no encontrado");
   if (agent.isVerified) throw new Error("Los agentes verificados del sistema no se pueden editar");
-  if (agent.createdBy && agent.createdBy !== user) {
-    throw new Error("Solo el creador puede restaurar versiones de este agente");
+  if (!canManage(agent, actor)) {
+    throw new Error("Solo el creador o un admin puede restaurar versiones de este agente");
   }
   const { rows } = await query<VersionRow>(
     `SELECT * FROM custom_agent_versions WHERE id = $1 AND agent_id = $2 AND tenant_id = $3`,
@@ -581,7 +653,7 @@ export async function restoreVersion(
   if (!rows[0]) throw new Error("Versión no encontrada");
   const v = mapVersion(rows[0]);
   // El estado actual también se snapshotea, así el restore es deshacible
-  await snapshotVersion(tenantId, agent, user).catch(() => null);
+  await snapshotVersion(tenantId, agent, actor.email).catch(() => null);
   const { rows: updated } = await query<AgentRow>(
     `UPDATE custom_agents
         SET name = $3, category = $4, description = $5, instructions = $6,
@@ -600,13 +672,16 @@ export async function restoreVersion(
 export async function duplicateAgent(
   tenantId: string,
   id: string,
-  user: string,
+  actor: AgentActor,
 ): Promise<CustomAgent> {
   await ready(tenantId);
   const src = await getAgent(tenantId, id);
   if (!src) throw new Error("Agente no encontrado");
   // Un borrador ajeno no se puede duplicar (no debería ser visible siquiera)
-  if (!src.isVerified && src.visibility === "private" && src.createdBy && src.createdBy !== user) {
+  if (
+    !src.isVerified && src.visibility === "private" &&
+    src.createdBy && src.createdBy !== actor.email && !actor.isAdmin
+  ) {
     throw new Error("Agente no encontrado");
   }
   return createAgent(tenantId, {
@@ -618,8 +693,44 @@ export async function duplicateAgent(
     icon: src.icon,
     model: src.model,
     visibility: "private",
-    createdBy: user,
+    createdBy: actor.email,
   });
+}
+
+// ============================================================
+// Onda 6 — estadísticas de uso por agente
+// ============================================================
+
+export interface AgentStats {
+  conversations: number;
+  messages: number;
+  uniqueUsers: number;
+  lastUsedAt: string | null;
+}
+
+export async function getAgentStats(tenantId: string, agentId: string): Promise<AgentStats> {
+  await ready(tenantId);
+  const { rows } = await query<{
+    conversations: string; unique_users: string; last_used_at: string | null; messages: string;
+  }>(
+    `SELECT
+       count(*)::text AS conversations,
+       count(DISTINCT user_id)::text AS unique_users,
+       max(updated_at) AS last_used_at,
+       (SELECT count(*)::text FROM agent_messages m
+         JOIN agent_conversations c2 ON c2.id = m.conversation_id
+        WHERE c2.agent_id = $1 AND c2.tenant_id = $2) AS messages
+     FROM agent_conversations
+     WHERE agent_id = $1 AND tenant_id = $2`,
+    [agentId, tenantId],
+  );
+  const r = rows[0];
+  return {
+    conversations: Number(r?.conversations ?? 0),
+    messages: Number(r?.messages ?? 0),
+    uniqueUsers: Number(r?.unique_users ?? 0),
+    lastUsedAt: r?.last_used_at ?? null,
+  };
 }
 
 // ============================================================
@@ -662,12 +773,12 @@ export interface ModelComparisonEntry {
 export async function compareModels(
   tenantId: string,
   agentId: string,
-  input: { message: string; models: string[]; user: string },
+  input: { message: string; models: string[]; user: string; isAdmin?: boolean },
 ): Promise<ModelComparisonEntry[]> {
   const agent = await getAgent(tenantId, agentId);
   if (!agent) throw new Error("Agente no encontrado");
-  if (agent.createdBy && agent.createdBy !== input.user && !agent.isVerified) {
-    throw new Error("Solo el creador puede comparar modelos de este agente");
+  if (agent.createdBy && agent.createdBy !== input.user && !agent.isVerified && !input.isAdmin) {
+    throw new Error("Solo el creador o un admin puede comparar modelos de este agente");
   }
   const models = input.models.slice(0, 2).map((m) => normalizeModel(m));
   if (models.length < 2) throw new Error("Se necesitan 2 modelos para comparar");
