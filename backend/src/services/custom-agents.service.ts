@@ -22,6 +22,8 @@ export interface CustomAgent {
   instructions: string;
   kbModules: string[];
   icon: string;
+  /** Modelo LLM del agente — de ALLOWED_AGENT_MODELS (Gemini o Claude). */
+  model: string;
   /** private = borrador (solo el creador lo ve) · team = publicado al equipo · public = sistema */
   visibility: "private" | "team" | "public";
   isVerified: boolean;
@@ -43,6 +45,7 @@ export interface CreateAgentInput {
   instructions: string;
   kbModules?: string[];
   icon?: string;
+  model?: string;
   visibility?: "private" | "team" | "public";
   createdBy?: string | null;
 }
@@ -51,6 +54,27 @@ export const AGENT_CATEGORIES = [
   "MM", "SD", "PP", "FI", "CO", "BTP", "EWM", "INTEGRACION",
   "PRODUCTIVIDAD", "REPORTING", "GENERAL",
 ] as const;
+
+// Modelos disponibles para agentes custom (onda 4.1).
+// Los claude-* requieren ANTHROPIC_API_KEY en el backend.
+export const DEFAULT_AGENT_MODEL = "gemini-2.5-flash";
+export const ALLOWED_AGENT_MODELS = [
+  "gemini-2.5-flash",
+  "claude-haiku-4-5-20251001",
+  "claude-sonnet-5",
+  "claude-opus-4-8",
+] as const;
+
+function normalizeModel(model: string | undefined): string {
+  const m = (model ?? "").trim();
+  if (!m) return DEFAULT_AGENT_MODEL;
+  if (!(ALLOWED_AGENT_MODELS as readonly string[]).includes(m)) {
+    throw new Error(
+      `Modelo "${m}" no permitido. Opciones: ${ALLOWED_AGENT_MODELS.join(", ")}`,
+    );
+  }
+  return m;
+}
 
 // ============================================================
 // Schema
@@ -85,6 +109,8 @@ async function ensureSchema(): Promise<void> {
   // Onda 4 — publicación al equipo
   await query(`ALTER TABLE custom_agents ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ`);
   await query(`ALTER TABLE custom_agents ADD COLUMN IF NOT EXISTS published_by TEXT`);
+  // Onda 4.1 — modelo LLM por agente (Gemini default; claude-* vía Anthropic)
+  await query(`ALTER TABLE custom_agents ADD COLUMN IF NOT EXISTS model TEXT NOT NULL DEFAULT 'gemini-2.5-flash'`);
   schemaEnsured = true;
 }
 
@@ -194,6 +220,7 @@ interface AgentRow {
   instructions: string;
   kb_modules: string[];
   icon: string;
+  model: string;
   visibility: string;
   is_verified: boolean;
   status: string;
@@ -217,6 +244,7 @@ function mapAgent(r: AgentRow): CustomAgent {
     instructions: r.instructions,
     kbModules: r.kb_modules ?? [],
     icon: r.icon,
+    model: r.model || DEFAULT_AGENT_MODEL,
     visibility: r.visibility as CustomAgent["visibility"],
     isVerified: r.is_verified,
     status: r.status as CustomAgent["status"],
@@ -306,8 +334,8 @@ export async function createAgent(tenantId: string, input: CreateAgentInput): Pr
   }
   const { rows } = await query<AgentRow>(
     `INSERT INTO custom_agents
-       (tenant_id, name, category, description, instructions, kb_modules, icon, visibility, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       (tenant_id, name, category, description, instructions, kb_modules, icon, model, visibility, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
      RETURNING *`,
     [
       tenantId,
@@ -317,6 +345,7 @@ export async function createAgent(tenantId: string, input: CreateAgentInput): Pr
       input.instructions.trim(),
       input.kbModules ?? [],
       input.icon || "🤖",
+      normalizeModel(input.model),
       input.visibility ?? "private",
       input.createdBy ?? null,
     ],
@@ -346,6 +375,7 @@ export async function updateAgent(
   if (input.instructions !== undefined) push("instructions", input.instructions.trim());
   if (input.kbModules !== undefined) push("kb_modules", input.kbModules);
   if (input.icon !== undefined) push("icon", input.icon);
+  if (input.model !== undefined) push("model", normalizeModel(input.model));
   if (input.visibility !== undefined) push("visibility", input.visibility);
   if (input.status !== undefined) push("status", input.status);
   if (sets.length === 0) return existing;
@@ -496,6 +526,8 @@ export async function chatWithCustomAgent(
     environment: input.environment ?? "NO_INFORMADO",
     tenantId,
     systemPromptOverride: agent.instructions,
+    // Onda 4.1 — cada agente usa su modelo (claude-* enruta a Anthropic)
+    modelOverride: agent.model,
   });
 
   await conv.appendMessage(tenantId, conversationId, "agent", result.text, {

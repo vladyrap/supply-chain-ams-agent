@@ -15,6 +15,10 @@ const PRICING: Record<string, { in: number; out: number }> = {
   "gemini-1.5-pro":         { in: 1.25,  out: 5.00  },
   "gemini-1.5-flash":       { in: 0.075, out: 0.30  },
   "gemini-embedding-001":   { in: 0.025, out: 0     },
+  // Anthropic (v1.3 onda 4.1) — agentes custom con modelos Claude
+  "claude-haiku-4-5-20251001": { in: 1.00, out: 5.00  },
+  "claude-sonnet-5":           { in: 3.00, out: 15.00 },
+  "claude-opus-4-8":           { in: 5.00, out: 25.00 },
 };
 const DEFAULT_PRICING = { in: 0.10, out: 0.40 };
 

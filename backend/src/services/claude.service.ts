@@ -130,6 +130,12 @@ export interface ClaudeChatInput {
    * scoped al módulo del agente.
    */
   systemPromptOverride?: string;
+  /**
+   * v1.3 onda 4.1 — modelo elegido por el agente custom. Si empieza con
+   * "claude-" se enruta a la API de Anthropic (requiere ANTHROPIC_API_KEY);
+   * cualquier otro valor va a Gemini. Sin override → GEMINI_MODEL/default.
+   */
+  modelOverride?: string;
 }
 
 // Tipos Part compatibles con @google/genai
@@ -148,7 +154,7 @@ interface PreparedRequest {
 }
 
 async function prepareRequest(input: ClaudeChatInput): Promise<PreparedRequest> {
-  const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
+  const model = input.modelOverride?.trim() || process.env.GEMINI_MODEL || DEFAULT_MODEL;
   // MT-3: prompt activo es per-tenant. Si no viene tenantId (path interno),
   // se usa "default" — mismo fallback que few-shot / RAG.
   const promptTenantId = input.tenantId ?? "default";
@@ -233,8 +239,96 @@ function ragSourcesFromChunks(chunks: Awaited<ReturnType<typeof retrieveRelevant
   }));
 }
 
+// ============================================================
+// Proveedor Anthropic (v1.3 onda 4.1) — agentes con modelos Claude
+// ============================================================
+
+export function isClaudeModel(model: string): boolean {
+  return model.startsWith("claude-");
+}
+
+interface AnthropicResult {
+  text: string;
+  promptTokens: number;
+  completionTokens: number;
+}
+
+async function callAnthropic(
+  model: string,
+  systemPrompt: string,
+  contents: string | GeminiPart[],
+): Promise<AnthropicResult> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new ConfigError(
+      "ANTHROPIC_API_KEY no está configurada en el backend — necesaria para agentes con modelos Claude (Opus/Sonnet/Haiku)",
+    );
+  }
+
+  // Los contents vienen en formato Gemini — se convierten a bloques Anthropic.
+  type AnthropicBlock =
+    | { type: "text"; text: string }
+    | { type: "image"; source: { type: "base64"; media_type: string; data: string } };
+  const blocks: AnthropicBlock[] = [];
+  if (typeof contents === "string") {
+    blocks.push({ type: "text", text: contents });
+  } else {
+    for (const p of contents) {
+      if ("text" in p) {
+        blocks.push({ type: "text", text: p.text });
+      } else {
+        blocks.push({
+          type: "image",
+          source: { type: "base64", media_type: p.inlineData.mimeType, data: p.inlineData.data },
+        });
+      }
+    }
+  }
+
+  const resp = await retryWithBackoff(
+    async () => {
+      const r = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 4096,
+          temperature: 0.4,
+          system: systemPrompt,
+          messages: [{ role: "user", content: blocks }],
+        }),
+      });
+      if (!r.ok) {
+        const body = await r.text().catch(() => "");
+        const err = new Error(`Anthropic HTTP ${r.status}: ${body.slice(0, 300)}`);
+        (err as Error & { statusCode?: number }).statusCode = r.status;
+        throw err;
+      }
+      return r.json() as Promise<{
+        content: Array<{ type: string; text?: string }>;
+        usage?: { input_tokens?: number; output_tokens?: number };
+      }>;
+    },
+    { label: "anthropic.messages", retries: 3 },
+  );
+
+  const text = (resp.content ?? [])
+    .filter((b) => b.type === "text" && b.text)
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+  return {
+    text,
+    promptTokens: resp.usage?.input_tokens ?? 0,
+    completionTokens: resp.usage?.output_tokens ?? 0,
+  };
+}
+
 export async function chatWithAgent(input: ClaudeChatInput): Promise<ClaudeChatResult> {
-  const ai = getClient();
   const { model, systemPrompt, contents, ragChunks, fewShotQaIds, fewShotItemIds } = await prepareRequest(input);
 
   logger.info(
@@ -243,33 +337,53 @@ export async function chatWithAgent(input: ClaudeChatInput): Promise<ClaudeChatR
   );
 
   try {
-    // v0.12.3 — Hard cap defensivo. Throws GeminiRateLimitExceeded si excede.
+    // v0.12.3 — Hard cap defensivo diario. Aplica a TODOS los proveedores
+    // (Gemini y Anthropic): protege el costo, no solo el free tier.
     assertCanCallGemini("chatWithAgent");
-    const resp = await retryWithBackoff(
-      () => ai.models.generateContent({
-        model,
-        contents,
-        config: {
-          systemInstruction: systemPrompt,
-          maxOutputTokens: 4096,
-          temperature: 0.4,
-        },
-      }),
-      { label: "gemini.generateContent", retries: 3 }
-    );
 
-    const text = (resp.text ?? "").trim();
+    let text: string;
+    let promptTokens = 0;
+    let completionTokens = 0;
+    let totalTokens = 0;
+
+    if (isClaudeModel(model)) {
+      // v1.3 onda 4.1 — agente custom con modelo Claude (Anthropic API)
+      const r = await callAnthropic(model, systemPrompt, contents);
+      text = r.text;
+      promptTokens = r.promptTokens;
+      completionTokens = r.completionTokens;
+      totalTokens = promptTokens + completionTokens;
+    } else {
+      const ai = getClient();
+      const resp = await retryWithBackoff(
+        () => ai.models.generateContent({
+          model,
+          contents,
+          config: {
+            systemInstruction: systemPrompt,
+            maxOutputTokens: 4096,
+            temperature: 0.4,
+          },
+        }),
+        { label: "gemini.generateContent", retries: 3 }
+      );
+      text = (resp.text ?? "").trim();
+      const usage = extractUsage(resp);
+      promptTokens = usage.promptTokens;
+      completionTokens = usage.completionTokens;
+      totalTokens = usage.totalTokens;
+    }
+
     if (!text) {
       throw new ClaudeError("Respuesta vacía del modelo");
     }
 
-    const usage = extractUsage(resp);
     recordUsageFireAndForget({
       source: "chat",
       model,
-      promptTokens:     usage.promptTokens,
-      completionTokens: usage.completionTokens,
-      totalTokens:      usage.totalTokens,
+      promptTokens,
+      completionTokens,
+      totalTokens,
       metadata: { module: input.module, client: input.client },
     });
 
@@ -315,7 +429,7 @@ export async function chatWithAgent(input: ClaudeChatInput): Promise<ClaudeChatR
     };
   } catch (err) {
     if (err instanceof ConfigError) throw err;
-    logger.error({ err }, "Error llamando a Gemini");
+    logger.error({ err }, "Error llamando al LLM");
     throw new ClaudeError("Error procesando la solicitud del agente AMS", err);
   }
 }

@@ -125,17 +125,20 @@ export async function postAgent(req: FastifyRequest, reply: FastifyReply) {
       instructions: b.instructions,
       kbModules: b.kbModules,
       icon: b.icon,
+      model: b.model,
       visibility: b.visibility,
       createdBy: b.createdBy ?? null,
     });
     await recordAudit(r.tenantId, "CUSTOM_AGENT_CREATED", {
       agentId: agent.id, name: agent.name, category: agent.category,
-      createdBy: agent.createdBy,
+      model: agent.model, createdBy: agent.createdBy,
     }).catch(() => null);
     return reply.code(201).send({ success: true, agent });
   } catch (err) {
+    const msg = (err as Error).message;
+    const code = /no permitido/.test(msg) ? 400 : 500;
     logger.error({ err }, "agents.create fail");
-    return reply.code(500).send({ success: false, error: (err as Error).message });
+    return reply.code(code).send({ success: false, error: msg });
   }
 }
 
@@ -154,7 +157,7 @@ export async function putAgent(
     return reply.send({ success: true, agent });
   } catch (err) {
     const msg = (err as Error).message;
-    const code = /verificados/.test(msg) ? 403 : 500;
+    const code = /verificados/.test(msg) ? 403 : /no permitido/.test(msg) ? 400 : 500;
     logger.error({ err }, "agents.update fail");
     return reply.code(code).send({ success: false, error: msg });
   }

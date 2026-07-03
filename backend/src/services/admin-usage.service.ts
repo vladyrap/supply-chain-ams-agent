@@ -25,6 +25,10 @@ const MODEL_PRICING: Record<string, { input: number; output: number }> = {
   "gemini-2.5-flash":      { input: 0.30, output: 2.50 },
   "gemini-2.5-flash-lite": { input: 0.10, output: 0.40 },
   "gemini-2.5-pro":        { input: 1.25, output: 10.00 },
+  // Anthropic (v1.3 onda 4.1) — USD por MTok, precios de referencia
+  "claude-haiku-4-5-20251001": { input: 1.00, output: 5.00 },
+  "claude-sonnet-5":           { input: 3.00, output: 15.00 },
+  "claude-opus-4-8":           { input: 5.00, output: 25.00 },
 };
 
 // FIX A3 (audit v1.1.0): cache POR TENANT (antes era global → leak cross-tenant).
