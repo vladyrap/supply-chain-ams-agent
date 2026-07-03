@@ -154,13 +154,17 @@ export async function postLogout(req: FastifyRequest, reply: FastifyReply) {
 }
 
 // POST /api/auth/refresh — rota el refresh token, emite session+refresh nuevos.
+// Onda 7.2: "sin token" responde 200 {success:false} en vez de 401 — es el
+// probe normal de sesión desde /login y el 401 ensuciaba la consola del
+// browser (el dev-overlay de Next lo contaba como error). Un cliente sin
+// cookie NO es un error: es simplemente "no autenticado".
 export async function postRefresh(req: FastifyRequest, reply: FastifyReply) {
   const refresh = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies?.[REFRESH_COOKIE_NAME];
-  if (!refresh) return reply.code(401).send({ success: false, error: "no_refresh_token" });
+  if (!refresh) return reply.send({ success: false, error: "no_refresh_token" });
   const result = await rotateRefreshToken(req.tenantId, refresh, meta(req));
   if (!result) {
     clearSessionCookie(reply);
-    return reply.code(401).send({ success: false, error: "refresh_invalid" });
+    return reply.send({ success: false, error: "refresh_invalid" });
   }
   setSessionCookie(reply, result.sessionToken);
   setRefreshCookie(reply, result.refreshToken);
@@ -190,15 +194,19 @@ export async function postLogoutAll(req: FastifyRequest, reply: FastifyReply) {
   return reply.send({ success: true });
 }
 
+// Onda 7.2: /me es el PROBE de sesión (AuthContext lo llama en cada carga,
+// incluso en /login sin cookie). "No autenticado" se responde 200
+// {success:false} para no generar 401s ruidosos en la consola del browser.
+// Los endpoints protegidos de verdad siguen devolviendo 401 vía requireAuth.
 export async function getMe(req: FastifyRequest, reply: FastifyReply) {
   const token = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies?.[COOKIE_NAME];
   if (!token) {
-    return reply.code(401).send({ success: false, error: "no_session" });
+    return reply.send({ success: false, error: "no_session" });
   }
   const user = await getUserBySession(req.tenantId, token);
   if (!user) {
     clearSessionCookie(reply);
-    return reply.code(401).send({ success: false, error: "invalid_session" });
+    return reply.send({ success: false, error: "invalid_session" });
   }
   return reply.send({ success: true, user });
 }

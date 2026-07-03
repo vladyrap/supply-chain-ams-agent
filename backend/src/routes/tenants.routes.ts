@@ -18,6 +18,7 @@ import {
   type CreateTenantInput, type UpdateTenantInput,
 } from "../services/tenants.service";
 import { requireAuth } from "../middleware/requireAuth";
+import { getUserBySession } from "../services/auth.service";
 import { logger } from "../utils/logger";
 
 /** Super admin = role='admin' Y tenantId del request es '*' (multi-tenant view) o admin del default. */
@@ -38,12 +39,21 @@ export async function tenantsRoutes(app: FastifyInstance): Promise<void> {
 
   // -------------------------------------------------------------------
   // GET /api/tenants/me — tenant del request actual
+  // Onda 7.2: es un PROBE (TenantProvider lo llama en cada carga, también
+  // en /login sin sesión). Sin sesión → 200 {success:false} en vez de 401
+  // para no ensuciar la consola del browser. Endpoints protegidos reales
+  // siguen usando requireAuth con 401.
   // -------------------------------------------------------------------
   app.get(
     "/api/tenants/me",
-    { preHandler: requireAuth },
     async (req, reply) => {
       try {
+        const cookies = (req as FastifyRequest & { cookies?: Record<string, string> }).cookies;
+        const token = cookies?.["ams_session"];
+        const user = token ? await getUserBySession(req.tenantId, token) : null;
+        if (!user) {
+          return reply.send({ success: false, error: "no_session" });
+        }
         const tenant = await getTenant(req.tenantId);
         if (!tenant) {
           return reply.code(404).send({
