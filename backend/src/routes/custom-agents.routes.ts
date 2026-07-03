@@ -17,6 +17,11 @@ export async function customAgentsRoutes(app: FastifyInstance) {
     { preHandler: requirePermission("agente_ams", "view") },
     ctrl.getAgents);
 
+  // Onda 5 — catálogo de modelos con disponibilidad (ruta estática gana a /:id)
+  app.get("/api/agents/models",
+    { preHandler: requirePermission("agente_ams", "view") },
+    ctrl.getModels);
+
   app.get<{ Params: { id: string } }>("/api/agents/:id",
     { preHandler: requirePermission("agente_ams", "view") },
     ctrl.getAgentById);
@@ -45,6 +50,23 @@ export async function customAgentsRoutes(app: FastifyInstance) {
   app.post<{ Params: { id: string } }>("/api/agents/:id/unpublish",
     { preHandler: requirePermission("agente_ams", "edit") },
     ctrl.postAgentUnpublish);
+
+  // Onda 5 — duplicar / versiones / comparador
+  app.post<{ Params: { id: string } }>("/api/agents/:id/duplicate",
+    { preHandler: requirePermission("agente_ams", "create") },
+    ctrl.postAgentDuplicate);
+
+  app.get<{ Params: { id: string } }>("/api/agents/:id/versions",
+    { preHandler: requirePermission("agente_ams", "edit") },
+    ctrl.getAgentVersions);
+
+  app.post<{ Params: { id: string; versionId: string } }>("/api/agents/:id/versions/:versionId/restore",
+    { preHandler: requirePermission("agente_ams", "edit") },
+    ctrl.postAgentRestore);
+
+  app.post<{ Params: { id: string } }>("/api/agents/:id/compare",
+    { preHandler: requirePermission("agente_ams", "edit") },
+    ctrl.postAgentCompare);
 
   app.post<{ Params: { id: string } }>("/api/agents/:id/chat",
     { preHandler: requirePermission("agente_ams", "view") },

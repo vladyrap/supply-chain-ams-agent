@@ -111,6 +111,24 @@ async function ensureSchema(): Promise<void> {
   await query(`ALTER TABLE custom_agents ADD COLUMN IF NOT EXISTS published_by TEXT`);
   // Onda 4.1 — modelo LLM por agente (Gemini default; claude-* vía Anthropic)
   await query(`ALTER TABLE custom_agents ADD COLUMN IF NOT EXISTS model TEXT NOT NULL DEFAULT 'gemini-2.5-flash'`);
+  // Onda 5 — historial de versiones (snapshot en cada guardado del builder)
+  await query(`
+    CREATE TABLE IF NOT EXISTS custom_agent_versions (
+      id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id    TEXT NOT NULL DEFAULT 'default',
+      agent_id     UUID NOT NULL,
+      name         TEXT NOT NULL,
+      category     TEXT NOT NULL,
+      description  TEXT NOT NULL DEFAULT '',
+      instructions TEXT NOT NULL,
+      kb_modules   TEXT[] NOT NULL DEFAULT '{}',
+      icon         TEXT NOT NULL DEFAULT '🤖',
+      model        TEXT NOT NULL DEFAULT 'gemini-2.5-flash',
+      saved_by     TEXT,
+      saved_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_agent_versions ON custom_agent_versions(tenant_id, agent_id, saved_at DESC)`);
   schemaEnsured = true;
 }
 
@@ -353,6 +371,32 @@ export async function createAgent(tenantId: string, input: CreateAgentInput): Pr
   return mapAgent(rows[0]!);
 }
 
+// Onda 5 — snapshot del estado actual antes de un update relevante.
+// Mantiene las últimas 20 versiones por agente.
+const MAX_VERSIONS_PER_AGENT = 20;
+
+async function snapshotVersion(tenantId: string, agent: CustomAgent, savedBy?: string | null): Promise<void> {
+  await query(
+    `INSERT INTO custom_agent_versions
+       (tenant_id, agent_id, name, category, description, instructions, kb_modules, icon, model, saved_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+    [
+      tenantId, agent.id, agent.name, agent.category, agent.description,
+      agent.instructions, agent.kbModules, agent.icon, agent.model, savedBy ?? null,
+    ],
+  );
+  await query(
+    `DELETE FROM custom_agent_versions
+      WHERE agent_id = $1 AND tenant_id = $2
+        AND id NOT IN (
+          SELECT id FROM custom_agent_versions
+           WHERE agent_id = $1 AND tenant_id = $2
+           ORDER BY saved_at DESC LIMIT ${MAX_VERSIONS_PER_AGENT}
+        )`,
+    [agent.id, tenantId],
+  );
+}
+
 export async function updateAgent(
   tenantId: string,
   id: string,
@@ -362,6 +406,15 @@ export async function updateAgent(
   const existing = await getAgent(tenantId, id);
   if (!existing) return null;
   if (existing.isVerified) throw new Error("Los agentes verificados del sistema no se pueden editar");
+
+  // Onda 5 — si cambia el contenido del agente, snapshot del estado previo
+  const contentKeys: Array<keyof CreateAgentInput> = [
+    "name", "category", "description", "instructions", "kbModules", "icon", "model",
+  ];
+  if (contentKeys.some((k) => input[k] !== undefined)) {
+    await snapshotVersion(tenantId, existing, input.createdBy ?? existing.createdBy).catch((err) =>
+      logger.debug({ err }, "snapshot version fail (non-blocking)"));
+  }
 
   const sets: string[] = [];
   const params: unknown[] = [];
@@ -453,6 +506,193 @@ export async function unpublishAgent(
     [id, tenantId],
   );
   return mapAgent(rows[0]!);
+}
+
+// ============================================================
+// Onda 5 — historial de versiones
+// ============================================================
+
+export interface AgentVersion {
+  id: string;
+  agentId: string;
+  name: string;
+  category: string;
+  description: string;
+  instructions: string;
+  kbModules: string[];
+  icon: string;
+  model: string;
+  savedBy: string | null;
+  savedAt: string;
+}
+
+interface VersionRow {
+  id: string;
+  agent_id: string;
+  name: string;
+  category: string;
+  description: string;
+  instructions: string;
+  kb_modules: string[];
+  icon: string;
+  model: string;
+  saved_by: string | null;
+  saved_at: string;
+}
+
+function mapVersion(r: VersionRow): AgentVersion {
+  return {
+    id: r.id, agentId: r.agent_id, name: r.name, category: r.category,
+    description: r.description, instructions: r.instructions,
+    kbModules: r.kb_modules ?? [], icon: r.icon, model: r.model,
+    savedBy: r.saved_by, savedAt: r.saved_at,
+  };
+}
+
+export async function listVersions(tenantId: string, agentId: string): Promise<AgentVersion[]> {
+  await ready(tenantId);
+  const { rows } = await query<VersionRow>(
+    `SELECT * FROM custom_agent_versions
+      WHERE agent_id = $1 AND tenant_id = $2
+      ORDER BY saved_at DESC`,
+    [agentId, tenantId],
+  );
+  return rows.map(mapVersion);
+}
+
+export async function restoreVersion(
+  tenantId: string,
+  agentId: string,
+  versionId: string,
+  user: string,
+): Promise<CustomAgent> {
+  await ready(tenantId);
+  const agent = await getAgent(tenantId, agentId);
+  if (!agent) throw new Error("Agente no encontrado");
+  if (agent.isVerified) throw new Error("Los agentes verificados del sistema no se pueden editar");
+  if (agent.createdBy && agent.createdBy !== user) {
+    throw new Error("Solo el creador puede restaurar versiones de este agente");
+  }
+  const { rows } = await query<VersionRow>(
+    `SELECT * FROM custom_agent_versions WHERE id = $1 AND agent_id = $2 AND tenant_id = $3`,
+    [versionId, agentId, tenantId],
+  );
+  if (!rows[0]) throw new Error("Versión no encontrada");
+  const v = mapVersion(rows[0]);
+  // El estado actual también se snapshotea, así el restore es deshacible
+  await snapshotVersion(tenantId, agent, user).catch(() => null);
+  const { rows: updated } = await query<AgentRow>(
+    `UPDATE custom_agents
+        SET name = $3, category = $4, description = $5, instructions = $6,
+            kb_modules = $7, icon = $8, model = $9, updated_at = now()
+      WHERE id = $1 AND tenant_id = $2
+      RETURNING *`,
+    [agentId, tenantId, v.name, v.category, v.description, v.instructions, v.kbModules, v.icon, v.model],
+  );
+  return mapAgent(updated[0]!);
+}
+
+// ============================================================
+// Onda 5 — duplicar agente (cualquiera visible → borrador propio)
+// ============================================================
+
+export async function duplicateAgent(
+  tenantId: string,
+  id: string,
+  user: string,
+): Promise<CustomAgent> {
+  await ready(tenantId);
+  const src = await getAgent(tenantId, id);
+  if (!src) throw new Error("Agente no encontrado");
+  // Un borrador ajeno no se puede duplicar (no debería ser visible siquiera)
+  if (!src.isVerified && src.visibility === "private" && src.createdBy && src.createdBy !== user) {
+    throw new Error("Agente no encontrado");
+  }
+  return createAgent(tenantId, {
+    name: `${src.name} (mi versión)`.slice(0, 120),
+    category: src.category,
+    description: src.description,
+    instructions: src.instructions,
+    kbModules: src.kbModules,
+    icon: src.icon,
+    model: src.model,
+    visibility: "private",
+    createdBy: user,
+  });
+}
+
+// ============================================================
+// Onda 5 — catálogo de modelos con disponibilidad real
+// ============================================================
+
+export interface ModelAvailability {
+  id: string;
+  available: boolean;
+  reason?: string;
+}
+
+export function getModelsCatalog(): ModelAvailability[] {
+  const geminiOk = Boolean(process.env.GEMINI_API_KEY);
+  const anthropicOk = Boolean(process.env.ANTHROPIC_API_KEY);
+  return ALLOWED_AGENT_MODELS.map((id) => {
+    const isClaude = id.startsWith("claude-");
+    const available = isClaude ? anthropicOk : geminiOk;
+    return {
+      id,
+      available,
+      reason: available ? undefined : isClaude
+        ? "Requiere ANTHROPIC_API_KEY en el backend"
+        : "Requiere GEMINI_API_KEY en el backend",
+    };
+  });
+}
+
+// ============================================================
+// Onda 5 — comparador de modelos (playground del creador)
+// ============================================================
+
+export interface ModelComparisonEntry {
+  model: string;
+  response: string;
+  durationMs: number;
+  error: string | null;
+}
+
+export async function compareModels(
+  tenantId: string,
+  agentId: string,
+  input: { message: string; models: string[]; user: string },
+): Promise<ModelComparisonEntry[]> {
+  const agent = await getAgent(tenantId, agentId);
+  if (!agent) throw new Error("Agente no encontrado");
+  if (agent.createdBy && agent.createdBy !== input.user && !agent.isVerified) {
+    throw new Error("Solo el creador puede comparar modelos de este agente");
+  }
+  const models = input.models.slice(0, 2).map((m) => normalizeModel(m));
+  if (models.length < 2) throw new Error("Se necesitan 2 modelos para comparar");
+  if (models[0] === models[1]) throw new Error("Elegí 2 modelos distintos");
+
+  const module = agent.kbModules[0] ?? agent.category;
+  const runOne = async (model: string): Promise<ModelComparisonEntry> => {
+    const started = Date.now();
+    try {
+      const result = await chatWithAgent({
+        userMessage: input.message,
+        user: input.user,
+        module: module === "GENERAL" ? "NO_INFORMADO" : module,
+        client: "NO_INFORMADO",
+        environment: "NO_INFORMADO",
+        tenantId,
+        systemPromptOverride: agent.instructions,
+        modelOverride: model,
+      });
+      return { model, response: result.text, durationMs: Date.now() - started, error: null };
+    } catch (err) {
+      return { model, response: "", durationMs: Date.now() - started, error: (err as Error).message };
+    }
+  };
+  // En paralelo: son solo 2 llamadas y cada una respeta el hard cap global
+  return Promise.all(models.map(runOne));
 }
 
 export async function rateAgent(tenantId: string, id: string, stars: number): Promise<CustomAgent | null> {

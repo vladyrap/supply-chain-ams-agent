@@ -59,6 +59,99 @@ export async function getAgentById(
   }
 }
 
+// ── Onda 5: catálogo de modelos, duplicar, versiones, comparador ──
+
+export async function getModels(_req: FastifyRequest, reply: FastifyReply) {
+  return reply.send({ success: true, models: svc.getModelsCatalog() });
+}
+
+export async function postAgentDuplicate(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+) {
+  const r = req as unknown as Req;
+  const b = (req.body || {}) as { user?: string };
+  const user = (b.user ?? "").toString().trim();
+  if (!user) return reply.code(400).send({ success: false, error: "user es obligatorio" });
+  try {
+    const agent = await svc.duplicateAgent(r.tenantId, req.params.id, user);
+    await recordAudit(r.tenantId, "CUSTOM_AGENT_DUPLICATED", {
+      sourceAgentId: req.params.id, newAgentId: agent.id, duplicatedBy: user,
+    }).catch(() => null);
+    return reply.code(201).send({ success: true, agent });
+  } catch (err) {
+    const msg = (err as Error).message;
+    const code = /no encontrado/.test(msg) ? 404 : /Límite/.test(msg) ? 409 : 500;
+    logger.error({ err }, "agents.duplicate fail");
+    return reply.code(code).send({ success: false, error: msg });
+  }
+}
+
+export async function getAgentVersions(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+) {
+  const r = req as unknown as Req;
+  try {
+    const versions = await svc.listVersions(r.tenantId, req.params.id);
+    return reply.send({ success: true, versions });
+  } catch (err) {
+    logger.error({ err }, "agents.versions fail");
+    return reply.code(500).send({ success: false, error: "Error listando versiones" });
+  }
+}
+
+export async function postAgentRestore(
+  req: FastifyRequest<{ Params: { id: string; versionId: string } }>,
+  reply: FastifyReply,
+) {
+  const r = req as unknown as Req;
+  const b = (req.body || {}) as { user?: string };
+  const user = (b.user ?? "").toString().trim();
+  if (!user) return reply.code(400).send({ success: false, error: "user es obligatorio" });
+  try {
+    const agent = await svc.restoreVersion(r.tenantId, req.params.id, req.params.versionId, user);
+    await recordAudit(r.tenantId, "CUSTOM_AGENT_VERSION_RESTORED", {
+      agentId: agent.id, versionId: req.params.versionId, restoredBy: user,
+    }).catch(() => null);
+    return reply.send({ success: true, agent });
+  } catch (err) {
+    const msg = (err as Error).message;
+    const code = /no encontrad/.test(msg) ? 404 : /Solo el creador|verificados/.test(msg) ? 403 : 500;
+    logger.error({ err }, "agents.restore fail");
+    return reply.code(code).send({ success: false, error: msg });
+  }
+}
+
+export async function postAgentCompare(
+  req: FastifyRequest<{ Params: { id: string } }>,
+  reply: FastifyReply,
+) {
+  const r = req as unknown as Req;
+  const b = (req.body || {}) as { message?: string; models?: string[]; user?: string };
+  const message = (b.message ?? "").trim();
+  const user = (b.user ?? "").toString().trim();
+  if (!message) return reply.code(400).send({ success: false, error: "message es obligatorio" });
+  if (message.length > 4000) return reply.code(400).send({ success: false, error: "message supera 4000 caracteres" });
+  if (!user) return reply.code(400).send({ success: false, error: "user es obligatorio" });
+  if (!Array.isArray(b.models) || b.models.length !== 2) {
+    return reply.code(400).send({ success: false, error: "models debe ser un array de 2 modelos" });
+  }
+  try {
+    const results = await svc.compareModels(r.tenantId, req.params.id, {
+      message, models: b.models, user,
+    });
+    return reply.send({ success: true, results });
+  } catch (err) {
+    const msg = (err as Error).message;
+    const code = /no encontrado/.test(msg) ? 404
+      : /Solo el creador/.test(msg) ? 403
+      : /no permitido|2 modelos|distintos/.test(msg) ? 400 : 500;
+    logger.error({ err }, "agents.compare fail");
+    return reply.code(code).send({ success: false, error: msg });
+  }
+}
+
 // ── Publicación (onda 4) ──
 
 export async function postAgentPublish(
