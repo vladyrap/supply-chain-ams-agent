@@ -40,6 +40,8 @@ import { adminUsersRoutes } from "./routes/admin-users.routes";
 import { customAgentsRoutes } from "./routes/custom-agents.routes";
 // v1.3 Agent Hub — apps agénticas (pipeline multi-agente)
 import { agenticAppsRoutes } from "./routes/agentic-apps.routes";
+// v1.3 — Clean Core: refactor Z → Clean Core (HANA) con IA (ROCCO)
+import { cleanCoreRoutes } from "./routes/clean-core.routes";
 // DH v0.9 — Audit Trail backend rico
 import { auditEventsRoutes } from "./routes/audit-events.routes";
 // v0.12.4 — Admin usage panel (costos Gemini visibles en /admin/costs)
@@ -243,6 +245,7 @@ export function buildServer() {
   // v1.3 Agent Hub
   app.register(customAgentsRoutes);
   app.register(agenticAppsRoutes);
+  app.register(cleanCoreRoutes);
   // DH v0.9 — nuevo audit_events backend
   app.register(auditEventsRoutes);
   // v0.12.4 — admin usage / cost panel
