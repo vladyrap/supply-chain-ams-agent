@@ -18,7 +18,9 @@ interface Req extends FastifyRequest {
   tenantId: string;
 }
 
-const MAX_CODE = 12000;
+// Programas ABAP completos pueden ser grandes; se admite hasta 40k caracteres
+// (≈ 900-1000 líneas). Gemini/Claude tienen contexto de sobra para ese tamaño.
+const MAX_CODE = 40000;
 
 const ROCCO_ABAP_SYSTEM_PROMPT = `Eres ROCCO, consultor SAP senior especializado en Clean Core, S/4HANA y ABAP para Cloud.
 Tu tarea: recibir un objeto ABAP clásico (Z/Y heredado de ECC) y devolver una versión refactorizada a Clean Core, optimizada para HANA y compatible con ABAP Cloud, sin cambiar la intención funcional.
