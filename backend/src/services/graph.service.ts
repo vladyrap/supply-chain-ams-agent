@@ -6,7 +6,14 @@
 // Tipos de nodos: incident, ticket, conversation, kb, meeting.
 // Tipos de edges: conversation→ticket (escalated), ticket→kb (uses_kb),
 //                 kb→ticket (kb_from).
-import { query } from "../database/db";
+//
+// ROCCO Fase 0 (activo #1): además de la proyección en vivo (getKnowledgeGraph),
+// se PERSISTE el grafo en kg_node/kg_edge (rebuildKnowledgeGraph) y se puede leer
+// persistido (getPersistedKnowledgeGraph). Ver docs/rocco/. La proyección en vivo
+// queda intacta (backward-compatible).
+import { createHash } from "crypto";
+import { query, withTx } from "../database/db";
+import { logger } from "../utils/logger";
 
 export type GraphNodeType = "incident" | "ticket" | "conversation" | "kb" | "meeting";
 
@@ -153,4 +160,140 @@ export async function getKnowledgeGraph(
       meeting: meetRows.rows.length,
     },
   };
+}
+
+// ── ROCCO Fase 0 · Persistencia del Knowledge Graph ──────────────────────────
+// Ver docs/rocco/ORGANIZATIONAL_MEMORY_AND_KNOWLEDGE_GRAPH.md. La proyección en
+// vivo (getKnowledgeGraph) queda intacta; esto la MATERIALIZA de forma idempotente.
+
+let kgSchemaEnsured = false;
+
+/** Crea kg_node/kg_edge si no existen (idempotente; best-effort al arranque). */
+export async function ensureKnowledgeGraphSchema(): Promise<void> {
+  if (kgSchemaEnsured) return;
+  await query(`
+    CREATE TABLE IF NOT EXISTS kg_node (
+      tenant_id TEXT NOT NULL, id TEXT NOT NULL, type TEXT NOT NULL,
+      label TEXT NOT NULL, subtitle TEXT, href TEXT,
+      meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+      provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+      content_hash TEXT NOT NULL,
+      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (tenant_id, id)
+    );
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_kg_node_tenant_type ON kg_node (tenant_id, type);`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS kg_edge (
+      tenant_id TEXT NOT NULL, id TEXT NOT NULL,
+      from_id TEXT NOT NULL, to_id TEXT NOT NULL, kind TEXT NOT NULL,
+      provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+      content_hash TEXT NOT NULL,
+      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (tenant_id, id)
+    );
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_kg_edge_from ON kg_edge (tenant_id, from_id);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_kg_edge_to   ON kg_edge (tenant_id, to_id);`);
+  kgSchemaEnsured = true;
+  logger.info("kg.schema.ensured");
+}
+
+// Serialización estable (claves ordenadas) → content_hash reproducible (Evidence by Design).
+function stableStringify(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+  if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
+  const obj = v as Record<string, unknown>;
+  return `{${Object.keys(obj).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
+}
+const sha256 = (s: string): string => createHash("sha256").update(s).digest("hex");
+function nodeHash(n: GraphNode): string {
+  return sha256(stableStringify({ t: n.type, l: n.label, s: n.subtitle ?? "", h: n.href ?? "", m: n.meta ?? {} }));
+}
+function edgeId(e: GraphEdge): string {
+  return sha256(`${e.from}|${e.kind}|${e.to}`);
+}
+
+export interface RebuildResult {
+  nodes: number;
+  edges: number;
+  at: string;
+}
+
+/**
+ * Recomputa la proyección y la MATERIALIZA en kg_node/kg_edge de forma idempotente:
+ * upsert por (tenant_id,id) + reconciliación de stale (borra lo que ya no está en la
+ * proyección). Multi-tenant, transaccional, con provenance. Recomputar no duplica.
+ */
+export async function rebuildKnowledgeGraph(tenantId: string): Promise<RebuildResult> {
+  await ensureKnowledgeGraphSchema();
+  const g = await getKnowledgeGraph(tenantId, { limitPerType: 100 });
+  const at = new Date().toISOString();
+  const prov = JSON.stringify({ origin: "system", source: "graph.projection", computed_at: at });
+
+  await withTx(async (client) => {
+    for (const n of g.nodes) {
+      await client.query(
+        `INSERT INTO kg_node (tenant_id,id,type,label,subtitle,href,meta,provenance,content_hash,last_seen_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9, now())
+         ON CONFLICT (tenant_id,id) DO UPDATE SET
+           type=EXCLUDED.type, label=EXCLUDED.label, subtitle=EXCLUDED.subtitle, href=EXCLUDED.href,
+           meta=EXCLUDED.meta, provenance=EXCLUDED.provenance, content_hash=EXCLUDED.content_hash,
+           last_seen_at=now()`,
+        [tenantId, n.id, n.type, n.label, n.subtitle ?? null, n.href ?? null,
+         JSON.stringify(n.meta ?? {}), prov, nodeHash(n)]
+      );
+    }
+    for (const e of g.edges) {
+      const id = edgeId(e);
+      await client.query(
+        `INSERT INTO kg_edge (tenant_id,id,from_id,to_id,kind,provenance,content_hash,last_seen_at)
+         VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7, now())
+         ON CONFLICT (tenant_id,id) DO UPDATE SET
+           from_id=EXCLUDED.from_id, to_id=EXCLUDED.to_id, kind=EXCLUDED.kind,
+           provenance=EXCLUDED.provenance, content_hash=EXCLUDED.content_hash, last_seen_at=now()`,
+        [tenantId, id, e.from, e.to, e.kind, prov, id]
+      );
+    }
+    // Reconciliación de stale: borra lo que ya no está en la proyección de este tenant.
+    const nodeIds = g.nodes.map((n) => n.id);
+    const edgeIds = g.edges.map(edgeId);
+    await client.query(`DELETE FROM kg_node WHERE tenant_id=$1 AND NOT (id = ANY($2::text[]))`, [tenantId, nodeIds]);
+    await client.query(`DELETE FROM kg_edge WHERE tenant_id=$1 AND NOT (id = ANY($2::text[]))`, [tenantId, edgeIds]);
+  });
+
+  logger.info({ tenantId, nodes: g.nodes.length, edges: g.edges.length }, "kg.rebuilt");
+  return { nodes: g.nodes.length, edges: g.edges.length, at };
+}
+
+/** Lee el grafo PERSISTIDO (kg_node/kg_edge) devolviendo el mismo GraphPayload. */
+export async function getPersistedKnowledgeGraph(
+  tenantId: string,
+  opts: { limit?: number } = {},
+): Promise<GraphPayload> {
+  await ensureKnowledgeGraphSchema();
+  const limit = Math.min(opts.limit ?? 500, 2000);
+  const [nodeRows, edgeRows] = await Promise.all([
+    query<{ id: string; type: GraphNodeType; label: string; subtitle: string | null; href: string | null; meta: Record<string, string | number | boolean | null> }>(
+      `SELECT id,type,label,subtitle,href,meta FROM kg_node WHERE tenant_id=$1 ORDER BY last_seen_at DESC LIMIT $2`,
+      [tenantId, limit]
+    ),
+    query<{ from_id: string; to_id: string; kind: GraphEdge["kind"] }>(
+      `SELECT from_id,to_id,kind FROM kg_edge WHERE tenant_id=$1 LIMIT $2`,
+      [tenantId, limit * 4]
+    ),
+  ]);
+  const nodes: GraphNode[] = nodeRows.rows.map((r) => ({
+    id: r.id, type: r.type, label: r.label,
+    subtitle: r.subtitle ?? undefined, href: r.href ?? undefined, meta: r.meta ?? {},
+  }));
+  const present = new Set(nodes.map((n) => n.id));
+  const edges: GraphEdge[] = edgeRows.rows
+    .filter((e) => present.has(e.from_id) && present.has(e.to_id))
+    .map((e) => ({ from: e.from_id, to: e.to_id, kind: e.kind }));
+  const counts: Record<GraphNodeType, number> = { incident: 0, ticket: 0, conversation: 0, kb: 0, meeting: 0 };
+  for (const n of nodes) counts[n.type] = (counts[n.type] ?? 0) + 1;
+  return { nodes, edges, counts };
 }

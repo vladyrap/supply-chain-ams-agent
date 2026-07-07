@@ -4,6 +4,7 @@ import { logger } from "./utils/logger";
 import { query } from "./database/db";
 import { bootstrapAdminIfNeeded } from "./services/auth.service";
 import { ensureVoiceSchema } from "./services/call-log.service";
+import { ensureKnowledgeGraphSchema } from "./services/graph.service";
 import { seedTrainingIfEmpty } from "./services/training.seed";
 import { bootstrapSelfTrainingCron } from "./services/self-training-cron.service";
 
@@ -22,6 +23,11 @@ async function main() {
   // Asegurar schema del canal telefónico (idempotente, best-effort).
   await ensureVoiceSchema().catch((err) => {
     logger.warn({ err }, "ensureVoiceSchema falló (continuamos)");
+  });
+
+  // ROCCO Fase 0: asegurar schema del Knowledge Graph persistido (idempotente).
+  await ensureKnowledgeGraphSchema().catch((err) => {
+    logger.warn({ err }, "ensureKnowledgeGraphSchema falló (continuamos)");
   });
 
   // Seed del Centro de Entrenamiento si tablas vacías (idempotente)
