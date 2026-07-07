@@ -14,7 +14,11 @@ import { createArticle } from "./support/kb.service";
 import { emitEventFireAndForget } from "./integrations/delivery.service";
 
 export type InboundSource =
-  | "idoc" | "short_dump" | "oss_note" | "job_failure" | "transport" | "generic";
+  | "idoc" | "short_dump" | "oss_note" | "job_failure" | "transport" | "generic"
+  // "clean_core": usado SOLO para scoping de tokens de servicio (connector Clean Core
+  // → POST /api/memory/ingest/clean-core). NO pasa por processInboundEvent: tiene su
+  // propio pipeline de ingesta (grafo + memoria). Por eso no está en VALID_SOURCES.
+  | "clean_core";
 
 const VALID_SOURCES: ReadonlySet<InboundSource> = new Set<InboundSource>([
   "idoc", "short_dump", "oss_note", "job_failure", "transport", "generic",

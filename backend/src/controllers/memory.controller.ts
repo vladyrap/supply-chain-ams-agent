@@ -7,6 +7,18 @@ import {
 import {
   ingestCleanCoreFindings, type IngestCleanCoreInput,
 } from "../services/clean-core-ingest.service";
+import { validateToken } from "../services/sap-inbound.service";
+
+/** Extrae el token de servicio inbound (X-AMS-Inbound-Token o Authorization: Bearer). */
+function extractInboundToken(req: FastifyRequest): string | null {
+  const direct = req.headers["x-ams-inbound-token"];
+  if (typeof direct === "string") return direct;
+  const auth = req.headers.authorization;
+  if (typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) {
+    return auth.slice(7);
+  }
+  return null;
+}
 
 /** GET /api/memory — lista MemoryRecords del tenant (opcional ?kind=&limit=). */
 export async function listMemoryRoute(
@@ -55,14 +67,27 @@ export async function ingestMemoryRoute(req: FastifyRequest, reply: FastifyReply
   }
 }
 
-/** POST /api/memory/ingest/clean-core — ingiere hallazgos del connector Clean Core. */
+/**
+ * POST /api/memory/ingest/clean-core — ingiere hallazgos del connector Clean Core.
+ *
+ * Auth servicio-a-servicio: el connector es un servicio SIN sesión de usuario, así
+ * que se autentica con un token inbound (X-AMS-Inbound-Token / Bearer) scoped al
+ * source "clean_core" — el MISMO mecanismo que /api/sap/inbound/*. El tenantId se
+ * resuelve DESDE el token (cada token está scoped a un tenant), NO de req.tenantId
+ * (que sin JWT caería al DEFAULT_TENANT). Fail-closed: token inválido/ausente → 401.
+ */
 export async function ingestCleanCoreRoute(req: FastifyRequest, reply: FastifyReply) {
   try {
+    const token = extractInboundToken(req);
+    const tokVal = await validateToken(token ?? "", "clean_core");
+    if (!tokVal.ok) {
+      return reply.code(401).send({ success: false, error: tokVal.reason });
+    }
     const body = (req.body ?? {}) as IngestCleanCoreInput;
     if (!Array.isArray(body.findings)) {
       return reply.code(400).send({ success: false, error: "Se requiere findings[]" });
     }
-    const result = await ingestCleanCoreFindings(req.tenantId, body);
+    const result = await ingestCleanCoreFindings(tokVal.tenantId, body);
     return reply.send({ success: true, result });
   } catch (err) {
     logger.error({ err }, "memory ingest clean-core fail");

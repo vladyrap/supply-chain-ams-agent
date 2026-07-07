@@ -18,7 +18,9 @@ export async function memoryRoutes(app: FastifyInstance) {
   // Ingesta idempotente (tickets resueltos → memoria). Acción de configuración.
   app.post("/api/memory/ingest", { preHandler: requirePermission("conocimiento_rag", "configure") }, ingestMemoryRoute);
   // Ingesta de hallazgos Clean Core (SAP-técnicos) → grafo + memoria. Fase 2.
-  app.post("/api/memory/ingest/clean-core", { preHandler: requirePermission("modulos_sap", "configure") }, ingestCleanCoreRoute);
+  // Auth servicio-a-servicio DENTRO del handler (token inbound scoped a "clean_core"):
+  // el connector no tiene sesión de usuario, así que NO se usa requirePermission aquí.
+  app.post("/api/memory/ingest/clean-core", ingestCleanCoreRoute);
   // Registro de decisiones (IA propone, consultor decide — Art. 8). Fase 4.
   app.post("/api/memory/decision", { preHandler: requirePermission("conocimiento_rag", "create") }, recordDecisionRoute);
 }
