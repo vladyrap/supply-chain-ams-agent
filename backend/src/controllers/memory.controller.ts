@@ -3,6 +3,9 @@ import { logger } from "../utils/logger";
 import {
   listMemory, getMemoryRecord, ingestResolvedTickets,
 } from "../services/memory.service";
+import {
+  ingestCleanCoreFindings, type IngestCleanCoreInput,
+} from "../services/clean-core-ingest.service";
 
 /** GET /api/memory — lista MemoryRecords del tenant (opcional ?kind=&limit=). */
 export async function listMemoryRoute(
@@ -48,5 +51,20 @@ export async function ingestMemoryRoute(req: FastifyRequest, reply: FastifyReply
   } catch (err) {
     logger.error({ err }, "memory ingest fail");
     return reply.code(500).send({ success: false, error: "Error ingiriendo memoria" });
+  }
+}
+
+/** POST /api/memory/ingest/clean-core — ingiere hallazgos del connector Clean Core. */
+export async function ingestCleanCoreRoute(req: FastifyRequest, reply: FastifyReply) {
+  try {
+    const body = (req.body ?? {}) as IngestCleanCoreInput;
+    if (!Array.isArray(body.findings)) {
+      return reply.code(400).send({ success: false, error: "Se requiere findings[]" });
+    }
+    const result = await ingestCleanCoreFindings(req.tenantId, body);
+    return reply.send({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "memory ingest clean-core fail");
+    return reply.code(500).send({ success: false, error: "Error ingiriendo hallazgos Clean Core" });
   }
 }

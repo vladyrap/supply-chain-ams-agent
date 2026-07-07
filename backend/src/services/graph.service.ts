@@ -15,11 +15,13 @@ import { createHash } from "crypto";
 import { query, withTx } from "../database/db";
 import { logger } from "../utils/logger";
 
+// Tipos de nodo de la proyección viva (operacional). El grafo persistido admite
+// además tipos SAP-técnicos (sap_object, sap_table, …) → GraphNode.type es string.
 export type GraphNodeType = "incident" | "ticket" | "conversation" | "kb" | "meeting";
 
 export interface GraphNode {
   id: string;
-  type: GraphNodeType;
+  type: string;   // GraphNodeType en la proyección viva; string admite nodos SAP-técnicos (Fase 2)
   label: string;
   subtitle?: string;
   href?: string;
@@ -29,13 +31,13 @@ export interface GraphNode {
 export interface GraphEdge {
   from: string;
   to: string;
-  kind: "escalated" | "uses_kb" | "kb_from" | "linked";
+  kind: string;   // escalated|uses_kb|kb_from|linked|accesses|remediated_by… (extensible)
 }
 
 export interface GraphPayload {
   nodes: GraphNode[];
   edges: GraphEdge[];
-  counts: Record<GraphNodeType, number>;
+  counts: Record<string, number>;
 }
 
 export async function getKnowledgeGraph(
@@ -276,11 +278,11 @@ export async function getPersistedKnowledgeGraph(
   await ensureKnowledgeGraphSchema();
   const limit = Math.min(opts.limit ?? 500, 2000);
   const [nodeRows, edgeRows] = await Promise.all([
-    query<{ id: string; type: GraphNodeType; label: string; subtitle: string | null; href: string | null; meta: Record<string, string | number | boolean | null> }>(
+    query<{ id: string; type: string; label: string; subtitle: string | null; href: string | null; meta: Record<string, string | number | boolean | null> }>(
       `SELECT id,type,label,subtitle,href,meta FROM kg_node WHERE tenant_id=$1 ORDER BY last_seen_at DESC LIMIT $2`,
       [tenantId, limit]
     ),
-    query<{ from_id: string; to_id: string; kind: GraphEdge["kind"] }>(
+    query<{ from_id: string; to_id: string; kind: string }>(
       `SELECT from_id,to_id,kind FROM kg_edge WHERE tenant_id=$1 LIMIT $2`,
       [tenantId, limit * 4]
     ),
@@ -293,7 +295,46 @@ export async function getPersistedKnowledgeGraph(
   const edges: GraphEdge[] = edgeRows.rows
     .filter((e) => present.has(e.from_id) && present.has(e.to_id))
     .map((e) => ({ from: e.from_id, to: e.to_id, kind: e.kind }));
-  const counts: Record<GraphNodeType, number> = { incident: 0, ticket: 0, conversation: 0, kb: 0, meeting: 0 };
+  const counts: Record<string, number> = {};
   for (const n of nodes) counts[n.type] = (counts[n.type] ?? 0) + 1;
   return { nodes, edges, counts };
+}
+
+/**
+ * Upsert idempotente de nodos/aristas al grafo persistido, SIN reconciliación de
+ * stale (a diferencia de rebuildKnowledgeGraph): estos vienen de una fuente
+ * EXTERNA (p. ej. el connector Clean Core) que no posee el conjunto completo.
+ * provenance.source identifica la fuente. Recomputar no duplica.
+ */
+export async function upsertKgNodes(
+  tenantId: string, nodes: GraphNode[], edges: GraphEdge[], source: string,
+): Promise<{ nodes: number; edges: number }> {
+  await ensureKnowledgeGraphSchema();
+  if (nodes.length === 0 && edges.length === 0) return { nodes: 0, edges: 0 };
+  const prov = JSON.stringify({ origin: "system", source, computed_at: new Date().toISOString() });
+  await withTx(async (client) => {
+    for (const n of nodes) {
+      await client.query(
+        `INSERT INTO kg_node (tenant_id,id,type,label,subtitle,href,meta,provenance,content_hash,last_seen_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9, now())
+         ON CONFLICT (tenant_id,id) DO UPDATE SET
+           type=EXCLUDED.type, label=EXCLUDED.label, subtitle=EXCLUDED.subtitle, href=EXCLUDED.href,
+           meta=EXCLUDED.meta, provenance=EXCLUDED.provenance, content_hash=EXCLUDED.content_hash, last_seen_at=now()`,
+        [tenantId, n.id, n.type, n.label, n.subtitle ?? null, n.href ?? null,
+         JSON.stringify(n.meta ?? {}), prov, nodeHash(n)]
+      );
+    }
+    for (const e of edges) {
+      const id = edgeId(e);
+      await client.query(
+        `INSERT INTO kg_edge (tenant_id,id,from_id,to_id,kind,provenance,content_hash,last_seen_at)
+         VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7, now())
+         ON CONFLICT (tenant_id,id) DO UPDATE SET
+           from_id=EXCLUDED.from_id, to_id=EXCLUDED.to_id, kind=EXCLUDED.kind,
+           provenance=EXCLUDED.provenance, content_hash=EXCLUDED.content_hash, last_seen_at=now()`,
+        [tenantId, id, e.from, e.to, e.kind, prov, id]
+      );
+    }
+  });
+  return { nodes: nodes.length, edges: edges.length };
 }

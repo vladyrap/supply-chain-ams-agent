@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import {
-  listMemoryRoute, getMemoryRoute, ingestMemoryRoute,
+  listMemoryRoute, getMemoryRoute, ingestMemoryRoute, ingestCleanCoreRoute,
 } from "../controllers/memory.controller";
 import { requirePermission } from "../middleware/requirePermission";
 
@@ -10,4 +10,6 @@ export async function memoryRoutes(app: FastifyInstance) {
   app.get("/api/memory/:id", getMemoryRoute);
   // Ingesta idempotente (tickets resueltos → memoria). Acción de configuración.
   app.post("/api/memory/ingest", { preHandler: requirePermission("conocimiento_rag", "configure") }, ingestMemoryRoute);
+  // Ingesta de hallazgos Clean Core (SAP-técnicos) → grafo + memoria. Fase 2.
+  app.post("/api/memory/ingest/clean-core", { preHandler: requirePermission("modulos_sap", "configure") }, ingestCleanCoreRoute);
 }
