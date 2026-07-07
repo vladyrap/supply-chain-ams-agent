@@ -7,6 +7,7 @@
 import { createHash } from "crypto";
 import { query, withTx } from "../database/db";
 import { logger } from "../utils/logger";
+import { getPersistedKnowledgeGraph, type GraphPayload } from "./graph.service";
 
 export type MemoryKind =
   | "incident_resolution" | "decision" | "assessment" | "config_change" | "learning" | "doc";
@@ -254,4 +255,153 @@ export async function getMemoryRecord(tenantId: string, id: string): Promise<Mem
   if (rows.length === 0) return null;
   const [dto] = await attachEvidence(tenantId, rows);
   return dto;
+}
+
+// ── F3 · Retrieval híbrido (graph + memoria) ─────────────────────────────────
+// Combina coincidencia léxica en la memoria con expansión por el grafo (nodos que
+// matchean → memoria enlazada). No inventa: sin coincidencias → results=[] + nota.
+// Es el substrato que ancla cualquier respuesta de IA a evidencia (Art. 11).
+export interface MemoryRetrievalHit extends MemoryRecordDTO {
+  matchedBy: ("text" | "graph")[];
+}
+
+export async function retrieveMemory(
+  tenantId: string, queryText: string, opts: { limit?: number } = {},
+): Promise<{ query: string; results: MemoryRetrievalHit[]; note?: string }> {
+  await ensureMemorySchema();
+  const q = (queryText ?? "").trim();
+  if (!q) return { query: "", results: [], note: "Consulta vacía." };
+  const like = `%${q}%`;
+  const limit = Math.min(opts.limit ?? 20, 100);
+
+  // 1) Coincidencia léxica en la memoria.
+  const textRows = await query<{ id: string }>(
+    `SELECT id FROM memory_record WHERE tenant_id=$1 AND (title ILIKE $2 OR body ILIKE $2)
+      ORDER BY updated_at DESC LIMIT $3`,
+    [tenantId, like, limit * 2]
+  );
+  const textIds = textRows.rows.map((r) => r.id);
+
+  // 2) Expansión por grafo: nodos cuyo label matchea → memoria que los referencia.
+  const nodeRows = await query<{ id: string }>(
+    `SELECT id FROM kg_node WHERE tenant_id=$1 AND label ILIKE $2 LIMIT 50`,
+    [tenantId, like]
+  ).catch(() => ({ rows: [] as { id: string }[], rowCount: 0 }));
+  const nodeIds = nodeRows.rows.map((r) => r.id);
+  let graphIds: string[] = [];
+  if (nodeIds.length > 0) {
+    const g = await query<{ id: string }>(
+      `SELECT id FROM memory_record WHERE tenant_id=$1 AND jsonb_exists_any(node_refs, $2::text[])
+        ORDER BY updated_at DESC LIMIT $3`,
+      [tenantId, nodeIds, limit * 2]
+    );
+    graphIds = g.rows.map((r) => r.id);
+  }
+
+  // 3) Ranking: en ambos (texto+grafo) > sólo texto > sólo grafo.
+  const textSet = new Set(textIds);
+  const graphSet = new Set(graphIds);
+  const orderedIds = [
+    ...textIds.filter((id) => graphSet.has(id)),
+    ...textIds.filter((id) => !graphSet.has(id)),
+    ...graphIds.filter((id) => !textSet.has(id)),
+  ].slice(0, limit);
+  if (orderedIds.length === 0) return { query: q, results: [], note: "Sin memoria sobre esto." };
+
+  const rows = await query<MemoryRow>(
+    `SELECT id,kind,title,body,confidence,provenance,node_refs,version,created_by,created_at,updated_at
+       FROM memory_record WHERE tenant_id=$1 AND id = ANY($2::uuid[])`,
+    [tenantId, orderedIds]
+  );
+  const byId = new Map(rows.rows.map((r) => [r.id, r]));
+  const orderedRows = orderedIds.map((id) => byId.get(id)).filter((r): r is MemoryRow => !!r);
+  const dtos = await attachEvidence(tenantId, orderedRows);
+  const results: MemoryRetrievalHit[] = dtos.map((d) => ({
+    ...d,
+    matchedBy: ([textSet.has(d.id) ? "text" : null, graphSet.has(d.id) ? "graph" : null]
+      .filter(Boolean)) as ("text" | "graph")[],
+  }));
+  return { query: q, results };
+}
+
+// ── F4 · Decisiones + Export (portabilidad) + Métricas ───────────────────────
+export interface DecisionInput {
+  tenantId: string;
+  title: string;
+  context?: string;
+  alternatives?: string[];
+  chosen?: string;
+  rationale?: string;
+  reversible?: boolean;
+  nodeRefs?: string[];
+  evidence?: EvidenceInput[];
+  createdBy?: string;
+  dedupeKey?: string;
+}
+
+/** Registra una Decisión como MemoryRecord (kind=decision) — preserva el "por qué". */
+export async function recordDecision(input: DecisionInput): Promise<{ id: string; created: boolean }> {
+  const body = [
+    input.context ? `Contexto: ${input.context}` : null,
+    input.alternatives?.length ? `Alternativas: ${input.alternatives.join(" | ")}` : null,
+    input.chosen ? `Elegida: ${input.chosen}` : null,
+    input.rationale ? `Racional: ${input.rationale}` : null,
+    typeof input.reversible === "boolean" ? `Reversible: ${input.reversible ? "sí" : "no"}` : null,
+  ].filter(Boolean).join("\n");
+  return recordMemory({
+    tenantId: input.tenantId,
+    kind: "decision",
+    title: input.title,
+    body,
+    nodeRefs: input.nodeRefs,
+    evidence: input.evidence,           // confidence se deriva (evidencia → "evidence")
+    provenance: { origin: "human", actor: input.createdBy ?? "unknown", at: new Date().toISOString() },
+    dedupeKey: input.dedupeKey,
+    createdBy: input.createdBy ?? "unknown",
+  });
+}
+
+/** Export de TODA la memoria del tenant (portabilidad, Art. 12). */
+export async function exportMemory(
+  tenantId: string,
+): Promise<{ tenantId: string; exportedAt: string; records: MemoryRecordDTO[]; graph: GraphPayload }> {
+  const records = await listMemory(tenantId, { limit: 1000 });
+  const graph = await getPersistedKnowledgeGraph(tenantId, { limit: 2000 });
+  return { tenantId, exportedAt: new Date().toISOString(), records, graph };
+}
+
+export interface MemoryStats {
+  records: number;
+  byKind: Record<string, number>;
+  byConfidence: Record<string, number>;
+  evidenceCoveragePct: number;   // % de records con >=1 evidencia (calidad de memoria)
+  graph: { nodes: number; edges: number };
+}
+
+/** Métricas de la Memoria del tenant (conocimiento preservado, calidad). */
+export async function memoryStats(tenantId: string): Promise<MemoryStats> {
+  await ensureMemorySchema();
+  const [kindRows, confRows, totals, nodeCount, edgeCount] = await Promise.all([
+    query<{ kind: string; n: string }>(`SELECT kind, count(*) n FROM memory_record WHERE tenant_id=$1 GROUP BY kind`, [tenantId]),
+    query<{ confidence: string; n: string }>(`SELECT confidence, count(*) n FROM memory_record WHERE tenant_id=$1 GROUP BY confidence`, [tenantId]),
+    query<{ total: string; with_ev: string }>(
+      `SELECT count(*) total,
+              count(*) FILTER (WHERE EXISTS (SELECT 1 FROM memory_evidence e WHERE e.tenant_id=m.tenant_id AND e.record_id=m.id)) with_ev
+         FROM memory_record m WHERE tenant_id=$1`, [tenantId]),
+    query<{ n: string }>(`SELECT count(*) n FROM kg_node WHERE tenant_id=$1`, [tenantId]).catch(() => ({ rows: [{ n: "0" }], rowCount: 1 })),
+    query<{ n: string }>(`SELECT count(*) n FROM kg_edge WHERE tenant_id=$1`, [tenantId]).catch(() => ({ rows: [{ n: "0" }], rowCount: 1 })),
+  ]);
+  const total = Number(totals.rows[0]?.total ?? 0);
+  const withEv = Number(totals.rows[0]?.with_ev ?? 0);
+  const byKind: Record<string, number> = {};
+  for (const r of kindRows.rows) byKind[r.kind] = Number(r.n);
+  const byConfidence: Record<string, number> = {};
+  for (const r of confRows.rows) byConfidence[r.confidence] = Number(r.n);
+  return {
+    records: total,
+    byKind,
+    byConfidence,
+    evidenceCoveragePct: total > 0 ? Math.round((withEv / total) * 1000) / 10 : 0,
+    graph: { nodes: Number(nodeCount.rows[0]?.n ?? 0), edges: Number(edgeCount.rows[0]?.n ?? 0) },
+  };
 }
