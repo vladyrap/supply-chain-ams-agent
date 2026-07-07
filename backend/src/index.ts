@@ -5,6 +5,7 @@ import { query } from "./database/db";
 import { bootstrapAdminIfNeeded } from "./services/auth.service";
 import { ensureVoiceSchema } from "./services/call-log.service";
 import { ensureKnowledgeGraphSchema } from "./services/graph.service";
+import { ensureMemorySchema } from "./services/memory.service";
 import { seedTrainingIfEmpty } from "./services/training.seed";
 import { bootstrapSelfTrainingCron } from "./services/self-training-cron.service";
 
@@ -28,6 +29,11 @@ async function main() {
   // ROCCO Fase 0: asegurar schema del Knowledge Graph persistido (idempotente).
   await ensureKnowledgeGraphSchema().catch((err) => {
     logger.warn({ err }, "ensureKnowledgeGraphSchema falló (continuamos)");
+  });
+
+  // ROCCO Fase 1: asegurar schema de la Memoria Organizacional (idempotente).
+  await ensureMemorySchema().catch((err) => {
+    logger.warn({ err }, "ensureMemorySchema falló (continuamos)");
   });
 
   // Seed del Centro de Entrenamiento si tablas vacías (idempotente)

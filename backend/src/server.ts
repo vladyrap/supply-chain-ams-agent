@@ -25,6 +25,7 @@ import { sapInboundRoutes } from "./routes/sap-inbound.routes";
 import { searchRoutes } from "./routes/search.routes";
 import { evalRoutes } from "./routes/eval.routes";
 import { graphRoutes } from "./routes/graph.routes";
+import { memoryRoutes } from "./routes/memory.routes";
 import { demoRoutes } from "./routes/demo.routes";
 import { voiceRoutes } from "./routes/voice.routes";
 import { agentLabRoutes } from "./routes/agent-lab.routes";
@@ -233,6 +234,7 @@ export function buildServer() {
   app.register(searchRoutes);
   app.register(evalRoutes);
   app.register(graphRoutes);
+  app.register(memoryRoutes);
   app.register(demoRoutes);
   app.register(voiceRoutes);
   app.register(agentLabRoutes);
