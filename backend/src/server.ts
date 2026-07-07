@@ -125,6 +125,7 @@ export function buildServer() {
   const CSRF_BYPASS_PATHS = [
     "/api/voice/twilio/", // Twilio firma su propio request
     "/api/sap/inbound/",  // SAP webhook (puede no mandar Origin)
+    "/api/memory/ingest/clean-core", // Connector Clean Core (autentica por inbound-token, sin Origin)
   ];
   if (ENFORCE_CSRF) {
     app.addHook("onRequest", async (req, reply) => {
