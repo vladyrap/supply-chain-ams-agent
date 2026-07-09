@@ -87,16 +87,19 @@ export async function postInviteUser(req: FastifyRequest, reply: FastifyReply) {
     // 4. Generar reset token + 5. enviar email (TTL fijo del servicio)
     const issued = await createPasswordResetToken(email, meta(req));
     let emailSent = false;
+    let welcomeUrl: string | undefined;
     if (issued) {
       const baseUrl = (process.env.PUBLIC_BASE_URL || "https://ams.roccoai.cl").replace(
         /\/+$/,
         "",
       );
-      const resetUrl = `${baseUrl}/reset-password?token=${encodeURIComponent(issued.token)}`;
+      // Link de bienvenida: sirve para el email Y para que el admin lo copie y lo
+      // envíe manual (WhatsApp) si el email no está configurado.
+      welcomeUrl = `${baseUrl}/reset-password?token=${encodeURIComponent(issued.token)}`;
       const r = await sendPasswordReset({
         to: email,
         name: b.name.trim(),
-        resetUrl,
+        resetUrl: welcomeUrl,
         expiresInMinutes: 120, // 2h default del servicio
       });
       emailSent = r.sent;
@@ -109,9 +112,10 @@ export async function postInviteUser(req: FastifyRequest, reply: FastifyReply) {
       success: true,
       user: platformUser,
       emailSent,
+      welcomeUrl,
       message: emailSent
         ? `Usuario creado y email enviado a ${email}`
-        : `Usuario creado pero email NO se pudo enviar (revisar SMTP). El usuario puede usar 'Olvidé contraseña' para setear su clave.`,
+        : `Usuario creado. Copiá el link de bienvenida de abajo y envíaselo al usuario (el email no salió).`,
     });
   } catch (err) {
     logger.error({ err, email }, "invite user failed");
