@@ -55,33 +55,40 @@ export async function postInviteUser(req: FastifyRequest, reply: FastifyReply) {
   }
 
   try {
-    // 1. Verificar que email no exista ya
+    // 1. ¿Ya existe la cuenta auth? Si borraste el usuario de la LISTA (RBAC) pero
+    //    la cuenta auth quedó, `findUserByEmail` la encuentra. En ese caso NO
+    //    tiramos 409: re-usamos esa cuenta, la re-agregamos a la lista y generamos
+    //    un link fresco. Invite = idempotente (crear o re-agregar).
     const existing = await findUserByEmail(tenantId, email);
+    const reAdded = !!existing;
+    let authUserId: string;
+    let createdAt: string;
+
     if (existing) {
-      return reply.code(409).send({
-        success: false,
-        error: "Ya existe un usuario con ese email en este tenant",
+      authUserId = existing.id;
+      createdAt = (existing as { created_at?: string }).created_at ?? new Date().toISOString();
+    } else {
+      // Crear cuenta auth con password random (nunca se usa, se cambia via reset)
+      const randomPwd = crypto.randomBytes(24).toString("base64url"); // 32 chars
+      const authUser = await createUser(tenantId, {
+        email,
+        password: randomPwd,
+        name: b.name.trim(),
+        role: "consultor", // rol auth por default (el real RBAC va en platform_users)
       });
+      authUserId = authUser.id;
+      createdAt = authUser.created_at;
     }
 
-    // 2. Crear cuenta auth con password random (nunca se usa, se cambia via reset)
-    const randomPwd = crypto.randomBytes(24).toString("base64url"); // 32 chars
-    const authUser = await createUser(tenantId, {
-      email,
-      password: randomPwd,
-      name: b.name.trim(),
-      role: "consultor", // rol auth por default (el real RBAC va en platform_users)
-    });
-
-    // 3. Upsert en platform_users (RBAC)
+    // 3. Upsert en platform_users (RBAC) — re-agrega a la lista si no estaba
     const platformUser = await rbac.upsertUser(tenantId, {
-      id: authUser.id,
+      id: authUserId,
       name: b.name.trim(),
       email,
       roleCode: b.roleCode,
       serviceLevel: (b.serviceLevel as "BASIC" | "STANDARD" | "PREMIUM" | "ENTERPRISE" | undefined) ?? "STANDARD",
       status: "ACTIVE",
-      createdAt: authUser.created_at,
+      createdAt,
     });
 
     // 4. Generar reset token + 5. enviar email (TTL fijo del servicio)
@@ -113,9 +120,11 @@ export async function postInviteUser(req: FastifyRequest, reply: FastifyReply) {
       user: platformUser,
       emailSent,
       welcomeUrl,
-      message: emailSent
-        ? `Usuario creado y email enviado a ${email}`
-        : `Usuario creado. Copiá el link de bienvenida de abajo y envíaselo al usuario (el email no salió).`,
+      message: reAdded
+        ? `El email ya tenía cuenta — se re-agregó a la lista. Copiá el link de abajo para que cree/resetee su clave.`
+        : emailSent
+          ? `Usuario creado y email enviado a ${email}`
+          : `Usuario creado. Copiá el link de bienvenida de abajo y envíaselo al usuario (el email no salió).`,
     });
   } catch (err) {
     logger.error({ err, email }, "invite user failed");
