@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import {
   listMemoryRoute, getMemoryRoute, ingestMemoryRoute, ingestCleanCoreRoute,
   searchMemoryRoute, recordDecisionRoute, exportMemoryRoute, statsMemoryRoute,
+  recordLearningRoute,
 } from "../controllers/memory.controller";
 import { requirePermission } from "../middleware/requirePermission";
 
@@ -23,4 +24,7 @@ export async function memoryRoutes(app: FastifyInstance) {
   app.post("/api/memory/ingest/clean-core", ingestCleanCoreRoute);
   // Registro de decisiones (IA propone, consultor decide — Art. 8). Fase 4.
   app.post("/api/memory/decision", { preHandler: requirePermission("conocimiento_rag", "create") }, recordDecisionRoute);
+  // Registro de aprendizajes del caso (Knowledge Evolution, F3). Persiste a
+  // memoria + emite KNOWLEDGE_UPDATED en el timeline del ticket.
+  app.post("/api/memory/learning", { preHandler: requirePermission("conocimiento_rag", "create") }, recordLearningRoute);
 }

@@ -3,7 +3,9 @@ import { logger } from "../utils/logger";
 import {
   listMemory, getMemoryRecord, ingestResolvedTickets,
   retrieveMemory, recordDecision, exportMemory, memoryStats,
+  recordMemory,
 } from "../services/memory.service";
+import { recordAuditEvent } from "../services/audit-events.service";
 import {
   ingestCleanCoreFindings, type IngestCleanCoreInput,
 } from "../services/clean-core-ingest.service";
@@ -139,6 +141,53 @@ export async function recordDecisionRoute(req: FastifyRequest, reply: FastifyRep
   } catch (err) {
     logger.error({ err }, "memory decision fail");
     return reply.code(500).send({ success: false, error: "Error registrando decisión" });
+  }
+}
+
+/**
+ * POST /api/memory/learning — registra un aprendizaje del caso (Knowledge
+ * Evolution, F3). Persiste un MemoryRecord kind=learning en la Memoria
+ * Organizacional Y emite un evento KNOWLEDGE_UPDATED para que aparezca en el
+ * Case Timeline del ticket. Idempotente vía dedupeKey (ej. caso+versión).
+ */
+export async function recordLearningRoute(req: FastifyRequest, reply: FastifyReply) {
+  try {
+    const body = (req.body ?? {}) as {
+      title?: string; body?: string; ticketKey?: string;
+      nodeRefs?: string[]; createdBy?: string; dedupeKey?: string;
+    };
+    if (!body.title || !body.title.trim()) {
+      return reply.code(400).send({ success: false, error: "Se requiere title" });
+    }
+    const nodeRefs = body.nodeRefs ?? (body.ticketKey ? [`ticket:${body.ticketKey}`] : undefined);
+    const result = await recordMemory({
+      tenantId: req.tenantId,
+      kind: "learning",
+      title: body.title.trim().slice(0, 200),
+      body: body.body,
+      nodeRefs,
+      provenance: { source: "case_timeline", ticketKey: body.ticketKey ?? null },
+      confidence: "inferred",
+      createdBy: body.createdBy,
+      dedupeKey: body.dedupeKey,
+    });
+    // Reflejar el aprendizaje en el timeline del caso (best-effort, no bloquea).
+    if (body.ticketKey) {
+      await recordAuditEvent({
+        tenantId: req.tenantId,
+        ticketId: body.ticketKey,
+        actorName: body.createdBy ?? "system",
+        eventType: "KNOWLEDGE_UPDATED",
+        category: "knowledge",
+        severity: "info",
+        source: "system",
+        payload: { title: body.title.trim(), memoryId: result.id },
+      });
+    }
+    return reply.send({ success: true, result });
+  } catch (err) {
+    logger.error({ err }, "memory learning fail");
+    return reply.code(500).send({ success: false, error: "Error registrando aprendizaje" });
   }
 }
 
