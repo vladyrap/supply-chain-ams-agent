@@ -19,6 +19,7 @@ export type LLMTaskType =
   | "QUALITY_GATE"         // (no usado hoy, motor determinístico)
   | "DOCUMENTATION"        // generación de docs (RCA, post-mortem)
   | "SUMMARY"              // resúmenes
+  | "INVESTIGATION"        // reinvestigación completa del caso con evidencia (POST /investigate)
   | "TECHNICAL_REASONING"; // razonamiento técnico (future)
 
 export interface TaskRouteConfig {
@@ -98,6 +99,13 @@ const TASK_CONFIG: Record<LLMTaskType, TaskRouteConfig> = {
     maxOutputTokens: 1024,
     jsonOutput: true,
     promptPack: "summary",
+  },
+  INVESTIGATION: {
+    model: DEFAULT_MODEL,
+    temperature: 0.45,          // algo de exploración: reconstruir hipótesis, no repetir
+    maxOutputTokens: 6144,      // salida de 10 secciones + diff vs versión previa
+    jsonOutput: true,
+    promptPack: "investigate",
   },
   TECHNICAL_REASONING: {
     model: DEFAULT_MODEL,

@@ -18,6 +18,7 @@ import {
   type CaseArtifactKind, type AddCaseArtifactInput,
 } from "../services/case-artifacts.service";
 import { recordAuditEvent } from "../services/audit-events.service";
+import { investigateTicket } from "../services/investigate.service";
 
 export async function getProviderStatus(_req: FastifyRequest, reply: FastifyReply) {
   try {
@@ -363,6 +364,30 @@ export async function postCaseArtifact(
   } catch (err) {
     logger.error({ err }, "postCaseArtifact fail");
     return reply.code(500).send({ success: false, error: "Error registrando artefacto" });
+  }
+}
+
+/**
+ * POST /api/tickets/:key/investigate — reinvestigación completa (RE-R2).
+ * Ensambla el paquete de evidencia (ticket + artefactos + timeline + memoria +
+ * análisis previo a re-evaluar) y ejecuta una investigación NUEVA con Gemini.
+ * Nunca reusa la respuesta previa. Si el LLM falla, devuelve ok:false y el
+ * frontend mantiene su análisis determinístico.
+ */
+export async function postInvestigateTicket(
+  req: FastifyRequest<{ Params: { key: string }; Body: { actor?: string; force?: boolean } }>,
+  reply: FastifyReply,
+) {
+  try {
+    const body = req.body ?? {};
+    const u = (req as unknown as { user?: { name?: string; email?: string } }).user;
+    const actor = body.actor || u?.name || u?.email || "system";
+    const result = await investigateTicket(req.tenantId, req.params.key, { actor, force: body.force });
+    if (!result) return reply.code(404).send({ success: false, error: "ticket no encontrado" });
+    return reply.send({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "postInvestigateTicket fail");
+    return reply.code(500).send({ success: false, error: "Error en la reinvestigación" });
   }
 }
 

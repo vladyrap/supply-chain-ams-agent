@@ -15,6 +15,7 @@ import {
   getTicketTimeline,
   postCaseArtifact,
   getCaseArtifacts,
+  postInvestigateTicket,
   patchTicketGeneral,
 } from "../controllers/ticket.controller";
 import type {
@@ -129,6 +130,13 @@ export async function ticketRoutes(app: FastifyInstance) {
     "/api/tickets/:key/artifacts",
     { preHandler: requirePermission("ticket_command_center", "view") },
     getCaseArtifacts);
+
+  // Reinvestigación completa (RE-R2) — arma el paquete de evidencia y ejecuta
+  // una investigación NUEVA con Gemini (nunca reusa la respuesta previa).
+  app.post<{ Params: { key: string }; Body: { actor?: string; force?: boolean } }>(
+    "/api/tickets/:key/investigate",
+    { preHandler: requirePermission("ticket_command_center", "edit") },
+    postInvestigateTicket);
 
   // TCC v0.12 — PATCH ticket campos generales (title, description, sapModule,
   // environment, priority, assignee, reporter, status). Whitelist en service.

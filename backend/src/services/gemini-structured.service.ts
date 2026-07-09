@@ -64,6 +64,8 @@ export interface StructuredCallInput {
     actor?: string;
     correlationId?: string;
   };
+  /** Si true, salta el cache de 24h — fuerza razonamiento fresco (reinvestigación). */
+  bypassCache?: boolean;
   /** Override modelo / mock mode. */
   ctx?: TaskRouteContext;
 }
@@ -141,10 +143,12 @@ export async function callGeminiStructured<T = unknown>(
     // Antes: reanalyze forzado siempre gastaba Gemini aunque inputHash
     // fuera el mismo. Ahora: cache de 24h evita 60-80% de reanalyze costs.
     const cacheKey = `${input.taskType}:${cfg.model}:${stableHash(userText + (systemFilled.slice(0, 200)))}`;
-    const cached = responseCache.get(cacheKey);
-    if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
-      logger.debug({ taskType: input.taskType, age: Date.now() - cached.at }, "gemini cache HIT");
-      return cached.value as Awaited<ReturnType<typeof callGeminiStructured<T>>>;
+    if (!input.bypassCache) {
+      const cached = responseCache.get(cacheKey);
+      if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
+        logger.debug({ taskType: input.taskType, age: Date.now() - cached.at }, "gemini cache HIT");
+        return cached.value as Awaited<ReturnType<typeof callGeminiStructured<T>>>;
+      }
     }
 
     // v0.12.3 — Hard cap defensivo (200/día, 80/hora, 20/min default).
@@ -251,8 +255,8 @@ export async function callGeminiStructured<T = unknown>(
     });
 
     const structuredResult = { data: parsed, repaired, modelUsed: cfg.model, wasMock: false, durationMs };
-    // FIX M16: cachear sólo si repair NO fue necesario (no queremos cache de respuestas reparadas).
-    if (!repaired) {
+    // FIX M16: cachear sólo si repair NO fue necesario y no se pidió bypass.
+    if (!repaired && !input.bypassCache) {
       evictCacheIfFull();
       responseCache.set(cacheKey, { value: structuredResult, at: Date.now() });
     }

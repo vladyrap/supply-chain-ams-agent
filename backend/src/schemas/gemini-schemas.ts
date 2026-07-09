@@ -95,6 +95,67 @@ export const SUMMARY_SCHEMA: Schema = {
   required: ["tldr", "confidence"],
 };
 
+/**
+ * INVESTIGATION — reinvestigación completa del caso. El modelo NO actualiza una
+ * respuesta previa: reconstruye toda la hipótesis desde cero con el paquete de
+ * evidencia. Salida de 10 secciones + diff explícito contra la versión previa.
+ */
+export const INVESTIGATION_SCHEMA: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    executiveSummary: { type: Type.STRING },
+    currentUnderstanding: { type: Type.STRING },
+    evidenceConsidered: {
+      type: Type.OBJECT,
+      properties: {
+        original: { type: Type.ARRAY, items: { type: Type.STRING } },
+        new: { type: Type.ARRAY, items: { type: Type.STRING } },
+      },
+    },
+    rootCauseAnalysis: { type: Type.STRING },
+    probableRootCause: { type: Type.STRING, nullable: true },
+    hypotheses: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          statement: { type: Type.STRING },
+          confidence: { type: Type.STRING, description: "alta | media | baja" },
+          status: { type: Type.STRING, description: "new | gained_confidence | lost_confidence | discarded | unchanged" },
+        },
+        required: ["statement", "confidence", "status"],
+      },
+    },
+    findings: {
+      type: Type.OBJECT,
+      properties: {
+        new: { type: Type.ARRAY, items: { type: Type.STRING } },
+        modified: { type: Type.ARRAY, items: { type: Type.STRING } },
+        removed: { type: Type.ARRAY, items: { type: Type.STRING } },
+      },
+    },
+    recommendations: { type: Type.ARRAY, items: { type: Type.STRING } },
+    confidenceLevel: { type: Type.STRING, description: "alta | media | baja" },
+    knowledgeLearned: { type: Type.STRING },
+    changesVsPrevious: {
+      type: Type.OBJECT,
+      properties: {
+        summary: { type: Type.STRING },
+        hypothesesDiscarded: { type: Type.ARRAY, items: { type: Type.STRING } },
+        hypothesesGainedConfidence: { type: Type.ARRAY, items: { type: Type.STRING } },
+        findingsRemoved: { type: Type.ARRAY, items: { type: Type.STRING } },
+        recommendationsChanged: { type: Type.ARRAY, items: { type: Type.STRING } },
+        rootCauseChanged: { type: Type.BOOLEAN },
+        why: { type: Type.STRING },
+      },
+    },
+  },
+  required: [
+    "executiveSummary", "currentUnderstanding", "rootCauseAnalysis",
+    "hypotheses", "recommendations", "confidenceLevel",
+  ],
+};
+
 /** Map de tarea → schema. Tasks sin schema = texto libre. */
 import type { LLMTaskType } from "../intelligence/task-router";
 export const SCHEMA_BY_TASK: Partial<Record<LLMTaskType, Schema>> = {
@@ -103,4 +164,5 @@ export const SCHEMA_BY_TASK: Partial<Record<LLMTaskType, Schema>> = {
   QUALITY_GATE: CUSTOMER_RESPONSE_SCHEMA,
   SUMMARY: SUMMARY_SCHEMA,
   ESTIMATION: SUMMARY_SCHEMA,
+  INVESTIGATION: INVESTIGATION_SCHEMA,
 };
