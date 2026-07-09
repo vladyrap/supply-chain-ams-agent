@@ -549,7 +549,8 @@ async function appendIntelligenceHistory(
      VALUES ($1, $2, $3, $4::jsonb, $5, $6)`,
     [tenantId, key, nextVersion, JSON.stringify(intel), inputHash, reason]
   );
-  // Cap a últimas 20 versiones por ticket (DELETE más viejas)
+  // Cap a últimas 50 versiones por ticket (DELETE más viejas).
+  // F2: subido de 20→50 para retener más historia del caso ("no perder info").
   await query(
     `DELETE FROM ticket_intelligence_history
        WHERE ticket_key = $1
@@ -559,7 +560,7 @@ async function appendIntelligenceHistory(
             WHERE ticket_key = $1
               AND tenant_id = $2
             ORDER BY snapshot_at DESC
-            LIMIT 20
+            LIMIT 50
          )`,
     [key, tenantId]
   );
@@ -580,7 +581,7 @@ export async function listIntelligenceHistory(tenantId: string, key: string): Pr
         WHERE ticket_key = $1
           AND tenant_id = $2
         ORDER BY snapshot_at DESC
-        LIMIT 20`,
+        LIMIT 50`,
       [key, tenantId]
     );
     return rows.map((r) => ({
