@@ -125,3 +125,41 @@ export async function postInviteUser(req: FastifyRequest, reply: FastifyReply) {
     });
   }
 }
+
+// =============================================================================
+// POST /api/admin/users/reset-link — generar link de acceso para un usuario
+// que YA existe (para reenviar la bienvenida o si el email no salió).
+// Devuelve welcomeUrl copiable; intenta enviar email best-effort.
+// =============================================================================
+export async function postUserResetLink(req: FastifyRequest, reply: FastifyReply) {
+  const tenantId = (req as FastifyRequest & { tenantId?: string }).tenantId || "default";
+  const b = (req.body || {}) as { email?: string };
+  const email = (b.email || "").trim().toLowerCase();
+  if (!email || !email.includes("@")) {
+    return reply.code(400).send({ success: false, error: "email inválido" });
+  }
+  try {
+    const existing = await findUserByEmail(tenantId, email);
+    if (!existing) {
+      return reply.code(404).send({ success: false, error: "No existe un usuario con ese email en este tenant" });
+    }
+    const issued = await createPasswordResetToken(email, meta(req));
+    if (!issued) {
+      return reply.code(500).send({ success: false, error: "No se pudo generar el link de acceso" });
+    }
+    const baseUrl = (process.env.PUBLIC_BASE_URL || "https://ams.roccoai.cl").replace(/\/+$/, "");
+    const welcomeUrl = `${baseUrl}/reset-password?token=${encodeURIComponent(issued.token)}`;
+    let emailSent = false;
+    try {
+      const name = (existing as { name?: string }).name || email;
+      const r = await sendPasswordReset({ to: email, name, resetUrl: welcomeUrl, expiresInMinutes: 120 });
+      emailSent = r.sent;
+    } catch (e) {
+      logger.warn({ email, err: e }, "reset-link email failed (link generado OK)");
+    }
+    return reply.send({ success: true, welcomeUrl, emailSent });
+  } catch (err) {
+    logger.error({ err, email }, "reset-link failed");
+    return reply.code(500).send({ success: false, error: "Error generando link: " + (err as Error).message });
+  }
+}
