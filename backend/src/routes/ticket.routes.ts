@@ -12,6 +12,7 @@ import {
   putTicketIntelligence,
   getTicketIntelligenceHandler,
   getTicketIntelligenceHistory,
+  getTicketTimeline,
   patchTicketGeneral,
 } from "../controllers/ticket.controller";
 import type {
@@ -109,6 +110,12 @@ export async function ticketRoutes(app: FastifyInstance) {
     "/api/tickets/:key/intelligence/history",
     { preHandler: requirePermission("ticket_command_center", "view") },
     getTicketIntelligenceHistory);
+
+  // Case Timeline (F0) — read-model unificado (audit_events + intelligence_history)
+  app.get<{ Params: { key: string }; Querystring: { limit?: string } }>(
+    "/api/tickets/:key/timeline",
+    { preHandler: requirePermission("ticket_command_center", "view") },
+    getTicketTimeline);
 
   // TCC v0.12 — PATCH ticket campos generales (title, description, sapModule,
   // environment, priority, assignee, reporter, status). Whitelist en service.

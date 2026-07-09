@@ -5,6 +5,9 @@ import {
   type TicketEstimatedResolution, type SeverityLevel,
   type EnvironmentLevel, type ComplexityLevel,
 } from "../utils/estimation";
+// Case Timeline (F0) — read-model unificado sobre el substrato existente.
+import { getAuditByTicket } from "./audit-events.service";
+import { redactSecrets, redactedPreview } from "../utils/redact";
 
 export type TicketSource = "jira" | "mock" | "user";
 
@@ -593,6 +596,177 @@ export async function listIntelligenceHistory(tenantId: string, key: string): Pr
     logger.warn({ err, key }, "listIntelligenceHistory failed");
     return [];
   }
+}
+
+// =============================================================================
+// Case Timeline (F0) — read-model unificado
+// =============================================================================
+// Proyección de solo-lectura que FUSIONA el flujo de eventos (audit_events) con
+// los snapshots de versión (ticket_intelligence_history) en un único feed
+// cronológico y tipado. NO es un almacén nuevo: no persiste nada, sólo lee las
+// fuentes de verdad existentes. Todo tenant-scoped. Redacta secretos/PII.
+
+export interface CaseTimelineItem {
+  id: string;
+  /** "event" = audit_event · "version" = snapshot de análisis. */
+  kind: "event" | "version";
+  eventType: string;
+  title: string;
+  description: string;
+  actor: string | null;
+  actorRole: string | null;
+  source: string;
+  severity: string;
+  category: string;
+  /** Número de versión cuando aplica (snapshot, o evento que la referencia). */
+  version: number | null;
+  /** ISO timestamp del hecho. */
+  at: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CaseTimelineResult {
+  ticketKey: string;
+  items: CaseTimelineItem[]; // más reciente primero
+  eventCount: number;
+  versionCount: number;
+}
+
+/** Prettifica un event_type SNAKE_CASE → "Snake case" como título de fallback. */
+function prettifyEventType(t: string): string {
+  const s = t.replace(/_/g, " ").toLowerCase();
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/** Extrae, defensivamente, un número de versión del payload de un evento. */
+function extractVersion(payload: unknown): number | null {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+  const v = p.analysisVersion ?? p.version;
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/** Metadata acotada: sólo claves cortas conocidas, para no filtrar blobs. */
+const META_WHITELIST = [
+  "version", "analysisVersion", "readiness", "readinessScore", "confidence",
+  "module", "sapModule", "errorCode", "transaction", "from", "to", "field",
+  "reason", "severity", "priority", "engineVersion", "durationMs",
+];
+function pickMeta(payload: unknown): Record<string, unknown> | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const p = payload as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const k of META_WHITELIST) {
+    const val = p[k];
+    if (val === undefined || val === null) continue;
+    if (typeof val === "string") out[k] = redactedPreview(val, 120);
+    else if (typeof val === "number" || typeof val === "boolean") out[k] = val;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** Resume un snapshot de intelligence (analysis es JSON opaco → lectura defensiva). */
+function summarizeIntelligence(intel: TicketIntelligence): {
+  line: string; readiness: number | null; enrichedBy: string | null;
+  meta: Record<string, unknown>;
+} {
+  const a = (intel?.analysis ?? {}) as Record<string, unknown>;
+  const readinessRaw = a.readinessScore;
+  const readiness = typeof readinessRaw === "number" ? readinessRaw : null;
+  const est = (a.estimatedResolution ?? null) as Record<string, unknown> | null;
+  const spec = (intel as unknown as Record<string, unknown>).specialistAnalysis as
+    | Record<string, unknown> | undefined;
+  const primary = (spec?.primaryAnalysis ?? null) as Record<string, unknown> | null;
+  const parts: string[] = [];
+  if (readiness !== null) parts.push(`readiness ${readiness}`);
+  if (est && typeof est.minHours === "number" && typeof est.maxHours === "number") {
+    parts.push(`ETA ${est.minHours}–${est.maxHours}h`);
+  }
+  if (primary && typeof primary.specialist === "string") parts.push(String(primary.specialist));
+  return {
+    line: parts.join(" · ") || "snapshot de análisis",
+    readiness,
+    enrichedBy: typeof intel?.enrichedBy === "string" ? intel.enrichedBy : null,
+    meta: {
+      status: intel?.status ?? null,
+      engineVersion: typeof a.engineVersion === "string" ? a.engineVersion : null,
+    },
+  };
+}
+
+/**
+ * Read-model del Case Timeline. Fusiona eventos + snapshots en orden
+ * cronológico descendente (más reciente primero). No persiste.
+ */
+export async function getCaseTimeline(
+  tenantId: string,
+  key: string,
+  opts: { limit?: number } = {},
+): Promise<CaseTimelineResult> {
+  await ensureTicketsDemoSchema(tenantId);
+  const limit = Math.min(Math.max(opts.limit ?? 500, 1), 1000);
+
+  const [events, history] = await Promise.all([
+    getAuditByTicket(tenantId, key, 1000).catch(() => []),
+    listIntelligenceHistory(tenantId, key).catch(() => []),
+  ]);
+
+  const items: CaseTimelineItem[] = [];
+
+  for (const e of events) {
+    const payload = e.payload as Record<string, unknown> | null;
+    const rawTitle = payload && typeof payload.title === "string" ? payload.title : null;
+    const rawDesc =
+      payload && typeof payload.description === "string" ? payload.description
+      : payload && typeof payload.summary === "string" ? payload.summary
+      : "";
+    items.push({
+      id: `evt:${e.id}`,
+      kind: "event",
+      eventType: e.eventType,
+      title: redactSecrets(rawTitle ?? prettifyEventType(e.eventType)),
+      description: redactedPreview(rawDesc),
+      actor: e.actorName,
+      actorRole: e.actorRole,
+      source: e.source,
+      severity: e.severity,
+      category: e.category,
+      version: extractVersion(e.payload),
+      at: e.createdAt,
+      metadata: pickMeta(e.payload),
+    });
+  }
+
+  for (const h of history) {
+    const s = summarizeIntelligence(h.intelligence);
+    const desc = [h.snapshotReason ? `Motivo: ${h.snapshotReason}` : null, s.line]
+      .filter(Boolean).join(" · ");
+    items.push({
+      id: `ver:${h.id}`,
+      kind: "version",
+      eventType: "KNOWLEDGE_SNAPSHOT",
+      title: `Snapshot de análisis · v${h.version}`,
+      description: redactSecrets(desc),
+      actor: s.enrichedBy,
+      actorRole: null,
+      source: "system",
+      severity: "info",
+      category: "intelligence",
+      version: h.version,
+      at: h.snapshotAt,
+      metadata: { inputHash: h.inputHash, readiness: s.readiness, ...s.meta },
+    });
+  }
+
+  // Orden cronológico descendente (más reciente primero) por timestamp ISO.
+  items.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
+
+  return {
+    ticketKey: key,
+    items: items.slice(0, limit),
+    eventCount: events.length,
+    versionCount: history.length,
+  };
 }
 
 /** Lee solo el intelligence de un ticket. Null si no existe el ticket. */

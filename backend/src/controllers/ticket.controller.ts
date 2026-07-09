@@ -4,6 +4,7 @@ import {
   createUserTicket, recalculateUserTicket, applyManualEstimatePatch,
   closeTicketWithActualHours, replaceTicketEstimate,
   upsertTicketIntelligence, getTicketIntelligence, listIntelligenceHistory,
+  getCaseTimeline,
   updateTicketGeneral, type UpdateTicketGeneralInput,
   type CreateTicketInput, type ManualEstimatePatch, type CloseTicketInput,
   type TicketIntelligence,
@@ -273,6 +274,27 @@ export async function getTicketIntelligenceHistory(
   } catch (err) {
     logger.error({ err }, "getTicketIntelligenceHistory fail");
     return reply.code(500).send({ success: false, error: "Error leyendo historial" });
+  }
+}
+
+/**
+ * GET /api/tickets/:key/timeline
+ * Case Timeline (F0) — read-model unificado: fusiona audit_events +
+ * ticket_intelligence_history en un feed cronológico tipado (más reciente
+ * primero). Redacta secretos/PII. Query opcional ?limit=.
+ */
+export async function getTicketTimeline(
+  req: FastifyRequest<{ Params: { key: string }; Querystring: { limit?: string } }>,
+  reply: FastifyReply
+) {
+  try {
+    const limitRaw = Number(req.query?.limit);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined;
+    const result = await getCaseTimeline(req.tenantId, req.params.key, { limit });
+    return reply.send({ success: true, ...result });
+  } catch (err) {
+    logger.error({ err }, "getTicketTimeline fail");
+    return reply.code(500).send({ success: false, error: "Error leyendo timeline del caso" });
   }
 }
 
