@@ -12,6 +12,12 @@ import {
 import type { TicketEstimatedResolution } from "../utils/estimation";
 import { chatWithAgent } from "../services/claude.service";
 import { logger } from "../utils/logger";
+// Case Timeline F4 — artefactos de 1ª clase
+import {
+  addCaseArtifact, listCaseArtifacts, CASE_ARTIFACT_KINDS,
+  type CaseArtifactKind, type AddCaseArtifactInput,
+} from "../services/case-artifacts.service";
+import { recordAuditEvent } from "../services/audit-events.service";
 
 export async function getProviderStatus(_req: FastifyRequest, reply: FastifyReply) {
   try {
@@ -295,6 +301,82 @@ export async function getTicketTimeline(
   } catch (err) {
     logger.error({ err }, "getTicketTimeline fail");
     return reply.code(500).send({ success: false, error: "Error leyendo timeline del caso" });
+  }
+}
+
+// =============================================================================
+// Case Timeline F4 — Artefactos de 1ª clase
+// =============================================================================
+
+/** Mapea el tipo de artefacto al evento de auditoría que aparece en el timeline. */
+const KIND_EVENT: Record<CaseArtifactKind, string> = {
+  sap_note: "SAP_NOTE_LINKED",
+  abap: "ABAP_UPLOADED",
+  attachment: "ATTACHMENT_ADDED",
+  evidence: "EVIDENCE_UPLOADED",
+  log: "EVIDENCE_UPLOADED",
+  dump: "EVIDENCE_UPLOADED",
+  screenshot: "EVIDENCE_UPLOADED",
+  email: "ATTACHMENT_ADDED",
+};
+
+/**
+ * POST /api/tickets/:key/artifacts
+ * Registra un artefacto del caso (SAP Note, ABAP, adjunto, dump, log, captura,
+ * correo). Redacta secretos/PII + hashea en el service, y emite el evento de
+ * timeline correspondiente para que quede en la historia del caso.
+ */
+export async function postCaseArtifact(
+  req: FastifyRequest<{ Params: { key: string }; Body: Partial<AddCaseArtifactInput> }>,
+  reply: FastifyReply,
+) {
+  try {
+    const body = req.body ?? {};
+    if (!body.kind || !CASE_ARTIFACT_KINDS.includes(body.kind)) {
+      return reply.code(400).send({ success: false, error: `kind inválido (esperado: ${CASE_ARTIFACT_KINDS.join(", ")})` });
+    }
+    if (!body.title || !body.title.trim()) {
+      return reply.code(400).send({ success: false, error: "title es requerido" });
+    }
+    const artifact = await addCaseArtifact(req.tenantId, req.params.key, {
+      kind: body.kind,
+      title: body.title.trim(),
+      ref: body.ref ?? null,
+      content: body.content ?? null,
+      meta: body.meta ?? null,
+      createdBy: body.createdBy,
+    });
+    if (!artifact) {
+      return reply.code(500).send({ success: false, error: "No se pudo registrar el artefacto" });
+    }
+    await recordAuditEvent({
+      tenantId: req.tenantId,
+      ticketId: req.params.key,
+      actorName: body.createdBy ?? "system",
+      eventType: KIND_EVENT[body.kind],
+      category: "ticket",
+      severity: "info",
+      source: "ui",
+      payload: { title: artifact.title, kind: artifact.kind, ref: artifact.ref, artifactId: artifact.id },
+    });
+    return reply.code(201).send({ success: true, artifact });
+  } catch (err) {
+    logger.error({ err }, "postCaseArtifact fail");
+    return reply.code(500).send({ success: false, error: "Error registrando artefacto" });
+  }
+}
+
+/** GET /api/tickets/:key/artifacts — lista los artefactos del caso. */
+export async function getCaseArtifacts(
+  req: FastifyRequest<{ Params: { key: string } }>,
+  reply: FastifyReply,
+) {
+  try {
+    const artifacts = await listCaseArtifacts(req.tenantId, req.params.key);
+    return reply.send({ success: true, artifacts });
+  } catch (err) {
+    logger.error({ err }, "getCaseArtifacts fail");
+    return reply.code(500).send({ success: false, error: "Error listando artefactos" });
   }
 }
 

@@ -13,11 +13,14 @@ import {
   getTicketIntelligenceHandler,
   getTicketIntelligenceHistory,
   getTicketTimeline,
+  postCaseArtifact,
+  getCaseArtifacts,
   patchTicketGeneral,
 } from "../controllers/ticket.controller";
 import type {
   CreateTicketInput, ManualEstimatePatch, CloseTicketInput, TicketIntelligence,
 } from "../services/ticket.service";
+import type { AddCaseArtifactInput } from "../services/case-artifacts.service";
 import type { TicketEstimatedResolution } from "../utils/estimation";
 // DH v0.9 — RBAC backend enforcement
 import { requirePermission } from "../middleware/requirePermission";
@@ -116,6 +119,16 @@ export async function ticketRoutes(app: FastifyInstance) {
     "/api/tickets/:key/timeline",
     { preHandler: requirePermission("ticket_command_center", "view") },
     getTicketTimeline);
+
+  // Case Timeline (F4) — artefactos de 1ª clase del caso
+  app.post<{ Params: { key: string }; Body: Partial<AddCaseArtifactInput> }>(
+    "/api/tickets/:key/artifacts",
+    { preHandler: requirePermission("ticket_command_center", "edit"), bodyLimit: 512 * 1024 },
+    postCaseArtifact);
+  app.get<{ Params: { key: string } }>(
+    "/api/tickets/:key/artifacts",
+    { preHandler: requirePermission("ticket_command_center", "view") },
+    getCaseArtifacts);
 
   // TCC v0.12 — PATCH ticket campos generales (title, description, sapModule,
   // environment, priority, assignee, reporter, status). Whitelist en service.
