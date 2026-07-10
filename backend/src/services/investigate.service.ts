@@ -45,6 +45,7 @@ export async function investigateTicket(
       taskType: "INVESTIGATION",
       userMessage: `Conducí una investigación NUEVA y completa del caso ${key} usando el paquete de evidencia provisto. Devolvé sólo el JSON.`,
       placeholders: { INVESTIGATION_CONTEXT: ctx.promptText },
+      tenantId,
       bypassCache: opts.force !== false, // por defecto no cachea el reanálisis
       audit: { ticketKey: key, actor: opts.actor ?? "system" },
     });

@@ -64,6 +64,8 @@ export interface StructuredCallInput {
     actor?: string;
     correlationId?: string;
   };
+  /** Tenant del request — forma parte de la key del cache (aislamiento por tenant). */
+  tenantId?: string;
   /** Si true, salta el cache de 24h — fuerza razonamiento fresco (reinvestigación). */
   bypassCache?: boolean;
   /** Override modelo / mock mode. */
@@ -142,7 +144,9 @@ export async function callGeminiStructured<T = unknown>(
     // FIX M16 (audit v1.1.0): cache LRU por inputHash en memoria.
     // Antes: reanalyze forzado siempre gastaba Gemini aunque inputHash
     // fuera el mismo. Ahora: cache de 24h evita 60-80% de reanalyze costs.
-    const cacheKey = `${input.taskType}:${cfg.model}:${stableHash(userText + (systemFilled.slice(0, 200)))}`;
+    // Aislamiento: la key incluye tenantId + ticketKey para nunca servir el
+    // resultado de un tenant/caso a otro (defensa en profundidad).
+    const cacheKey = `${input.tenantId ?? "default"}:${input.audit?.ticketKey ?? ""}:${input.taskType}:${cfg.model}:${stableHash(userText + (systemFilled.slice(0, 200)))}`;
     if (!input.bypassCache) {
       const cached = responseCache.get(cacheKey);
       if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
