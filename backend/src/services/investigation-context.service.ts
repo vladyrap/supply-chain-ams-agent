@@ -128,12 +128,12 @@ export async function buildInvestigationContext(
 
   const promptText = parts.join("\n");
 
-  // Fingerprint de evidencia: artefactos (id+hash) + conteo timeline + versiones.
+  // Fingerprint de evidencia: SÓLO lo que agrega el usuario (artefactos: id+hash).
+  // NO incluye timeline/versiones/latestEvent, que MUTAN en cada investigación
+  // (cada corrida emite eventos + snapshotea una versión). Así "misma evidencia
+  // → mismo fingerprint" y la idempotencia del PUT evita versiones espurias.
   const fpSource = JSON.stringify({
-    artifacts: artifacts.map((a) => `${a.id}:${a.contentHash ?? ""}`),
-    timelineCount: items.length,
-    latestEventId: items[0]?.id ?? null,
-    versions: history.length,
+    artifacts: artifacts.map((a) => `${a.id}:${a.contentHash ?? ""}`).sort(),
   });
   const evidenceFingerprint = createHash("sha256").update(fpSource).digest("hex").slice(0, 24);
 

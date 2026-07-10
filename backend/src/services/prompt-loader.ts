@@ -63,7 +63,10 @@ export function fillPlaceholders(prompt: string, vars: Record<string, string>): 
   let out = prompt;
   for (const [key, value] of Object.entries(vars)) {
     const re = new RegExp(`\\{\\{${key}\\}\\}`, "g");
-    out = out.replace(re, value);
+    // Reemplazo por FUNCIÓN: evita que $&, $`, $', $$ dentro de `value`
+    // (dumps ST22, código ABAP, logs con $) se interpreten como patrones de
+    // sustitución y corrompan la evidencia enviada al LLM.
+    out = out.replace(re, () => value);
   }
   return out;
 }

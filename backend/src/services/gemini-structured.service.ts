@@ -146,7 +146,10 @@ export async function callGeminiStructured<T = unknown>(
     // fuera el mismo. Ahora: cache de 24h evita 60-80% de reanalyze costs.
     // Aislamiento: la key incluye tenantId + ticketKey para nunca servir el
     // resultado de un tenant/caso a otro (defensa en profundidad).
-    const cacheKey = `${input.tenantId ?? "default"}:${input.audit?.ticketKey ?? ""}:${input.taskType}:${cfg.model}:${stableHash(userText + (systemFilled.slice(0, 200)))}`;
+    // Hash del prompt COMPLETO (no slice(0,200)): en INVESTIGATION la evidencia
+    // va en {{INVESTIGATION_CONTEXT}} al final del prompt — con slice quedaba
+    // fuera de la key y dos casos con evidencia distinta colisionaban.
+    const cacheKey = `${input.tenantId ?? "default"}:${input.audit?.ticketKey ?? ""}:${input.taskType}:${cfg.model}:${stableHash(userText + systemFilled)}`;
     if (!input.bypassCache) {
       const cached = responseCache.get(cacheKey);
       if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
